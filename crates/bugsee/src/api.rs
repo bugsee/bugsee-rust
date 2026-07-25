@@ -30,6 +30,8 @@ use crate::report::Report;
 // but not `Sync`; the lock is held only long enough to enqueue.
 static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "native")]
+static NATIVE: Mutex<Option<bugsee_native::NativeHandler>> = Mutex::new(None);
 
 /// The Bugsee SDK facade.
 pub struct Bugsee;
@@ -78,6 +80,15 @@ impl Bugsee {
         config.rotate_interval = options.rotate_interval;
 
         let recorder = Recorder::launch(config, transport)?;
+
+        // Install the native crash handler pointing at this generation's marker.
+        #[cfg(feature = "native")]
+        if options.native_crash_capture {
+            if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
+                *NATIVE.lock().unwrap() = Some(handler);
+            }
+        }
+
         *RECORDER.lock().unwrap() = Some(recorder);
         PAUSED.store(false, Ordering::SeqCst);
 
@@ -89,6 +100,10 @@ impl Bugsee {
 
     /// Stop the SDK and flush pending work (dropping the recorder joins the worker).
     pub fn stop() {
+        #[cfg(feature = "native")]
+        {
+            let _ = NATIVE.lock().unwrap().take();
+        }
         let _ = RECORDER.lock().unwrap().take();
     }
 

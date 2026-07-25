@@ -24,6 +24,7 @@ pub struct LaunchOptions {
     pub(crate) rotate_interval: Duration,
     pub(crate) endpoint: Option<String>,
     pub(crate) transport: Option<Arc<dyn Transport>>,
+    pub(crate) native_crash_capture: bool,
 }
 
 impl LaunchOptions {
@@ -37,7 +38,15 @@ impl LaunchOptions {
             rotate_interval: Duration::from_secs(1),
             endpoint: None,
             transport: None,
+            native_crash_capture: true,
         }
+    }
+
+    /// Enable/disable installing the native fatal-crash handler (default `true`).
+    /// Disable when the host already owns native crash handling.
+    pub fn native_crash_capture(mut self, enabled: bool) -> Self {
+        self.native_crash_capture = enabled;
+        self
     }
 
     /// Override the on-disk data directory (defaults to a per-app temp dir).

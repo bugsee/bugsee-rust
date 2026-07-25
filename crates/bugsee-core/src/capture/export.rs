@@ -78,6 +78,33 @@ pub fn export_report(
     Ok(docs)
 }
 
+/// The `(min, max)` entry timestamp span across all parts under `report_dir`,
+/// or `None` if there are no records. Used to set the manifest window for a
+/// recovered session where the live span is not known in memory.
+pub fn report_span(report_dir: &Path) -> std::io::Result<Option<(i64, i64)>> {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    let mut any = false;
+    for part in part_dirs_sorted(report_dir)? {
+        let entries = match std::fs::read_dir(&part) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for file in entries.flatten() {
+            if !file.file_name().to_string_lossy().ends_with(".part") {
+                continue;
+            }
+            let data = std::fs::read(file.path())?;
+            for (ts, _) in RecordIter::new(&data) {
+                any = true;
+                min = min.min(ts);
+                max = max.max(ts);
+            }
+        }
+    }
+    Ok(any.then_some((min, max)))
+}
+
 /// The numeric part sub-directories of `report_dir`, sorted ascending.
 fn part_dirs_sorted(report_dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut parts: Vec<(u64, std::path::PathBuf)> = Vec::new();

@@ -1,0 +1,16 @@
+[package]
+name = "bugsee-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Native fatal-crash handler (signal/exception) for the Bugsee Rust SDK — writes a crash marker for next-launch recovery."
+
+[dependencies]
+bugsee-core = { workspace = true }
+crash-handler = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

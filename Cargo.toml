@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/bugsee-core",
     "crates/bugsee-panic",
+    "crates/bugsee-native",
     "crates/bugsee",
 ]
 
@@ -17,6 +18,7 @@ authors = ["Bugsee <support@bugsee.com>"]
 [workspace.dependencies]
 bugsee-core = { path = "crates/bugsee-core", version = "0.1.0" }
 bugsee-panic = { path = "crates/bugsee-panic", version = "0.1.0" }
+bugsee-native = { path = "crates/bugsee-native", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"

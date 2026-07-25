@@ -45,6 +45,14 @@ pub struct ReportMeta {
     pub attachments: Vec<Attachment>,
 }
 
+/// An extra file to place in the bundle (e.g. a native minidump), with its
+/// manifest `type`.
+pub struct ExtraFile {
+    pub filename: String,
+    pub file_type: String,
+    pub data: Vec<u8>,
+}
+
 /// A finished, ready-to-deliver report.
 pub struct AssembledReport {
     /// `<random20>.bundle.zip` file name.
@@ -66,6 +74,21 @@ pub fn assemble(
     app_token: &str,
     created_on_ms: i64,
 ) -> std::io::Result<AssembledReport> {
+    assemble_with_extras(report_dir, window, meta, env, crash_json, &[], app_token, created_on_ms)
+}
+
+/// Like [`assemble`] but also bundles `extra_files` (e.g. a native minidump).
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_with_extras(
+    report_dir: &Path,
+    window: TimeWindow,
+    meta: &ReportMeta,
+    env: &Environment,
+    crash_json: Option<Vec<u8>>,
+    extra_files: &[ExtraFile],
+    app_token: &str,
+    created_on_ms: i64,
+) -> std::io::Result<AssembledReport> {
     let docs = export_report(report_dir, window.start, window.end)?;
 
     let mut files: Vec<FileDescriptor> = Vec::new();
@@ -80,6 +103,11 @@ pub fn assemble(
     if let Some(bytes) = crash_json {
         files.push(FileDescriptor::capture("crash.json", "crash"));
         entries.push(BundleEntry::new("crash.json", bytes));
+    }
+
+    for extra in extra_files {
+        files.push(FileDescriptor::capture(&extra.filename, &extra.file_type));
+        entries.push(BundleEntry::new(extra.filename.clone(), extra.data.clone()));
     }
 
     for att in &meta.attachments {

@@ -16,11 +16,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::capture::{PartStore, WindowCaps};
+use crate::capture::{export, PartStore, WindowCaps};
 use crate::model::entry::CaptureEntry;
 use crate::model::environment::Environment;
+use crate::model::report::TimeWindow;
 use crate::model::scope::Scope;
+use crate::recovery;
 use crate::reporting::{self, ReportMeta};
+use crate::session::Session;
 use crate::transport::{self, Transport};
 use crate::util::epoch_ms;
 
@@ -31,7 +34,6 @@ pub struct RecorderConfig {
     pub sdk_version: String,
     pub caps: WindowCaps,
     pub rotate_interval: Duration,
-    pub generation: u64,
 }
 
 impl RecorderConfig {
@@ -43,7 +45,6 @@ impl RecorderConfig {
             sdk_version: env!("CARGO_PKG_VERSION").to_string(),
             caps: WindowCaps::default(),
             rotate_interval: Duration::from_secs(1),
-            generation: 0,
         }
     }
 }
@@ -76,11 +77,13 @@ pub struct Recorder {
     shared: Arc<Shared>,
     caps: WindowCaps,
     data_dir: PathBuf,
+    session: Session,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Recorder {
-    /// Start the worker and begin capturing.
+    /// Start the worker and begin capturing. Recovers and delivers any prior
+    /// session that ended abnormally.
     pub fn launch(config: RecorderConfig, transport: Arc<dyn Transport>) -> std::io::Result<Self> {
         let env = Environment::detect(&config.sdk_version);
         let environment_json = serde_json::to_vec(&env).unwrap_or_default();
@@ -93,8 +96,11 @@ impl Recorder {
             transport,
         });
 
+        let session = Session::begin(&config.data_dir)?;
+        let generation = session.generation();
+
         let (tx, rx) = channel();
-        let store = PartStore::new(&config.data_dir, config.generation, config.caps)?;
+        let store = PartStore::new(&config.data_dir, generation, config.caps)?;
         let worker_shared = Arc::clone(&shared);
         let rotate_interval = config.rotate_interval;
         let data_dir = config.data_dir.clone();
@@ -104,6 +110,8 @@ impl Recorder {
         let worker = std::thread::Builder::new()
             .name("bugsee-capture".into())
             .spawn(move || {
+                // Deliver any crashed prior session before capturing this one.
+                run_recovery(&worker_shared, &worker_data_dir, generation);
                 worker_loop(rx, store, worker_shared, rotate_interval, worker_data_dir, caps);
             })?;
 
@@ -112,6 +120,7 @@ impl Recorder {
             shared,
             caps,
             data_dir,
+            session,
             worker: Some(worker),
         })
     }
@@ -159,6 +168,15 @@ impl Recorder {
         &self.data_dir
     }
 
+    /// Path where the native crash handler should write its crash-info marker
+    /// for this generation (picked up by next-launch recovery).
+    pub fn crash_info_path(&self) -> PathBuf {
+        self.data_dir
+            .join("parts")
+            .join(self.session.generation().to_string())
+            .join(crate::recovery::CRASH_INFO_NAME)
+    }
+
     /// Configured window caps.
     pub fn caps(&self) -> WindowCaps {
         self.caps
@@ -174,6 +192,39 @@ impl Drop for Recorder {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+        // Clean shutdown: drop the liveness marker so next launch does not treat
+        // this session as an abnormal exit.
+        self.session.end();
+    }
+}
+
+/// Recover and deliver any prior generation that ended abnormally.
+fn run_recovery(shared: &Shared, data_dir: &std::path::Path, current_generation: u64) {
+    for pending in recovery::find_pending(data_dir, current_generation) {
+        let span = export::report_span(&pending.parts_dir).ok().flatten();
+        let now = epoch_ms();
+        let (start, end) = span.unwrap_or((now, now));
+        let built = recovery::build_report(&pending, end);
+        let window = TimeWindow { start, end };
+        if let Ok(assembled) = reporting::assemble_with_extras(
+            &pending.parts_dir,
+            window,
+            &built.meta,
+            &shared.env,
+            Some(built.crash_json),
+            &built.extra_files,
+            &shared.app_token,
+            end,
+        ) {
+            let _ = transport::deliver(
+                &*shared.transport,
+                &shared.app_token,
+                &shared.environment_json,
+                &shared.session,
+                &assembled,
+            );
+        }
+        recovery::discard(data_dir, &pending);
     }
 }
 

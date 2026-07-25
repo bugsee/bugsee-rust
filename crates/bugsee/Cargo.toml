@@ -11,6 +11,7 @@ description = "Bugsee SDK for Rust — crash, panic, and error reporting with ba
 [dependencies]
 bugsee-core = { workspace = true }
 bugsee-panic = { workspace = true, optional = true }
+bugsee-native = { workspace = true, optional = true }
 serde_json = { workspace = true }
 backtrace = "0.3"
 ureq = { version = "2", optional = true, features = ["json"] }
@@ -19,8 +20,10 @@ ureq = { version = "2", optional = true, features = ["json"] }
 zip = { version = "2", default-features = false, features = ["zstd"] }
 
 [features]
-default = ["net", "panic"]
+default = ["net", "panic", "native"]
 # The default synchronous HTTP transport (ureq). Disable to inject a custom one.
 net = ["dep:ureq"]
 # Global Rust panic observer + catch_unwind boundary guards.
 panic = ["dep:bugsee-panic"]
+# Native fatal-crash handler (signal/Mach exception) + next-launch recovery.
+native = ["dep:bugsee-native"]
