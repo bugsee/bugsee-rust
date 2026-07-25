@@ -21,6 +21,7 @@ pub mod capture;
 pub mod errors;
 pub mod model;
 pub mod panic_info;
+pub mod queue;
 pub mod recovery;
 pub mod reporting;
 pub mod runtime;

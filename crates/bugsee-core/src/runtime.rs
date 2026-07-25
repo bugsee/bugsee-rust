@@ -5,16 +5,18 @@
 //  Copyright © 2026 Bugsee. All rights reserved.
 //
 
-//! The capture runtime: a single background worker that owns the part store,
-//! drains captured entries, rotates on a timer, and assembles + delivers
-//! reports on demand. Producers only enqueue; all disk and network work happens
-//! off the caller's thread.
+//! The capture runtime: a capture worker that owns the part store and drains
+//! entries, plus an uploader thread that delivers reports from the durable
+//! on-disk queue with retry. Producers only enqueue; all disk and network work
+//! happens off the caller's thread. A report is assembled and persisted to the
+//! queue, then delivered by the uploader — so delivery survives failures and
+//! restarts.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -23,11 +25,14 @@ use crate::model::entry::{CaptureEntry, TraceEntry};
 use crate::model::environment::Environment;
 use crate::model::report::TimeWindow;
 use crate::model::scope::Scope;
-use crate::recovery;
-use crate::reporting::{self, ReportMeta};
+use crate::reporting::{self, AssembledReport, ReportMeta};
 use crate::session::Session;
-use crate::transport::{self, Transport};
+use crate::transport::{self, Transport, TransportError};
 use crate::util::epoch_ms;
+use crate::{queue, recovery};
+
+/// Maximum upload attempts before a queued report is abandoned.
+const UPLOAD_RETRY_CAP: u32 = 60;
 
 /// Produces system/process telemetry samples appended as `traces.system` on
 /// each rotation tick. Implemented by the host layer (e.g. via `sysinfo`).
@@ -45,6 +50,8 @@ pub struct RecorderConfig {
     pub rotate_interval: Duration,
     /// Optional telemetry sampler run each rotation tick.
     pub sampler: Option<Box<dyn TelemetrySampler>>,
+    /// Base delay for upload retry backoff (doubles per attempt, capped at 300 s).
+    pub upload_backoff_base: Duration,
 }
 
 impl RecorderConfig {
@@ -57,11 +64,12 @@ impl RecorderConfig {
             caps: WindowCaps::default(),
             rotate_interval: Duration::from_secs(1),
             sampler: None,
+            upload_backoff_base: Duration::from_secs(30),
         }
     }
 }
 
-/// State shared between the facade and the worker.
+/// State shared between the facade, the capture worker, and the uploader.
 struct Shared {
     scope: Mutex<Scope>,
     env: Environment,
@@ -77,25 +85,32 @@ enum Msg {
         meta: ReportMeta,
         window_end: i64,
         crash_json: Option<Vec<u8>>,
-        ack: Sender<()>,
     },
     Flush(Sender<()>),
     Stop(Sender<()>),
 }
 
-/// The running capture pipeline. Cloneable handles capture into the same worker.
+enum UploadMsg {
+    Wake,
+    Drain(Sender<()>),
+    Stop(Sender<()>),
+}
+
+/// The running capture pipeline.
 pub struct Recorder {
     tx: Sender<Msg>,
+    upload_tx: Sender<UploadMsg>,
     shared: Arc<Shared>,
     caps: WindowCaps,
     data_dir: PathBuf,
     session: Session,
     worker: Option<JoinHandle<()>>,
+    uploader: Option<JoinHandle<()>>,
 }
 
 impl Recorder {
-    /// Start the worker and begin capturing. Recovers and delivers any prior
-    /// session that ended abnormally.
+    /// Start the workers and begin capturing. Recovers any prior session that
+    /// ended abnormally, queueing it for delivery.
     pub fn launch(config: RecorderConfig, transport: Arc<dyn Transport>) -> std::io::Result<Self> {
         let env = Environment::detect(&config.sdk_version);
         let environment_json = serde_json::to_vec(&env).unwrap_or_default();
@@ -110,21 +125,33 @@ impl Recorder {
 
         let session = Session::begin(&config.data_dir)?;
         let generation = session.generation();
+        let data_dir = config.data_dir.clone();
 
+        // Uploader thread: drains the durable queue with retry.
+        let (upload_tx, upload_rx) = channel();
+        let uploader_shared = Arc::clone(&shared);
+        let uploader_data_dir = data_dir.clone();
+        let backoff_base = config.upload_backoff_base;
+        let uploader = std::thread::Builder::new()
+            .name("bugsee-uploader".into())
+            .spawn(move || uploader_loop(upload_rx, uploader_shared, uploader_data_dir, backoff_base))?;
+
+        // Capture worker: owns the part store; enqueues reports.
         let (tx, rx) = channel();
         let store = PartStore::new(&config.data_dir, generation, config.caps)?;
         let worker_shared = Arc::clone(&shared);
         let rotate_interval = config.rotate_interval;
-        let data_dir = config.data_dir.clone();
         let worker_data_dir = data_dir.clone();
         let caps = config.caps;
         let sampler = config.sampler;
+        let worker_upload_tx = upload_tx.clone();
 
         let worker = std::thread::Builder::new()
             .name("bugsee-capture".into())
             .spawn(move || {
-                // Deliver any crashed prior session before capturing this one.
+                // Queue any crashed prior session before capturing this one.
                 run_recovery(&worker_shared, &worker_data_dir, generation);
+                let _ = worker_upload_tx.send(UploadMsg::Wake);
                 worker_loop(
                     rx,
                     store,
@@ -133,16 +160,19 @@ impl Recorder {
                     worker_data_dir,
                     caps,
                     sampler,
+                    worker_upload_tx,
                 );
             })?;
 
         Ok(Recorder {
             tx,
+            upload_tx,
             shared,
             caps,
             data_dir,
             session,
             worker: Some(worker),
+            uploader: Some(uploader),
         })
     }
 
@@ -158,30 +188,36 @@ impl Recorder {
     }
 
     /// Trigger a report with `meta`, snapshotting the window ending now.
-    /// Fire-and-forget; use [`Recorder::flush`] to await delivery.
     pub fn report(&self, meta: ReportMeta, crash_json: Option<Vec<u8>>) {
         self.report_at(meta, epoch_ms(), crash_json);
     }
 
-    /// Like [`Recorder::report`] but with an explicit window-end timestamp, used
-    /// by the deferred `create_report` flow to pin the window at creation time.
+    /// Like [`Recorder::report`] but with an explicit window-end timestamp.
     pub fn report_at(&self, meta: ReportMeta, window_end: i64, crash_json: Option<Vec<u8>>) {
-        let (ack, _rx) = channel();
         let _ = self.tx.send(Msg::Report {
             meta,
             window_end,
             crash_json,
-            ack,
         });
     }
 
-    /// Block until all previously-enqueued work has been processed, or `timeout`.
+    /// Block until captured work is persisted and the queue has been drained
+    /// once, or `timeout` elapses.
     pub fn flush(&self, timeout: Duration) -> bool {
+        // First ensure the capture worker has processed everything (reports are
+        // assembled + queued), then drain the uploader.
         let (tx, rx) = channel();
         if self.tx.send(Msg::Flush(tx)).is_err() {
             return false;
         }
-        rx.recv_timeout(timeout).is_ok()
+        if rx.recv_timeout(timeout).is_err() {
+            return false;
+        }
+        let (utx, urx) = channel();
+        if self.upload_tx.send(UploadMsg::Drain(utx)).is_err() {
+            return false;
+        }
+        urx.recv_timeout(timeout).is_ok()
     }
 
     /// Data directory root for this recorder.
@@ -189,14 +225,12 @@ impl Recorder {
         &self.data_dir
     }
 
-    /// Path where the native crash handler should write its crash-info marker
-    /// for this generation (picked up by next-launch recovery).
+    /// Path where the native crash handler should write its crash-info marker.
     pub fn crash_info_path(&self) -> PathBuf {
         self.gen_dir().join(crate::recovery::CRASH_INFO_NAME)
     }
 
-    /// Path where the panic observer should persist its snapshot for this
-    /// generation (used for next-launch abort correlation).
+    /// Path where the panic observer should persist its snapshot.
     pub fn panic_info_path(&self) -> PathBuf {
         self.gen_dir().join(crate::panic_info::PANIC_INFO_NAME)
     }
@@ -222,13 +256,20 @@ impl Drop for Recorder {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+        let (utx, urx) = channel();
+        if self.upload_tx.send(UploadMsg::Stop(utx)).is_ok() {
+            let _ = urx.recv_timeout(Duration::from_secs(2));
+        }
+        if let Some(handle) = self.uploader.take() {
+            let _ = handle.join();
+        }
         // Clean shutdown: drop the liveness marker so next launch does not treat
         // this session as an abnormal exit.
         self.session.end();
     }
 }
 
-/// Recover and deliver any prior generation that ended abnormally.
+/// Recover any prior generation that ended abnormally, queueing it for delivery.
 fn run_recovery(shared: &Shared, data_dir: &std::path::Path, current_generation: u64) {
     for pending in recovery::find_pending(data_dir, current_generation) {
         let span = export::report_span(&pending.parts_dir).ok().flatten();
@@ -246,13 +287,7 @@ fn run_recovery(shared: &Shared, data_dir: &std::path::Path, current_generation:
             &shared.app_token,
             end,
         ) {
-            let _ = transport::deliver(
-                &*shared.transport,
-                &shared.app_token,
-                &shared.environment_json,
-                &shared.session,
-                &assembled,
-            );
+            let _ = queue::enqueue(data_dir, &assembled);
         }
         recovery::discard(data_dir, &pending);
     }
@@ -267,6 +302,7 @@ fn worker_loop(
     data_dir: PathBuf,
     caps: WindowCaps,
     mut sampler: Option<Box<dyn TelemetrySampler>>,
+    upload_tx: Sender<UploadMsg>,
 ) {
     loop {
         match rx.recv_timeout(rotate_interval) {
@@ -281,10 +317,12 @@ fn worker_loop(
                 meta,
                 window_end,
                 crash_json,
-                ack,
             }) => {
-                let _ = process_report(&mut store, &shared, &data_dir, caps, meta, window_end, crash_json);
-                let _ = ack.send(());
+                if process_report(&mut store, &shared, &data_dir, caps, meta, window_end, crash_json)
+                    .is_ok()
+                {
+                    let _ = upload_tx.send(UploadMsg::Wake);
+                }
             }
             Ok(Msg::Flush(ack)) => {
                 let _ = store.flush();
@@ -350,7 +388,7 @@ fn process_report(
 
     store.snapshot_into(&report_dir, window_start, window_end)?;
 
-    let window = crate::model::report::TimeWindow {
+    let window = TimeWindow {
         start: window_start,
         end: window_end,
     };
@@ -364,16 +402,119 @@ fn process_report(
         window_end,
     )?;
 
-    let result = transport::deliver(
-        &*shared.transport,
-        &shared.app_token,
-        &shared.environment_json,
-        &shared.session,
-        &assembled,
-    );
-    // Phase 1: clean up the snapshot regardless. Durable queue + retry lands in
-    // Phase 5.
+    // Persist to the durable queue; the uploader delivers it.
+    let enqueue_result = queue::enqueue(data_dir, &assembled);
     let _ = std::fs::remove_dir_all(&report_dir);
-    let _ = result;
-    Ok(())
+    enqueue_result
+}
+
+fn uploader_loop(
+    rx: Receiver<UploadMsg>,
+    shared: Arc<Shared>,
+    data_dir: PathBuf,
+    backoff_base: Duration,
+) {
+    let poll = Duration::from_secs(5);
+    // A fresh launch retries any queued report immediately (force), ignoring
+    // backoff scheduled by the prior session.
+    drain(&shared, &data_dir, backoff_base, true);
+    loop {
+        match rx.recv_timeout(poll) {
+            Ok(UploadMsg::Wake) => {
+                drain(&shared, &data_dir, backoff_base, false);
+            }
+            Ok(UploadMsg::Drain(ack)) => {
+                drain_until_empty(&shared, &data_dir, backoff_base, Duration::from_secs(5));
+                let _ = ack.send(());
+            }
+            Ok(UploadMsg::Stop(ack)) => {
+                let _ = ack.send(());
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                drain(&shared, &data_dir, backoff_base, false);
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Attempt delivery of every due queued report once. Returns whether any report
+/// was attempted (used to pace `drain_until_empty`).
+fn drain(shared: &Shared, data_dir: &std::path::Path, backoff_base: Duration, force: bool) -> bool {
+    let now = epoch_ms();
+    let mut attempted = false;
+    for report in queue::list_pending(data_dir) {
+        let Ok((zip, request_json, retry, next_attempt)) = queue::load(&report) else {
+            continue;
+        };
+        if !force && now < next_attempt {
+            continue; // still backing off
+        }
+        attempted = true;
+        let assembled = AssembledReport {
+            bundle_name: queue::bundle_name(&report),
+            zip,
+            request_json,
+        };
+        match transport::deliver(
+            &*shared.transport,
+            &shared.app_token,
+            &shared.environment_json,
+            &shared.session,
+            &assembled,
+        ) {
+            Ok(()) => queue::remove(&report),
+            Err(TransportError::Transient(_)) => {
+                let n = retry + 1;
+                if n >= UPLOAD_RETRY_CAP {
+                    queue::remove(&report);
+                } else {
+                    queue::set_meta(&report, n, now + backoff_delay(n, backoff_base));
+                }
+            }
+            // Duplicate / permanent / blacklisted — abandon the report.
+            Err(_) => queue::remove(&report),
+        }
+    }
+    attempted
+}
+
+/// Exponential backoff: `base * 2^(retry-1)`, capped at 300 s.
+fn backoff_delay(retry: u32, base: Duration) -> i64 {
+    let shift = retry.saturating_sub(1).min(20);
+    let ms = (base.as_millis() as u64)
+        .saturating_mul(1u64 << shift)
+        .min(300_000);
+    ms as i64
+}
+
+/// Drain until the queue is empty or no report is deliverable before `deadline`,
+/// sleeping until the soonest scheduled retry between passes.
+fn drain_until_empty(
+    shared: &Shared,
+    data_dir: &std::path::Path,
+    backoff_base: Duration,
+    deadline: Duration,
+) {
+    let start = Instant::now();
+    loop {
+        drain(shared, data_dir, backoff_base, false);
+        let pending = queue::list_pending(data_dir);
+        if pending.is_empty() {
+            break;
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            break;
+        }
+        let now = epoch_ms();
+        let soonest = pending.iter().map(queue::next_attempt).min().unwrap_or(now);
+        let wait_ms = (soonest - now).max(0) as u64;
+        let remaining_ms = (deadline - elapsed).as_millis() as u64;
+        if wait_ms > remaining_ms {
+            break; // next retry is beyond the deadline
+        }
+        std::thread::sleep(Duration::from_millis(wait_ms.clamp(5, remaining_ms.max(5))));
+    }
 }
