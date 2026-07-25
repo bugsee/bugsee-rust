@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bugsee-core",
+    "crates/bugsee-panic",
+    "crates/bugsee",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Proprietary"
+repository = "https://github.com/bugsee/bugsee-rust"
+authors = ["Bugsee <support@bugsee.com>"]
+
+[workspace.dependencies]
+bugsee-core = { path = "crates/bugsee-core", version = "0.1.0" }
+bugsee-panic = { path = "crates/bugsee-panic", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_repr = "0.1"
+
+[profile.release]
+panic = "unwind"

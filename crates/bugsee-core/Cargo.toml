@@ -1,0 +1,20 @@
+[package]
+name = "bugsee-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core capture, persistence, and export engine for the Bugsee Rust SDK (no host-integration deps)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_repr = { workspace = true }
+zip = { version = "2", default-features = false, features = ["zstd"] }
+getrandom = "0.2"
+sha1 = "0.10.7"
+
+[dev-dependencies]
+serde_json = { workspace = true }

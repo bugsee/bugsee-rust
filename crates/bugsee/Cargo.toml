@@ -1,0 +1,26 @@
+[package]
+name = "bugsee"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Bugsee SDK for Rust — crash, panic, and error reporting with backend-compatible report bundles."
+
+[dependencies]
+bugsee-core = { workspace = true }
+bugsee-panic = { workspace = true, optional = true }
+serde_json = { workspace = true }
+backtrace = "0.3"
+ureq = { version = "2", optional = true, features = ["json"] }
+
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["zstd"] }
+
+[features]
+default = ["net", "panic"]
+# The default synchronous HTTP transport (ureq). Disable to inject a custom one.
+net = ["dep:ureq"]
+# Global Rust panic observer + catch_unwind boundary guards.
+panic = ["dep:bugsee-panic"]
