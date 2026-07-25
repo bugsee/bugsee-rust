@@ -195,8 +195,14 @@ mod tests {
     #[test]
     fn source_chain_nests_causes() {
         let causes = vec![
-            Cause { name: "IoError".into(), reason: "broken pipe".into() },
-            Cause { name: "Os".into(), reason: "EPIPE".into() },
+            Cause {
+                name: "IoError".into(),
+                reason: "broken pipe".into(),
+            },
+            Cause {
+                name: "Os".into(),
+                reason: "EPIPE".into(),
+            },
         ];
         let built = build_handled_error("TopError", "request failed", &causes, vec![], 1);
         let v: Value = serde_json::from_slice(&built.crash_json).unwrap();

@@ -63,7 +63,9 @@ impl Bugsee {
             None => {
                 #[cfg(feature = "net")]
                 {
-                    std::sync::Arc::new(crate::transport::HttpTransport::new(options.endpoint.clone()))
+                    std::sync::Arc::new(crate::transport::HttpTransport::new(
+                        options.endpoint.clone(),
+                    ))
                 }
                 #[cfg(not(feature = "net"))]
                 {
@@ -79,6 +81,7 @@ impl Bugsee {
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
         config.before_send = options.before_send;
+        config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
 
         #[cfg(feature = "telemetry")]
@@ -134,14 +137,17 @@ impl Bugsee {
             && !PAUSED.load(Ordering::SeqCst)
     }
 
-    /// Pause capture (events are dropped until [`Bugsee::resume`]).
+    /// Pause capture (events are dropped until [`Bugsee::resume`]). Also gates
+    /// the recorder's telemetry sampler so nothing is written while paused.
     pub fn pause() {
         PAUSED.store(true, Ordering::SeqCst);
+        Self::with_recorder(|r| r.set_paused(true));
     }
 
     /// Resume capture.
     pub fn resume() {
         PAUSED.store(false, Ordering::SeqCst);
+        Self::with_recorder(|r| r.set_paused(false));
     }
 
     /// Capture a log line.
@@ -181,9 +187,19 @@ impl Bugsee {
         Self::capture(CaptureEntry::Log(entry));
     }
 
-    /// Record a captured breadcrumb (used by integrations).
+    /// Record a captured breadcrumb (used by integrations). Runs the configured
+    /// `before_breadcrumb` hook first: a `None` return drops the breadcrumb, and
+    /// any mutation the hook applies is what gets captured.
     pub fn capture_breadcrumb(entry: bugsee_core::model::entry::Breadcrumb) {
-        Self::capture(CaptureEntry::Breadcrumb(entry));
+        if PAUSED.load(Ordering::SeqCst) {
+            return;
+        }
+        // Consult the recorder's hook on the caller path. `with_recorder` returns
+        // `None` when not launched (no-op, matching every other capture method);
+        // an inner `None` means the hook dropped the breadcrumb.
+        if let Some(Some(crumb)) = Self::with_recorder(|r| r.before_breadcrumb(entry)) {
+            Self::capture(CaptureEntry::Breadcrumb(crumb));
+        }
     }
 
     /// Record a named value trace.
@@ -290,7 +306,11 @@ impl Bugsee {
     }
 
     fn with_recorder<R>(f: impl FnOnce(&Recorder) -> R) -> Option<R> {
-        RECORDER.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(f)
+        RECORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(f)
     }
 }
 
@@ -330,7 +350,10 @@ struct PanicSink;
 impl bugsee_panic::PanicReporter for PanicSink {
     fn report_panic(&self, report: bugsee_panic::PanicReport) {
         let reason = match &report.file {
-            Some(file) => format!("{} ({}:{}:{})", report.reason, file, report.line, report.column),
+            Some(file) => format!(
+                "{} ({}:{}:{})",
+                report.reason, file, report.line, report.column
+            ),
             None => report.reason.clone(),
         };
         let built = errors::build_panic(&reason, report.frames, report.handled, epoch_ms());

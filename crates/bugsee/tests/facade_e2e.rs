@@ -80,26 +80,43 @@ fn full_public_api_flow() {
     assert_eq!(bundles.len(), 1, "one report uploaded");
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).expect("valid zip");
 
-    let names: Vec<String> =
-        (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
-    assert!(names.iter().any(|n| n.ends_with(".attachment.bgsfile")), "attachment present: {names:?}");
+    let names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with(".attachment.bgsfile")),
+        "attachment present: {names:?}"
+    );
 
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let req: Value = serde_json::from_slice(&rbytes).unwrap();
     assert_eq!(req["summary"], "Manual checkpoint");
     assert_eq!(req["severity"], 4, "Critical == 4");
     assert_eq!(req["labels"], serde_json::json!(["beta"]));
     assert_eq!(req["email"], "user@example.com");
     assert_eq!(req["source"]["type"], "code_upload");
-    assert_eq!(req["environment"]["sdk"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        req["environment"]["sdk"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 
     let mut mbytes = Vec::new();
-    zip.by_name("manifest.json").unwrap().read_to_end(&mut mbytes).unwrap();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_end(&mut mbytes)
+        .unwrap();
     let man: Value = serde_json::from_slice(&mbytes).unwrap();
     assert_eq!(man["attrs"]["tier"], "premium");
-    let types: Vec<&str> =
-        man["files"].as_array().unwrap().iter().map(|f| f["type"].as_str().unwrap()).collect();
+    let types: Vec<&str> = man["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
     assert!(types.contains(&"log"));
     assert!(types.contains(&"events.user"));
     assert!(types.contains(&"traces.user"));

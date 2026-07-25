@@ -43,7 +43,9 @@ async fn captures_request_and_response_into_network_json() {
     let dir = TempDir::new();
     let mock = Arc::new(MockTransport::default());
     let _guard = Bugsee::launch_with(
-        LaunchOptions::new("T").data_dir(&dir.path).with_transport(mock.clone()),
+        LaunchOptions::new("T")
+            .data_dir(&dir.path)
+            .with_transport(mock.clone()),
     )
     .unwrap();
 
@@ -84,7 +86,10 @@ async fn captures_request_and_response_into_network_json() {
         .find(|n| n.ends_with(".network.json"))
         .expect("network.json present");
     let mut nbytes = Vec::new();
-    zip.by_name(&net_name).unwrap().read_to_end(&mut nbytes).unwrap();
+    zip.by_name(&net_name)
+        .unwrap()
+        .read_to_end(&mut nbytes)
+        .unwrap();
     let net: Value = serde_json::from_slice(&nbytes).unwrap();
     let events = net["events"].as_array().unwrap();
 

@@ -24,7 +24,10 @@ struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let mut path = std::env::temp_dir();
-        path.push(format!("bugsee-tracing-{}", bugsee::core::util::random_hex(8)));
+        path.push(format!(
+            "bugsee-tracing-{}",
+            bugsee::core::util::random_hex(8)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }
     }
@@ -40,7 +43,9 @@ fn tracing_events_become_log_entries() {
     let dir = TempDir::new();
     let mock = Arc::new(MockTransport::default());
     let _guard = Bugsee::launch_with(
-        LaunchOptions::new("T").data_dir(&dir.path).with_transport(mock.clone()),
+        LaunchOptions::new("T")
+            .data_dir(&dir.path)
+            .with_transport(mock.clone()),
     )
     .unwrap();
 
@@ -63,23 +68,41 @@ fn tracing_events_become_log_entries() {
         .find(|n| n.ends_with(".log.json"))
         .expect("log.json present");
     let mut bytes = Vec::new();
-    zip.by_name(&log_name).unwrap().read_to_end(&mut bytes).unwrap();
+    zip.by_name(&log_name)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
     let log: Value = serde_json::from_slice(&bytes).unwrap();
     let events = log["events"].as_array().unwrap();
 
-    let messages: Vec<&str> = events.iter().map(|e| e["message"].as_str().unwrap()).collect();
+    let messages: Vec<&str> = events
+        .iter()
+        .map(|e| e["message"].as_str().unwrap())
+        .collect();
     assert!(messages.contains(&"user logged in"));
     assert!(messages.contains(&"boom happened"));
     assert!(messages.contains(&"verbose detail"));
-    assert!(!messages.contains(&"too verbose to capture"), "TRACE below min level skipped");
+    assert!(
+        !messages.contains(&"too verbose to capture"),
+        "TRACE below min level skipped"
+    );
 
     // The info event mapped to level 3 (Info), tag = target, field captured.
-    let info = events.iter().find(|e| e["message"] == "user logged in").unwrap();
+    let info = events
+        .iter()
+        .find(|e| e["message"] == "user logged in")
+        .unwrap();
     assert_eq!(info["level"], 3);
     assert_eq!(info["tag"], "myapp");
-    assert_eq!(info["user"], "alice", "structured field flattened onto the entry");
+    assert_eq!(
+        info["user"], "alice",
+        "structured field flattened onto the entry"
+    );
 
     // The error event mapped to level 1 (Error).
-    let err = events.iter().find(|e| e["message"] == "boom happened").unwrap();
+    let err = events
+        .iter()
+        .find(|e| e["message"] == "boom happened")
+        .unwrap();
     assert_eq!(err["level"], 1);
 }

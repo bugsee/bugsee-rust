@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bugsee_core::capture::WindowCaps;
+use bugsee_core::model::entry::Breadcrumb;
 use bugsee_core::reporting::ReportMeta;
-use bugsee_core::runtime::BeforeSend;
+use bugsee_core::runtime::{BeforeBreadcrumb, BeforeSend};
 use bugsee_core::transport::Transport;
 
 /// Configuration passed to [`crate::Bugsee::launch_with`].
@@ -23,12 +24,14 @@ pub struct LaunchOptions {
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) max_window: Duration,
     pub(crate) max_bytes: u64,
+    pub(crate) max_events: u64,
     pub(crate) rotate_interval: Duration,
     pub(crate) endpoint: Option<String>,
     pub(crate) transport: Option<Arc<dyn Transport>>,
     pub(crate) native_crash_capture: bool,
     pub(crate) system_telemetry: bool,
     pub(crate) before_send: Option<BeforeSend>,
+    pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
     pub(crate) sample_rate: f64,
 }
 
@@ -40,12 +43,14 @@ impl LaunchOptions {
             data_dir: None,
             max_window: Duration::from_secs(60),
             max_bytes: 8 << 20,
+            max_events: 100_000,
             rotate_interval: Duration::from_secs(1),
             endpoint: None,
             transport: None,
             native_crash_capture: true,
             system_telemetry: true,
             before_send: None,
+            before_breadcrumb: None,
             sample_rate: 1.0,
         }
     }
@@ -99,6 +104,22 @@ impl LaunchOptions {
         self
     }
 
+    /// Maximum total entry count retained across the capture window.
+    pub fn max_events(mut self, events: u64) -> Self {
+        self.max_events = events;
+        self
+    }
+
+    /// Register a callback run on every breadcrumb before it is captured. Return
+    /// the (possibly-mutated) breadcrumb to keep it, or `None` to drop it.
+    pub fn before_breadcrumb(
+        mut self,
+        f: impl Fn(Breadcrumb) -> Option<Breadcrumb> + Send + Sync + 'static,
+    ) -> Self {
+        self.before_breadcrumb = Some(Box::new(f));
+        self
+    }
+
     /// Override the API base URL (defaults to `https://api.bugsee.com/v2`).
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
@@ -115,6 +136,7 @@ impl LaunchOptions {
         WindowCaps {
             max_window_ms: self.max_window.as_millis() as i64,
             max_bytes: self.max_bytes,
+            max_events: self.max_events,
         }
     }
 
@@ -130,5 +152,9 @@ impl LaunchOptions {
 }
 
 fn short_token(token: &str) -> String {
-    token.chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect()
+    token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .collect()
 }

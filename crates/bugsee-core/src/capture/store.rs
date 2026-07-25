@@ -29,6 +29,8 @@ pub struct WindowCaps {
     pub max_window_ms: i64,
     /// Max total on-disk bytes across retained parts.
     pub max_bytes: u64,
+    /// Max total entry count retained across parts.
+    pub max_events: u64,
 }
 
 impl Default for WindowCaps {
@@ -36,6 +38,7 @@ impl Default for WindowCaps {
         WindowCaps {
             max_window_ms: 60_000,
             max_bytes: 8 << 20,
+            max_events: 100_000,
         }
     }
 }
@@ -47,6 +50,8 @@ struct PartMeta {
     start_ts: i64,
     end_ts: i64,
     bytes: u64,
+    /// Number of appended entries in this part (for the event-count cap).
+    count: u64,
 }
 
 /// A generation's worth of capture parts.
@@ -57,6 +62,7 @@ pub struct PartStore {
     parts: Vec<PartMeta>,
     caps: WindowCaps,
     total_bytes: u64,
+    total_events: u64,
 }
 
 impl PartStore {
@@ -70,6 +76,7 @@ impl PartStore {
             parts: Vec::new(),
             caps,
             total_bytes: 0,
+            total_events: 0,
         };
         store.begin_part(0)?;
         Ok(store)
@@ -82,6 +89,7 @@ impl PartStore {
             start_ts: i64::MAX,
             end_ts: i64::MIN,
             bytes: 0,
+            count: 0,
         });
         self.current = num;
         Ok(())
@@ -104,10 +112,12 @@ impl PartStore {
 
         let n = framed.len() as u64;
         self.total_bytes += n;
+        self.total_events += 1;
         let cur = self.parts.last_mut().expect("current part exists");
         cur.start_ts = cur.start_ts.min(ts);
         cur.end_ts = cur.end_ts.max(ts);
         cur.bytes += n;
+        cur.count += 1;
         Ok(())
     }
 
@@ -144,12 +154,14 @@ impl PartStore {
                 && oldest.start_ts != i64::MAX
                 && newest_end - oldest.start_ts > self.caps.max_window_ms;
             let bytes_exceeded = self.total_bytes > self.caps.max_bytes;
-            if !span_exceeded && !bytes_exceeded {
+            let events_exceeded = self.total_events > self.caps.max_events;
+            if !span_exceeded && !bytes_exceeded && !events_exceeded {
                 break;
             }
             let victim = self.parts.remove(0);
             let _ = std::fs::remove_dir_all(self.part_dir(victim.num));
             self.total_bytes = self.total_bytes.saturating_sub(victim.bytes);
+            self.total_events = self.total_events.saturating_sub(victim.count);
         }
         Ok(())
     }
@@ -164,8 +176,18 @@ impl PartStore {
 
     /// The `[start, end]` timestamp span currently retained across parts.
     pub fn retained_span(&self) -> Option<(i64, i64)> {
-        let start = self.parts.iter().map(|p| p.start_ts).filter(|&t| t != i64::MAX).min()?;
-        let end = self.parts.iter().map(|p| p.end_ts).filter(|&t| t != i64::MIN).max()?;
+        let start = self
+            .parts
+            .iter()
+            .map(|p| p.start_ts)
+            .filter(|&t| t != i64::MAX)
+            .min()?;
+        let end = self
+            .parts
+            .iter()
+            .map(|p| p.end_ts)
+            .filter(|&t| t != i64::MIN)
+            .max()?;
         Some((start, end))
     }
 
@@ -198,5 +220,51 @@ impl PartStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("bugsee-store-{}", crate::util::random_hex(8)));
+        p
+    }
+
+    #[test]
+    fn event_count_cap_evicts_oldest_parts() {
+        let dir = tmp_dir();
+        // Isolate the event-count cap: time and byte caps are effectively
+        // unbounded so only the count trigger can fire.
+        let caps = WindowCaps {
+            max_window_ms: i64::MAX,
+            max_bytes: u64::MAX,
+            max_events: 2,
+        };
+        let mut store = PartStore::new(&dir, 0, caps).unwrap();
+
+        // One entry per part, rotating after each so eviction has a chance to run.
+        for i in 0..6i64 {
+            store.append("log", 1000 + i, b"x").unwrap();
+            store.rotate().unwrap();
+        }
+
+        // The running count must stay at or below the cap after eviction.
+        assert!(
+            store.total_events <= caps.max_events,
+            "total_events={} exceeded cap={}",
+            store.total_events,
+            caps.max_events
+        );
+        // Eviction actually happened: far fewer parts than the 7 created.
+        assert!(
+            store.parts.len() < 7,
+            "expected eviction, still have {} parts",
+            store.parts.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

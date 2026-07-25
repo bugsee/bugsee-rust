@@ -24,7 +24,10 @@ struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let mut path = std::env::temp_dir();
-        path.push(format!("bugsee-recover-{}", bugsee_core::util::random_hex(8)));
+        path.push(format!(
+            "bugsee-recover-{}",
+            bugsee_core::util::random_hex(8)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }
     }
@@ -44,9 +47,7 @@ fn seed_crashed_session(data: &Path, generation: u64) {
     std::fs::create_dir_all(&part).unwrap();
     let mut bytes = Vec::new();
     for (ts, msg) in [(100i64, "pre-crash line A"), (200, "pre-crash line B")] {
-        let payload = format!(
-            r#"{{"timestamp":{ts},"level":1,"source":2,"message":"{msg}"}}"#
-        );
+        let payload = format!(r#"{{"timestamp":{ts},"level":1,"source":2,"message":"{msg}"}}"#);
         record::frame(ts, payload.as_bytes(), &mut bytes);
     }
     std::fs::write(part.join("log.part"), &bytes).unwrap();
@@ -75,7 +76,10 @@ fn abnormal_prior_session_is_recovered_on_next_launch() {
 
     // crash.json is an abnormal-exit payload.
     let mut cbytes = Vec::new();
-    zip.by_name("crash.json").unwrap().read_to_end(&mut cbytes).unwrap();
+    zip.by_name("crash.json")
+        .unwrap()
+        .read_to_end(&mut cbytes)
+        .unwrap();
     let crash: Value = serde_json::from_slice(&cbytes).unwrap();
     assert_eq!(crash["exception"]["name"], "AppExit");
     assert_eq!(crash["exception"]["domain"], "AppExit::Unknown");
@@ -87,7 +91,10 @@ fn abnormal_prior_session_is_recovered_on_next_launch() {
         .find(|n| n.ends_with(".log.json"))
         .expect("log capture file present");
     let mut lbytes = Vec::new();
-    zip.by_name(&log_name).unwrap().read_to_end(&mut lbytes).unwrap();
+    zip.by_name(&log_name)
+        .unwrap()
+        .read_to_end(&mut lbytes)
+        .unwrap();
     let log: Value = serde_json::from_slice(&lbytes).unwrap();
     let msgs: Vec<&str> = log["events"]
         .as_array()
@@ -99,15 +106,24 @@ fn abnormal_prior_session_is_recovered_on_next_launch() {
 
     // request.json is a crash issue.
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let req: Value = serde_json::from_slice(&rbytes).unwrap();
     assert_eq!(req["type"], "crash");
     assert_eq!(req["source"]["type"], "crash");
 
     // The recovered generation's on-disk state was cleaned up.
     drop(bundles);
-    assert!(!dir.path.join("parts").join("1").exists(), "prior parts removed");
-    assert!(!dir.path.join("sessions").join("1.alive").exists(), "marker removed");
+    assert!(
+        !dir.path.join("parts").join("1").exists(),
+        "prior parts removed"
+    );
+    assert!(
+        !dir.path.join("sessions").join("1.alive").exists(),
+        "marker removed"
+    );
 
     drop(recorder);
 }
@@ -128,8 +144,16 @@ fn seed_native_crash(data: &Path, generation: u64) {
     );
     std::fs::write(part.join("log.part"), &bytes).unwrap();
 
-    std::fs::write(gen_dir.join("crash.info"), "signal=11\ncode=1\naddress=0x0\n").unwrap();
-    std::fs::write(gen_dir.join("crash.minidump"), b"MDMP\x00fake-minidump-bytes").unwrap();
+    std::fs::write(
+        gen_dir.join("crash.info"),
+        "signal=11\ncode=1\naddress=0x0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        gen_dir.join("crash.minidump"),
+        b"MDMP\x00fake-minidump-bytes",
+    )
+    .unwrap();
 
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -152,21 +176,34 @@ fn native_crash_is_recovered_with_minidump_and_signal() {
 
     // Thin native crash.json with signal info.
     let mut cbytes = Vec::new();
-    zip.by_name("crash.json").unwrap().read_to_end(&mut cbytes).unwrap();
+    zip.by_name("crash.json")
+        .unwrap()
+        .read_to_end(&mut cbytes)
+        .unwrap();
     let crash: Value = serde_json::from_slice(&cbytes).unwrap();
     assert_eq!(crash["ndkCrash"], true);
     assert_eq!(crash["exception_type"], "native");
     assert_eq!(crash["handled"], false);
     assert_eq!(crash["signal"]["number"], 11);
     assert_eq!(crash["signal"]["name"], "SIGSEGV");
-    assert!(crash.get("exception").is_none(), "native variant is thin (no exception)");
+    assert!(
+        crash.get("exception").is_none(),
+        "native variant is thin (no exception)"
+    );
 
     // The minidump is bundled and listed with type `minidump`.
     let mut mbytes = Vec::new();
-    zip.by_name("manifest.json").unwrap().read_to_end(&mut mbytes).unwrap();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_end(&mut mbytes)
+        .unwrap();
     let man: Value = serde_json::from_slice(&mbytes).unwrap();
-    let types: Vec<&str> =
-        man["files"].as_array().unwrap().iter().map(|f| f["type"].as_str().unwrap()).collect();
+    let types: Vec<&str> = man["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
     assert!(types.contains(&"minidump"), "minidump bundled: {types:?}");
     assert!(types.contains(&"log"), "pre-crash log window bundled");
 }
@@ -182,7 +219,11 @@ fn seed_aborting_panic(data: &Path, generation: u64) {
     std::fs::create_dir_all(gen_dir.join("0")).unwrap();
 
     // SIGABRT marker from the native handler.
-    std::fs::write(gen_dir.join("crash.info"), "signal=6\ncode=0\naddress=0x0\n").unwrap();
+    std::fs::write(
+        gen_dir.join("crash.info"),
+        "signal=6\ncode=0\naddress=0x0\n",
+    )
+    .unwrap();
 
     // Panic snapshot from the observer.
     let info = PanicInfo {
@@ -224,7 +265,10 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
 
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
     let mut cbytes = Vec::new();
-    zip.by_name("crash.json").unwrap().read_to_end(&mut cbytes).unwrap();
+    zip.by_name("crash.json")
+        .unwrap()
+        .read_to_end(&mut cbytes)
+        .unwrap();
     let crash: Value = serde_json::from_slice(&cbytes).unwrap();
 
     // One managed crash event carrying the Rust panic frames; the SIGABRT is
@@ -233,13 +277,22 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
     // it, nor the non-contract `mechanism` key).
     assert_eq!(crash["handled"], false);
     assert_eq!(crash["ndkCrash"], false);
-    assert!(crash.get("mechanism").is_none(), "no off-contract mechanism key");
-    assert!(crash.get("signal").is_none(), "no signal object on the managed variant");
+    assert!(
+        crash.get("mechanism").is_none(),
+        "no off-contract mechanism key"
+    );
+    assert!(
+        crash.get("signal").is_none(),
+        "no signal object on the managed variant"
+    );
     assert_eq!(crash["exception"]["name"], "panic");
     assert_eq!(crash["exception"]["domain"], "Signal::SIGABRT");
     let reason = crash["exception"]["reason"].as_str().unwrap();
     assert!(reason.contains("index out of bounds") && reason.contains("checkout.rs:42:9"));
-    assert_eq!(crash["exception"]["frames"][0]["trace"], "app::checkout::settle");
+    assert_eq!(
+        crash["exception"]["frames"][0]["trace"],
+        "app::checkout::settle"
+    );
     assert_eq!(crash["signatures"].as_array().unwrap().len(), 1);
 }
 

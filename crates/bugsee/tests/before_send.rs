@@ -69,13 +69,22 @@ fn before_send_mutates_and_drops_reports() {
 
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let req: Value = serde_json::from_slice(&rbytes).unwrap();
     assert_eq!(req["summary"], "keep-me");
     assert_eq!(req["severity"], 4, "before_send bumped to Critical");
 
     let mut mbytes = Vec::new();
-    zip.by_name("manifest.json").unwrap().read_to_end(&mut mbytes).unwrap();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_end(&mut mbytes)
+        .unwrap();
     let man: Value = serde_json::from_slice(&mbytes).unwrap();
-    assert_eq!(man["attrs"]["scrubbed"], true, "before_send mutation applied");
+    assert_eq!(
+        man["attrs"]["scrubbed"], true,
+        "before_send mutation applied"
+    );
 }

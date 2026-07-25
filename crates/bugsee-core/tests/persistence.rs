@@ -20,7 +20,10 @@ struct TempDir {
 impl TempDir {
     fn new(tag: &str) -> Self {
         let mut path = std::env::temp_dir();
-        path.push(format!("bugsee-test-{tag}-{}", bugsee_core::util::random_hex(8)));
+        path.push(format!(
+            "bugsee-test-{tag}-{}",
+            bugsee_core::util::random_hex(8)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }
     }
@@ -45,7 +48,9 @@ fn snapshot_export_filters_by_timestamp() {
     store.append("log", 100, &log_payload("a")).unwrap();
     store.rotate().unwrap();
     store.append("log", 200, &log_payload("b")).unwrap();
-    store.append("network", 250, br#"{"timestamp":250,"id":"x"}"#).unwrap();
+    store
+        .append("network", 250, br#"{"timestamp":250,"id":"x"}"#)
+        .unwrap();
     store.append("log", 300, &log_payload("c")).unwrap();
 
     // Snapshot window [150, 260] should include log@200, network@250; drop 100 & 300.
@@ -64,7 +69,11 @@ fn snapshot_export_filters_by_timestamp() {
         .iter()
         .map(|e| e["message"].as_str().unwrap())
         .collect();
-    assert_eq!(msgs, vec!["b"], "only the in-window log entry survives the filter");
+    assert_eq!(
+        msgs,
+        vec!["b"],
+        "only the in-window log entry survives the filter"
+    );
 
     let net: Value = serde_json::from_slice(&by["network"]).unwrap();
     assert_eq!(net["events"].as_array().unwrap().len(), 1);
@@ -76,7 +85,9 @@ fn export_preserves_order_across_parts() {
     let dir = TempDir::new("order");
     let mut store = PartStore::new(&dir.path, 0, WindowCaps::default()).unwrap();
     for (i, ts) in [10i64, 20, 30, 40].into_iter().enumerate() {
-        store.append("log", ts, &log_payload(&format!("m{i}"))).unwrap();
+        store
+            .append("log", ts, &log_payload(&format!("m{i}")))
+            .unwrap();
         store.rotate().unwrap();
     }
     let report_dir = dir.path.join("reports").join("r");
@@ -89,7 +100,11 @@ fn export_preserves_order_across_parts() {
         .iter()
         .map(|e| e["message"].as_str().unwrap())
         .collect();
-    assert_eq!(msgs, vec!["m0", "m1", "m2", "m3"], "records stay timestamp-ordered");
+    assert_eq!(
+        msgs,
+        vec!["m0", "m1", "m2", "m3"],
+        "records stay timestamp-ordered"
+    );
 }
 
 #[test]
@@ -98,6 +113,7 @@ fn byte_cap_evicts_oldest_parts() {
     let caps = WindowCaps {
         max_window_ms: i64::MAX, // isolate the byte cap
         max_bytes: 200,
+        max_events: u64::MAX,
     };
     let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
     // Each ~50-byte payload in its own part; after enough rotations the oldest
@@ -109,7 +125,10 @@ fn byte_cap_evicts_oldest_parts() {
     }
     let parts_root = dir.path.join("parts").join("0");
     let remaining = std::fs::read_dir(&parts_root).unwrap().count();
-    assert!(remaining < 10, "eviction removed old parts, {remaining} remain");
+    assert!(
+        remaining < 10,
+        "eviction removed old parts, {remaining} remain"
+    );
     assert!(remaining >= 1, "at least the current part remains");
 }
 
@@ -119,13 +138,16 @@ fn time_cap_evicts_parts_beyond_the_window() {
     // freshly-rotated empty part's end_ts).
     let dir = TempDir::new("timecap");
     let caps = WindowCaps {
-        max_window_ms: 100, // 100 ms window
+        max_window_ms: 100,  // 100 ms window
         max_bytes: u64::MAX, // isolate the time cap
+        max_events: u64::MAX,
     };
     let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
     // One entry per part, timestamps 0,50,100,...,500 — span 500 ms >> 100 ms.
     for i in 0..=10 {
-        store.append("log", i * 50, &log_payload(&format!("m{i}"))).unwrap();
+        store
+            .append("log", i * 50, &log_payload(&format!("m{i}")))
+            .unwrap();
         store.rotate().unwrap();
     }
     let (start, end) = store.retained_span().expect("some retained span");
@@ -136,7 +158,10 @@ fn time_cap_evicts_parts_beyond_the_window() {
     );
     let parts_root = dir.path.join("parts").join("0");
     let remaining = std::fs::read_dir(&parts_root).unwrap().count();
-    assert!(remaining < 11, "old parts evicted by the time cap ({remaining} remain)");
+    assert!(
+        remaining < 11,
+        "old parts evicted by the time cap ({remaining} remain)"
+    );
 }
 
 #[test]
@@ -145,6 +170,7 @@ fn hard_link_snapshot_survives_eviction() {
     let caps = WindowCaps {
         max_window_ms: i64::MAX,
         max_bytes: 60,
+        max_events: u64::MAX,
     };
     let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
     store.append("log", 10, &log_payload("keep-me")).unwrap();
@@ -156,7 +182,9 @@ fn hard_link_snapshot_survives_eviction() {
     // Now push data that forces eviction of the original part from the live pool.
     for ts in 1..8 {
         store.rotate().unwrap();
-        store.append("log", ts * 100, &log_payload("filler-payload")).unwrap();
+        store
+            .append("log", ts * 100, &log_payload("filler-payload"))
+            .unwrap();
     }
 
     // The snapshot's hard link keeps the data alive despite live eviction.

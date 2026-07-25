@@ -53,8 +53,8 @@ impl<'a> Iterator for RecordIter<'a> {
             return None;
         }
         let ts = i64::from_le_bytes(self.bytes[self.pos..self.pos + 8].try_into().unwrap());
-        let len =
-            u32::from_le_bytes(self.bytes[self.pos + 8..self.pos + 12].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(self.bytes[self.pos + 8..self.pos + 12].try_into().unwrap())
+            as usize;
         if len == 0 {
             // Zeroed tail of a preallocated/grown file — end of real data.
             return None;
@@ -80,7 +80,9 @@ mod tests {
         frame(10, b"alpha", &mut buf);
         frame(20, b"beta", &mut buf);
         frame(30, b"", &mut buf); // note: empty payload => zero length => terminator
-        let got: Vec<_> = RecordIter::new(&buf).map(|(t, p)| (t, p.to_vec())).collect();
+        let got: Vec<_> = RecordIter::new(&buf)
+            .map(|(t, p)| (t, p.to_vec()))
+            .collect();
         // The empty-payload record acts as a terminator, so only two are read.
         assert_eq!(got, vec![(10, b"alpha".to_vec()), (20, b"beta".to_vec())]);
     }

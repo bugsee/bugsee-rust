@@ -65,7 +65,11 @@ fn log_entry_flattens_custom_data() {
         custom,
     };
     let v = to_value(&e);
-    assert_eq!(v.get("request_id"), Some(&json!("abc123")), "custom flattens to top level");
+    assert_eq!(
+        v.get("request_id"),
+        Some(&json!("abc123")),
+        "custom flattens to top level"
+    );
 }
 
 #[test]
@@ -102,7 +106,11 @@ fn breadcrumb_nests_data_not_flattened() {
     assert_eq!(v.get("type"), Some(&json!("navigation")));
     assert_eq!(v.get("level"), Some(&json!("info")));
     assert!(v.get("message").is_none(), "message omitted when unset");
-    assert_eq!(v["data"]["to"], json!("CheckoutScreen"), "custom nests under data");
+    assert_eq!(
+        v["data"]["to"],
+        json!("CheckoutScreen"),
+        "custom nests under data"
+    );
 }
 
 #[test]
@@ -116,7 +124,10 @@ fn trace_entry_omits_display_id_headless() {
     };
     let v = to_value(&e);
     assert!(v.get("displayId").is_none());
-    assert_eq!(v, json!({"timestamp":1720000000000i64,"name":"cart_total","value":129.95}));
+    assert_eq!(
+        v,
+        json!({"timestamp":1720000000000i64,"name":"cart_total","value":129.95})
+    );
 }
 
 #[test]
@@ -150,7 +161,10 @@ fn network_entry_emits_all_keys_with_lowercase_stage() {
         assert!(v.get(k).is_some(), "{k} must be present (null)");
         assert!(v[k].is_null(), "{k} should be null here");
     }
-    assert!(v["custom"].get("timings").is_none(), "timings omitted when absent");
+    assert!(
+        v["custom"].get("timings").is_none(),
+        "timings omitted when absent"
+    );
     assert_eq!(v["override"], json!(false));
 }
 

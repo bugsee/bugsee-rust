@@ -72,7 +72,9 @@ impl Session {
 
     /// The liveness-marker path for `generation` under `data_dir`.
     pub fn marker_path(data_dir: &Path, generation: u64) -> PathBuf {
-        data_dir.join(SESSIONS_DIR).join(format!("{generation}.alive"))
+        data_dir
+            .join(SESSIONS_DIR)
+            .join(format!("{generation}.alive"))
     }
 
     /// Mark a clean shutdown: remove this session's liveness marker.
@@ -91,7 +93,10 @@ fn floor_generation(data_dir: &Path) -> u64 {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0u64);
 
-    floor = floor.max(max_numeric_entry(&data_dir.join(SESSIONS_DIR), Some(".alive")));
+    floor = floor.max(max_numeric_entry(
+        &data_dir.join(SESSIONS_DIR),
+        Some(".alive"),
+    ));
     floor = floor.max(max_numeric_entry(&data_dir.join("parts"), None));
     floor
 }

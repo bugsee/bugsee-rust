@@ -32,10 +32,11 @@ fn map_ureq_error(err: ureq::Error) -> TransportError {
     match err {
         ureq::Error::Status(code, resp) => {
             // Inspect the response envelope for Bugsee app error codes.
-            let app_code = resp
-                .into_json::<Value>()
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_i64()));
+            let app_code = resp.into_json::<Value>().ok().and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_i64())
+            });
             match (code, app_code) {
                 (401, _) => TransportError::SessionExpired,
                 (_, Some(12003)) => TransportError::DuplicateDropped,

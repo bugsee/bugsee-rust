@@ -20,9 +20,7 @@ pub fn capture() -> Vec<Frame> {
                 .name()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
-            let file = symbol
-                .filename()
-                .map(|p| p.to_string_lossy().into_owned());
+            let file = symbol.filename().map(|p| p.to_string_lossy().into_owned());
             let line = symbol.lineno().map(|l| l as i64).unwrap_or(-1);
 
             let hidden = is_sdk_frame(&name);
@@ -58,13 +56,18 @@ fn is_sdk_frame(name: &str) -> bool {
 fn split_symbol(name: &str) -> (Option<String>, String) {
     // Strip a trailing rustc hash before splitting.
     let stripped = match name.rfind("::h") {
-        Some(idx) if name[idx + 3..].chars().all(|c| c.is_ascii_hexdigit()) && idx + 3 < name.len() => {
+        Some(idx)
+            if name[idx + 3..].chars().all(|c| c.is_ascii_hexdigit()) && idx + 3 < name.len() =>
+        {
             &name[..idx]
         }
         _ => name,
     };
     match stripped.rfind("::") {
-        Some(idx) => (Some(stripped[..idx].to_string()), stripped[idx + 2..].to_string()),
+        Some(idx) => (
+            Some(stripped[..idx].to_string()),
+            stripped[idx + 2..].to_string(),
+        ),
         None => (None, stripped.to_string()),
     }
 }

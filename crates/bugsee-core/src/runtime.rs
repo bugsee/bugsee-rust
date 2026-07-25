@@ -21,7 +21,7 @@
 //!   limit.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
-use crate::model::entry::{CaptureEntry, TraceEntry};
+use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
 use crate::model::environment::Environment;
 use crate::model::report::TimeWindow;
@@ -49,6 +49,10 @@ const DEFAULT_MAX_QUEUED: usize = 8192;
 /// A callback run on every report before delivery. Mutate the metadata in place;
 /// return `false` to drop the report entirely.
 pub type BeforeSend = Box<dyn Fn(&mut ReportMeta) -> bool + Send + Sync>;
+
+/// A callback run on every breadcrumb before it is captured. Return the
+/// (possibly-mutated) breadcrumb to keep it, or `None` to drop it.
+pub type BeforeBreadcrumb = Box<dyn Fn(Breadcrumb) -> Option<Breadcrumb> + Send + Sync>;
 
 /// Lock a mutex, recovering the guard if it was poisoned by a panic. Library
 /// code must never propagate a poisoned-lock panic onto a host thread.
@@ -76,6 +80,8 @@ pub struct RecorderConfig {
     pub upload_backoff_base: Duration,
     /// Optional callback to mutate or drop reports before delivery.
     pub before_send: Option<BeforeSend>,
+    /// Optional callback to mutate or drop breadcrumbs before capture.
+    pub before_breadcrumb: Option<BeforeBreadcrumb>,
     /// Fraction of non-fatal (`error`) reports to keep, in `[0, 1]`. Crashes are
     /// never sampled out.
     pub sample_rate: f64,
@@ -95,6 +101,7 @@ impl RecorderConfig {
             sampler: None,
             upload_backoff_base: Duration::from_secs(30),
             before_send: None,
+            before_breadcrumb: None,
             sample_rate: 1.0,
             max_queued_entries: DEFAULT_MAX_QUEUED,
         }
@@ -117,10 +124,13 @@ struct Shared {
     session: Mutex<Option<String>>,
     transport: Arc<dyn Transport>,
     before_send: Option<BeforeSend>,
+    before_breadcrumb: Option<BeforeBreadcrumb>,
     sample_rate: f64,
     /// In-flight capture entries queued to the worker (back-pressure counter).
     queued: AtomicUsize,
     max_queued: usize,
+    /// Whether telemetry sampling is paused (mirrors the facade's pause state).
+    paused: AtomicBool,
 }
 
 enum Msg {
@@ -177,9 +187,11 @@ impl Recorder {
             session: Mutex::new(None),
             transport,
             before_send: config.before_send,
+            before_breadcrumb: config.before_breadcrumb,
             sample_rate: config.sample_rate,
             queued: AtomicUsize::new(0),
             max_queued: config.max_queued_entries.max(1),
+            paused: AtomicBool::new(false),
         });
 
         let session = Session::begin(&config.data_dir)?;
@@ -193,7 +205,9 @@ impl Recorder {
         let backoff_base = config.upload_backoff_base;
         let uploader = std::thread::Builder::new()
             .name("bugsee-uploader".into())
-            .spawn(move || uploader_loop(upload_rx, uploader_shared, uploader_data_dir, backoff_base))?;
+            .spawn(move || {
+                uploader_loop(upload_rx, uploader_shared, uploader_data_dir, backoff_base)
+            })?;
 
         // Capture worker: owns the part store; enqueues reports.
         let (tx, rx) = channel();
@@ -246,6 +260,25 @@ impl Recorder {
         if self.tx.send(Msg::Capture(entry)).is_err() {
             self.shared.queued.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Apply the configured `before_breadcrumb` hook to `crumb`. Returns the
+    /// (possibly-mutated) breadcrumb to keep, or `None` to drop it. With no hook
+    /// configured the breadcrumb passes through unchanged. A panicking hook is
+    /// contained and drops just that breadcrumb (never crashes the caller).
+    pub fn before_breadcrumb(&self, crumb: Breadcrumb) -> Option<Breadcrumb> {
+        match &self.shared.before_breadcrumb {
+            Some(hook) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(crumb)))
+                .unwrap_or(None),
+            None => Some(crumb),
+        }
+    }
+
+    /// Route the facade's pause state into the recorder so the worker skips
+    /// telemetry sampling while paused (in addition to the facade gating
+    /// producer entries).
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
     /// Mutate the ambient scope (email / labels / attributes).
@@ -448,8 +481,10 @@ fn worker_loop(
                 crash_json,
             }) => {
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    process_report(&mut store, &shared, &data_dir, caps, meta, window_end, crash_json)
-                        .is_ok()
+                    process_report(
+                        &mut store, &shared, &data_dir, caps, meta, window_end, crash_json,
+                    )
+                    .is_ok()
                 }))
                 .unwrap_or(false);
                 if ok {
@@ -484,18 +519,22 @@ fn worker_loop(
             }
             Err(RecvTimeoutError::Timeout) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if let Some(sampler) = sampler.as_mut() {
-                        let ts = epoch_ms();
-                        for (name, value) in sampler.sample() {
-                            let entry = TraceEntry {
-                                timestamp: ts,
-                                display_id: None,
-                                name: Some(name),
-                                value,
-                                custom: Default::default(),
-                            };
-                            if let Ok(bytes) = serde_json::to_vec(&entry) {
-                                let _ = store.append("traces.system", ts, &bytes);
+                    // Skip telemetry sampling while paused; rotation/eviction still
+                    // runs so the window keeps sliding.
+                    if !shared.paused.load(Ordering::Relaxed) {
+                        if let Some(sampler) = sampler.as_mut() {
+                            let ts = epoch_ms();
+                            for (name, value) in sampler.sample() {
+                                let entry = TraceEntry {
+                                    timestamp: ts,
+                                    display_id: None,
+                                    name: Some(name),
+                                    value,
+                                    custom: Default::default(),
+                                };
+                                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                                    let _ = store.append("traces.system", ts, &bytes);
+                                }
                             }
                         }
                     }
@@ -529,7 +568,12 @@ fn take_snapshot(
 }
 
 /// Assemble + enqueue a report from a pre-taken snapshot (deferred upload path).
-fn deliver_snapshot(shared: &Shared, data_dir: &Path, handle: SnapshotHandle, mut meta: ReportMeta) -> bool {
+fn deliver_snapshot(
+    shared: &Shared,
+    data_dir: &Path,
+    handle: SnapshotHandle,
+    mut meta: ReportMeta,
+) -> bool {
     merge_scope(shared, &mut meta);
     if let Some(hook) = &shared.before_send {
         if !hook(&mut meta) {
@@ -609,7 +653,12 @@ fn process_report(
     enqueue_result
 }
 
-fn uploader_loop(rx: Receiver<UploadMsg>, shared: Arc<Shared>, data_dir: PathBuf, backoff_base: Duration) {
+fn uploader_loop(
+    rx: Receiver<UploadMsg>,
+    shared: Arc<Shared>,
+    data_dir: PathBuf,
+    backoff_base: Duration,
+) {
     let poll = Duration::from_secs(5);
     // A fresh launch retries any queued report immediately (force), ignoring
     // backoff scheduled by the prior session. Guarded so a panicking Transport
@@ -709,7 +758,12 @@ fn backoff_delay(retry: u32, base: Duration) -> i64 {
 
 /// Drain until the queue is empty or no report is deliverable before `deadline`.
 /// Returns whether the queue ended up empty.
-fn drain_until_empty(shared: &Shared, data_dir: &Path, backoff_base: Duration, deadline: Duration) -> bool {
+fn drain_until_empty(
+    shared: &Shared,
+    data_dir: &Path,
+    backoff_base: Duration,
+    deadline: Duration,
+) -> bool {
     let start = Instant::now();
     loop {
         // Force so a report in backoff is still attempted on an explicit flush.
@@ -722,5 +776,65 @@ fn drain_until_empty(shared: &Shared, data_dir: &Path, backoff_base: Duration, d
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::enums::BreadcrumbLevel;
+    use crate::transport::MockTransport;
+
+    fn tmp_dir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("bugsee-bc-{}", crate::util::random_hex(8)));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn crumb(msg: &str) -> Breadcrumb {
+        Breadcrumb {
+            timestamp: 0,
+            crumb_type: None,
+            category: None,
+            level: BreadcrumbLevel::Info,
+            message: Some(msg.to_string()),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn before_breadcrumb_drops_and_mutates() {
+        let dir = tmp_dir();
+        let transport = Arc::new(MockTransport::default());
+        let mut config = RecorderConfig::new(&dir, "T");
+        config.before_breadcrumb = Some(Box::new(|mut b: Breadcrumb| match b.message.as_deref() {
+            Some("drop") => None,
+            _ => {
+                b.category = Some("mutated".into());
+                Some(b)
+            }
+        }));
+        let recorder = Recorder::launch(config, transport).unwrap();
+
+        // A hook returning None drops the breadcrumb.
+        assert!(recorder.before_breadcrumb(crumb("drop")).is_none());
+        // A kept breadcrumb carries the hook's mutation.
+        let kept = recorder.before_breadcrumb(crumb("keep")).expect("kept");
+        assert_eq!(kept.category.as_deref(), Some("mutated"));
+
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn before_breadcrumb_passthrough_without_hook() {
+        let dir = tmp_dir();
+        let transport = Arc::new(MockTransport::default());
+        let recorder = Recorder::launch(RecorderConfig::new(&dir, "T"), transport).unwrap();
+        // No hook configured: the breadcrumb passes through unchanged.
+        assert!(recorder.before_breadcrumb(crumb("x")).is_some());
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -100,6 +100,8 @@ mod tests {
     fn random_hex_length_and_charset() {
         let s = random_hex(16);
         assert_eq!(s.len(), 32);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

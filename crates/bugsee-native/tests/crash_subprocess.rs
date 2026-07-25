@@ -44,7 +44,11 @@ fn native_handler_writes_marker_on_segfault() {
 
     let exe = std::env::current_exe().unwrap();
     let output = Command::new(exe)
-        .args(["native_handler_writes_marker_on_segfault", "--exact", "--nocapture"])
+        .args([
+            "native_handler_writes_marker_on_segfault",
+            "--exact",
+            "--nocapture",
+        ])
         .env(CHILD_ENV, "1")
         .env(PATH_ENV, &marker)
         .output()
@@ -60,8 +64,14 @@ fn native_handler_writes_marker_on_segfault() {
 
     assert!(marker.exists(), "crash-info marker written by the handler");
     let content = std::fs::read_to_string(&marker).unwrap();
-    assert!(content.contains("signal=11"), "SIGSEGV recorded: {content:?}");
-    assert!(content.contains("address=0x"), "fault address recorded: {content:?}");
+    assert!(
+        content.contains("signal=11"),
+        "SIGSEGV recorded: {content:?}"
+    );
+    assert!(
+        content.contains("address=0x"),
+        "fault address recorded: {content:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

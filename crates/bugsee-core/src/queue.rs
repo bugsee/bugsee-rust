@@ -133,9 +133,11 @@ pub fn signatures_of(report: &AssembledReport) -> Vec<String> {
     serde_json::from_slice::<serde_json::Value>(&report.request_json)
         .ok()
         .and_then(|v| {
-            v.get("signatures")
-                .and_then(|s| s.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            v.get("signatures").and_then(|s| s.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -146,7 +148,12 @@ fn blacklist_path(data_dir: &Path) -> PathBuf {
 
 fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
     std::fs::read_to_string(blacklist_path(data_dir))
-        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 

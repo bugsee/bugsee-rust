@@ -39,13 +39,16 @@ fn transaction_with_span_exports_to_performance_json() {
     let dir = TempDir::new();
     let mock = Arc::new(MockTransport::default());
     let _guard = Bugsee::launch_with(
-        LaunchOptions::new("T").data_dir(&dir.path).with_transport(mock.clone()),
+        LaunchOptions::new("T")
+            .data_dir(&dir.path)
+            .with_transport(mock.clone()),
     )
     .unwrap();
 
     let tx = Bugsee::start_transaction("MainScreen", "ui.load");
     let mut span = tx.start_span("db.query");
-    span.set_description("SELECT * FROM users").set_status(Status::Ok);
+    span.set_description("SELECT * FROM users")
+        .set_status(Status::Ok);
     span.finish();
     tx.set_status(Status::Ok);
     tx.finish();
@@ -64,7 +67,10 @@ fn transaction_with_span_exports_to_performance_json() {
         .expect("performance.json present");
 
     let mut pbytes = Vec::new();
-    zip.by_name(&perf_name).unwrap().read_to_end(&mut pbytes).unwrap();
+    zip.by_name(&perf_name)
+        .unwrap()
+        .read_to_end(&mut pbytes)
+        .unwrap();
     let perf: Value = serde_json::from_slice(&pbytes).unwrap();
 
     // APM uses the transactions envelope, not the events envelope.
@@ -82,9 +88,16 @@ fn transaction_with_span_exports_to_performance_json() {
 
     // The manifest lists it with type `performance`.
     let mut mbytes = Vec::new();
-    zip.by_name("manifest.json").unwrap().read_to_end(&mut mbytes).unwrap();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_end(&mut mbytes)
+        .unwrap();
     let man: Value = serde_json::from_slice(&mbytes).unwrap();
-    let types: Vec<&str> =
-        man["files"].as_array().unwrap().iter().map(|f| f["type"].as_str().unwrap()).collect();
+    let types: Vec<&str> = man["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
     assert!(types.contains(&"performance"), "types: {types:?}");
 }

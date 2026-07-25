@@ -43,7 +43,10 @@ unsafe fn cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    unsafe { CStr::from_ptr(ptr) }.to_str().ok().map(str::to_owned)
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 /// Run `f` inside a panic boundary, mapping a contained panic to `Panic`.
@@ -308,7 +311,11 @@ mod tests {
     #[test]
     fn guarded_contains_panics() {
         let status = guarded(|| panic!("boom across the FFI boundary"));
-        assert_eq!(status, BugseeStatus::Panic, "panic must not unwind across FFI");
+        assert_eq!(
+            status,
+            BugseeStatus::Panic,
+            "panic must not unwind across FFI"
+        );
     }
 
     #[test]

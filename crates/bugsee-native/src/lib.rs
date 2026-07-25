@@ -69,7 +69,12 @@ fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
 fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
     let si = cc.siginfo;
     unsafe {
-        write_marker(path_cbytes, si.ssi_signo as i32, si.ssi_code, si.ssi_addr as usize);
+        write_marker(
+            path_cbytes,
+            si.ssi_signo as i32,
+            si.ssi_code,
+            si.ssi_addr as usize,
+        );
     }
 }
 
@@ -77,7 +82,11 @@ fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
 #[cfg(target_vendor = "apple")]
 fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
     let (signo, code, addr) = match &cc.exception {
-        Some(e) => (mach_to_signal(e.kind), e.code as i32, e.subcode.unwrap_or(0) as usize),
+        Some(e) => (
+            mach_to_signal(e.kind),
+            e.code as i32,
+            e.subcode.unwrap_or(0) as usize,
+        ),
         None => (0, 0, 0),
     };
     unsafe {

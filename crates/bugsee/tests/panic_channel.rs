@@ -23,7 +23,10 @@ struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let mut path = std::env::temp_dir();
-        path.push(format!("bugsee-panic-{}", bugsee::core::util::random_hex(8)));
+        path.push(format!(
+            "bugsee-panic-{}",
+            bugsee::core::util::random_hex(8)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }
     }
@@ -39,7 +42,9 @@ fn caught_panic_is_contained_and_reported() {
     let dir = TempDir::new();
     let mock = Arc::new(MockTransport::default());
     let _guard = Bugsee::launch_with(
-        LaunchOptions::new("T").data_dir(&dir.path).with_transport(mock.clone()),
+        LaunchOptions::new("T")
+            .data_dir(&dir.path)
+            .with_transport(mock.clone()),
     )
     .unwrap();
 
@@ -61,7 +66,10 @@ fn caught_panic_is_contained_and_reported() {
 
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
     let mut cbytes = Vec::new();
-    zip.by_name("crash.json").unwrap().read_to_end(&mut cbytes).unwrap();
+    zip.by_name("crash.json")
+        .unwrap()
+        .read_to_end(&mut cbytes)
+        .unwrap();
     let crash: Value = serde_json::from_slice(&cbytes).unwrap();
 
     assert_eq!(crash["exception"]["name"], "panic");
@@ -74,8 +82,14 @@ fn caught_panic_is_contained_and_reported() {
     );
 
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let req: Value = serde_json::from_slice(&rbytes).unwrap();
-    assert_eq!(req["type"], "error", "caught panic is a non-fatal error issue");
+    assert_eq!(
+        req["type"], "error",
+        "caught panic is a non-fatal error issue"
+    );
     assert_eq!(req["signatures"].as_array().unwrap().len(), 1);
 }

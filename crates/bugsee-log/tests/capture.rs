@@ -38,7 +38,9 @@ fn log_records_become_log_entries() {
     let dir = TempDir::new();
     let mock = Arc::new(MockTransport::default());
     let _guard = Bugsee::launch_with(
-        LaunchOptions::new("T").data_dir(&dir.path).with_transport(mock.clone()),
+        LaunchOptions::new("T")
+            .data_dir(&dir.path)
+            .with_transport(mock.clone()),
     )
     .unwrap();
 
@@ -58,16 +60,25 @@ fn log_records_become_log_entries() {
         .find(|n| n.ends_with(".log.json"))
         .expect("log.json present");
     let mut bytes = Vec::new();
-    zip.by_name(&log_name).unwrap().read_to_end(&mut bytes).unwrap();
+    zip.by_name(&log_name)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
     let log: Value = serde_json::from_slice(&bytes).unwrap();
     let events = log["events"].as_array().unwrap();
 
-    let messages: Vec<&str> = events.iter().map(|e| e["message"].as_str().unwrap()).collect();
+    let messages: Vec<&str> = events
+        .iter()
+        .map(|e| e["message"].as_str().unwrap())
+        .collect();
     assert!(messages.contains(&"hello from log"));
     assert!(messages.contains(&"bad thing happened"));
     assert!(!messages.contains(&"too verbose"));
 
-    let info = events.iter().find(|e| e["message"] == "hello from log").unwrap();
+    let info = events
+        .iter()
+        .find(|e| e["message"] == "hello from log")
+        .unwrap();
     assert_eq!(info["level"], 3);
     assert_eq!(info["tag"], "svc");
 }

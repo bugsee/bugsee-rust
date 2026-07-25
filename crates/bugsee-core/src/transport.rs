@@ -106,7 +106,10 @@ impl Transport for MockTransport {
         _access_token: Option<&str>,
         request_json: &[u8],
     ) -> Result<String, TransportError> {
-        self.created_requests.lock().unwrap().push(request_json.to_vec());
+        self.created_requests
+            .lock()
+            .unwrap()
+            .push(request_json.to_vec());
         Ok("https://uploads.example/mock-presigned".into())
     }
 

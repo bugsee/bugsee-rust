@@ -119,7 +119,10 @@ fn worker_survives_a_panicking_before_send() {
     recorder.report(bugsee_core::reporting::manual_upload_meta(), None); // must still be delivered
     assert!(recorder.flush(Duration::from_secs(5)));
 
-    assert!(calls.load(Ordering::SeqCst) >= 2, "before_send ran for both reports");
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "before_send ran for both reports"
+    );
     assert_eq!(
         mock.uploaded_bundles.lock().unwrap().len(),
         1,
@@ -137,7 +140,11 @@ fn transient_failures_are_retried_until_delivered() {
     recorder.report(bugsee_core::reporting::manual_upload_meta(), None);
     assert!(recorder.flush(Duration::from_secs(5)));
 
-    assert_eq!(*flaky.uploaded.lock().unwrap(), 1, "delivered after retries");
+    assert_eq!(
+        *flaky.uploaded.lock().unwrap(),
+        1,
+        "delivered after retries"
+    );
     assert!(queue::list_pending(&dir.path).is_empty(), "queue drained");
 }
 
@@ -148,8 +155,7 @@ fn queued_report_survives_restart_and_delivers_next_launch() {
     // Session 1: delivery always fails → the bundle stays queued. Dropping the
     // recorder flushes the capture worker (enqueueing the report) on shutdown.
     {
-        let recorder =
-            Recorder::launch(config(&dir.path), Arc::new(AlwaysFailUpload)).unwrap();
+        let recorder = Recorder::launch(config(&dir.path), Arc::new(AlwaysFailUpload)).unwrap();
         recorder.capture(log_entry());
         recorder.report(bugsee_core::reporting::manual_upload_meta(), None);
     } // clean drop enqueues then stops
@@ -168,5 +174,8 @@ fn queued_report_survives_restart_and_delivers_next_launch() {
         1,
         "queued bundle delivered on the next launch"
     );
-    assert!(queue::list_pending(&dir.path).is_empty(), "queue drained after relaunch");
+    assert!(
+        queue::list_pending(&dir.path).is_empty(),
+        "queue drained after relaunch"
+    );
 }

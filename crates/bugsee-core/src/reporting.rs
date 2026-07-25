@@ -74,7 +74,16 @@ pub fn assemble(
     app_token: &str,
     created_on_ms: i64,
 ) -> std::io::Result<AssembledReport> {
-    assemble_with_extras(report_dir, window, meta, env, crash_json, &[], app_token, created_on_ms)
+    assemble_with_extras(
+        report_dir,
+        window,
+        meta,
+        env,
+        crash_json,
+        &[],
+        app_token,
+        created_on_ms,
+    )
 }
 
 /// Like [`assemble`] but also bundles `extra_files` (e.g. a native minidump).

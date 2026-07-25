@@ -18,3 +18,4 @@ sha1 = "0.10.7"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+proptest = "1"

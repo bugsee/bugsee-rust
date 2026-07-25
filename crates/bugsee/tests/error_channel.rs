@@ -63,14 +63,20 @@ impl Drop for TempDir {
 fn crash_json_in(bundle: &[u8]) -> Value {
     let mut zip = ZipArchive::new(Cursor::new(bundle.to_vec())).unwrap();
     let mut bytes = Vec::new();
-    zip.by_name("crash.json").unwrap().read_to_end(&mut bytes).unwrap();
+    zip.by_name("crash.json")
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
 fn request_json_in(bundle: &[u8]) -> Value {
     let mut zip = ZipArchive::new(Cursor::new(bundle.to_vec())).unwrap();
     let mut bytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut bytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -79,7 +85,9 @@ fn capture_error_message_and_result_ext() {
     let dir = TempDir::new();
     let mock = Arc::new(MockTransport::default());
     let _guard = Bugsee::launch_with(
-        LaunchOptions::new("T").data_dir(&dir.path).with_transport(mock.clone()),
+        LaunchOptions::new("T")
+            .data_dir(&dir.path)
+            .with_transport(mock.clone()),
     )
     .unwrap();
 
@@ -108,9 +116,15 @@ fn capture_error_message_and_result_ext() {
     assert_eq!(crash["handled"], true);
     assert_eq!(crash["ndkCrash"], false);
     assert_eq!(crash["exception_type"], "error");
-    assert_eq!(crash["exception"]["name"], "CheckoutError", "short type name");
+    assert_eq!(
+        crash["exception"]["name"], "CheckoutError",
+        "short type name"
+    );
     assert_eq!(crash["exception"]["reason"], "checkout failed");
-    assert_eq!(crash["exception"]["cause"]["reason"], "inner boom", "source() chain captured");
+    assert_eq!(
+        crash["exception"]["cause"]["reason"], "inner boom",
+        "source() chain captured"
+    );
     // Signature is shared between request.json and crash.json.
     assert_eq!(req["signatures"][0], crash["signatures"][0]);
 

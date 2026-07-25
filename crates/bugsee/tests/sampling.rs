@@ -22,7 +22,10 @@ struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let mut path = std::env::temp_dir();
-        path.push(format!("bugsee-sample-{}", bugsee::core::util::random_hex(8)));
+        path.push(format!(
+            "bugsee-sample-{}",
+            bugsee::core::util::random_hex(8)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }
     }
@@ -54,11 +57,21 @@ fn zero_sample_rate_drops_errors_but_keeps_manual_reports() {
     assert!(Bugsee::flush(Duration::from_secs(5)));
 
     let bundles = mock.uploaded_bundles.lock().unwrap();
-    assert_eq!(bundles.len(), 1, "only the non-sampled manual report survived");
+    assert_eq!(
+        bundles.len(),
+        1,
+        "only the non-sampled manual report survived"
+    );
 
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let req: Value = serde_json::from_slice(&rbytes).unwrap();
-    assert_eq!(req["type"], "bug", "the surviving report is the manual upload");
+    assert_eq!(
+        req["type"], "bug",
+        "the surviving report is the manual upload"
+    );
 }

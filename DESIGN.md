@@ -81,7 +81,7 @@ A Cargo workspace. Integrations are **separate crates** re-exported by an umbrel
    rotation · export→JSON · bundle ZIP (zstd-93) · signature · offline queue + retry
 ```
 
-**Rules:** `bugsee-core` builds with zero default features, no async. `unsafe` concentrates in `bugsee-native` (signals/FFI) and `bugsee-ffi`; core's mmap module is the only `unsafe` in core, gated. Each integration crate pulls exactly one ecosystem dep. **Edition 2021, MSRV ~1.75 (CI-gated).**
+**Rules:** `bugsee-core` builds with zero default features, no async. `unsafe` concentrates in `bugsee-native` (signals/FFI) and `bugsee-ffi`; `bugsee-core` currently contains **no** `unsafe` at all (it declares `#![forbid(unsafe_op_in_unsafe_fn)]` and its persistence uses only safe buffered-append `std::fs` I/O — the earlier "gated core mmap module" was never built). Each integration crate pulls exactly one ecosystem dep. **Edition 2021, MSRV 1.85 (CI-gated).** (The transitive dep graph — `backtrace ≥1.82`, `indexmap`/`hashbrown` via `zip` ≥1.85 — already requires 1.85; the earlier "~1.75" was aspirational and untrue.)
 
 ## 6. Public API surface
 
@@ -92,9 +92,15 @@ Global singleton (mobile parity); `launch` returns a guard whose `Drop` flushes.
 let _guard = Bugsee::launch("APP_TOKEN")?;
 let _guard = Bugsee::launch_with(LaunchOptions::new("APP_TOKEN")
     .max_window(Duration::from_secs(60)).max_events(10_000).max_bytes(8 << 20)
-    .capture_logs(true).network_default_sanitizer(true)
-    .on_report(|r: &mut Report| r.set_severity(Severity::High))
+    .sample_rate(1.0).native_crash_capture(true).system_telemetry(true)
+    .before_send(|r: &mut ReportMeta| { r.severity = Severity::High; true })
     .before_breadcrumb(|c| Some(c)))?;
+// Real builder set (see `crates/bugsee/src/options.rs`): data_dir, max_window,
+// max_bytes, max_events, endpoint, with_transport, before_send,
+// before_breadcrumb, sample_rate, native_crash_capture, system_telemetry.
+// (`capture_logs` / `network_default_sanitizer` / a dedicated `on_report` are
+// not part of the current surface — capture toggles and a network sanitizer
+// hook are future work; report mutation goes through `before_send`.)
 Bugsee::stop(); Bugsee::pause(); Bugsee::resume(); Bugsee::is_active();
 
 // Timeline
@@ -122,7 +128,7 @@ r.add_attachment(bytes, "resp.txt", "text/plain"); r.upload();  // drop = discar
 Bugsee::flush(Duration::from_secs(5));
 ```
 
-**Manual entry points (mobile parity, minus UI):** `upload_with` (immediate), `create_report`+`report.upload()` (deferred), `capture_error`/`capture_message` (handled `logException`), — `showReportDialog` dropped. The same `Report` type is what `on_report(&mut Report)` receives — one type, two paths (auto hook vs. imperative `create_report`).
+**Manual entry points (mobile parity, minus UI):** `upload_with` (immediate), `create_report`+`report.upload()` (deferred), `capture_error`/`capture_message` (handled `logException`), — `showReportDialog` dropped. Report-level attributes are mutated through the `before_send(&mut ReportMeta) -> bool` hook (return `false` to drop) — the same metadata shape the imperative `create_report` path builds.
 
 **Dropped from mobile:** blackout/secure-view, video/screenshot, view-tree, feedback/chat, gestures.
 
@@ -161,7 +167,7 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 **Storage layout** (one per-SDK data dir, single volume so hard links work):
 ```
 <data>/gen                                   persisted monotonic generation counter
-<data>/parts/<gen>/<part-n>/<channel>.part   live capture, mmap append streams
+<data>/parts/<gen>/<part-n>/<channel>.part   live capture, buffered append streams
 <data>/reports/<id>/                         per-report snapshot (hard links) + state
 <data>/queue/                                finished *.bundle.zip awaiting upload
 ```
@@ -170,11 +176,13 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 
 **Rotation + hybrid eviction (the sliding window):** ~1 s timer rolls the active part (also on a size cap); after each roll, evict oldest parts while **any** cap is exceeded — `max_window` (time), `max_bytes` (global), `max_events`/per-channel count caps (breadcrumbs 100). Eviction = `unlink` (refcount-safe vs. live snapshots).
 
-**Write path:** producers push into a bounded MPSC queue (drop-oldest, never block); the single capture worker drains → serializes → appends → publishes a per-stream **committed length** atomically after each complete record.
+**Write path (as built):** producers push into a bounded MPSC queue (drop-oldest, never block); the single capture worker drains → serializes each entry to JSON → frames it (`record::frame`) → `write_all`s the framed bytes to a per-channel file opened `OpenOptions::create(true).append(true)` (`store::PartStore::append`). There is **no mmap, no msync, no `fsync`/`sync_all`** — `flush()` only pushes the `std::fs::File`'s (empty) userspace buffer, so once `write_all` returns the bytes are in the OS page cache. Because capture is **single-threaded** (one worker owns the store), there is no reader/writer concurrency on a live part, so the "committed length" scheme the earlier design added to bound a concurrent-write race is unnecessary and not implemented; instead the reader (`record::RecordIter`) is self-terminating — a zero-length or over-long length prefix (the zeroed/torn tail of a part) ends iteration at the last complete record.
 
-**Crash survivability & generations:** streams are `mmap(MAP_SHARED)` (kernel flushes dirty pages on abnormal death). Each launch bumps `gen`; next-launch recovery reads the **previous** gen's parts before advancing.
+**Durability envelope (be honest):** buffered append survives **process death** (panic, `abort`, signal, `kill -9`) because completed `write()`s live in the kernel page cache independent of the crashing process — this is what the `recovery_e2e` / `kill -9` tests exercise. It does **not** guarantee survival of **power loss / kernel panic**, since nothing is `fsync`'d; a hardening tier (periodic `fsync`, or the originally-envisioned `mmap(MAP_SHARED)` + `msync`) is **future work**, not current behavior.
 
-**Snapshot (no seal, no copy):** pin `[start,end]` (`end`=snapshot instant, `start`=`end−window`) + **hard-link current parts including the active one** into the report dir. At export, read linked parts and include only entries with `start ≤ timestamp ≤ end` (monotonic order → early-stop at the tail; committed-length bounds the concurrent-write race). Bounds become `manifest.time.start/end`. Cost: 2 timestamps + O(#parts) `link` syscalls. Fallback to copy on FAT/exFAT/cross-volume (capability-probed once). Reflink (APFS `clonefile` / Linux `FICLONE`) a noted future tier.
+**Generations:** each launch bumps `gen`; next-launch recovery reads the **previous** gen's parts before advancing.
+
+**Snapshot (no seal, no copy):** pin `[start,end]` (`end`=snapshot instant, `start`=`end−window`) + **hard-link current parts including the active one** into the report dir (`PartStore::snapshot_into`, after a `flush`). At export, read linked parts and include only entries with `start ≤ timestamp ≤ end` (monotonic order → early-stop at the tail; the self-terminating `RecordIter` cleanly ignores any torn trailing write on the active part). Bounds become `manifest.time.start/end`. Cost: 2 timestamps + O(#parts) `link` syscalls. Fallback to copy on FAT/exFAT/cross-volume (capability-probed once). Reflink (APFS `clonefile` / Linux `FICLONE`) a noted future tier.
 
 ## 9. Failure pipeline
 
@@ -214,15 +222,15 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 | Role | Count | Owns | Does |
 |---|---|---|---|
 | Producers | app threads | — | `Bugsee::log/event/…` → enqueue only, never block |
-| Capture worker | 1 | mmap part streams | drain → serialize → append → publish committed length; rotation + eviction + telemetry sampling on the same timed loop |
+| Capture worker | 1 | buffered-append part streams | drain → serialize → frame → `write_all` (append); rotation + eviction + telemetry sampling on the same timed loop |
 | Report/upload worker | 1 | `reports/`, `queue/` | export → bundle (zstd-93) → 3-step upload → retry |
 | Crash-time context | any thread | — | panic observer / native handler: touch only preallocated `PanicSnapshot` + minidump |
 
-**Crash-time isolation rule:** the fault path never enqueues/allocates/locks — it writes only to fixed preallocated storage + mmap marker (worker may be dead/frozen). **Back-pressure:** bounded queue drops-oldest; byte-budget + `MADV_DONTNEED`/`msync` cap RSS. **Async-optional:** capture worker is always a `std` thread; only the uploader can become a task on the host runtime (`async` feature). **Shutdown:** guard `Drop` → `flush(timeout)`.
+**Crash-time isolation rule:** the fault path never enqueues/allocates/locks — it writes only to fixed preallocated storage + a file-based crash marker (worker may be dead/frozen). **Back-pressure:** bounded queue drops-oldest; the worker holds no large in-RAM buffer (it frames one record at a time and `write_all`s it), so on-disk growth is bounded by `max_bytes`/`max_window` eviction rather than RSS. **Async-optional:** capture worker is always a `std` thread; only the uploader can become a task on the host runtime (`async` feature). **Shutdown:** guard `Drop` → `flush(timeout)`.
 
 ## 12. Crash-time safety, best-effort flush & edge cases
 
-**Best-effort in-flight flush:** at crash, secure the guaranteed artifact first (`PanicSnapshot` / minidump), then attempt flush, then terminate. The crashing thread never touches the queue lock/allocator — it does an async-signal-safe wake (atomic flag + `sem_post`/eventfd/self-pipe) and waits ≤~50 ms for the worker to drain→append→`msync`→ack; no ack → give up. Panic(unwind): usually succeeds. panic=abort: hook wakes worker before abort. Native fault: defensive only.
+**Best-effort in-flight flush:** at crash, secure the guaranteed artifact first (`PanicSnapshot` / minidump), then attempt flush, then terminate. The crashing thread never touches the queue lock/allocator — it does an async-signal-safe wake (atomic flag + `sem_post`/eventfd/self-pipe) and waits ≤~50 ms for the worker to drain→append→`write_all`→ack; no ack → give up. (This best-effort in-flight flush is a **planned** hardening step; the current worker already durably appends each record as it drains, so completed records survive without it.) Panic(unwind): usually succeeds. panic=abort: hook wakes worker before abort. Native fault: defensive only.
 
 **Recursion guard:** `NORMAL→PANICKING→HANDLING_FATAL→SECONDARY`; second fatal → tiny marker + terminate, no re-entry.
 **Quarantine:** Class A (continue) / B (restart) / C (rebuild instance) / D (disable); restart budget (1 immediate, 3/10 min, then disable) — never infinite.
@@ -233,15 +241,23 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 
 **Methodology:** red-green TDD; **every flow has an E2E test** written failing first, then implemented to green, then refactored.
 
-**Wire-format conformance (contract-critical):** golden fixtures for every capture type + `manifest`/`request`/`crash` checked against `report-bundle-structure` schemas (envelope versions, lowercase enums, null-tolerance, custom-data flattening). Signature golden vectors. **Strongest gate:** feed a produced `*.bundle.zip` to the actual worker ingest in CI and assert it parses.
+**What is actually verified today (in CI):**
+- **Unit tests** — e.g. `record.rs` framing/`RecordIter` termination, `signature.rs`, `util.rs`, `errors.rs`.
+- **E2E / integration tests** — `bugsee-core/tests/{bundle,persistence,durable_queue,recovery_e2e,runtime_e2e,wire_format}.rs`, `bugsee/tests/{facade_e2e,error_channel,panic_channel,sampling,before_send,apm}.rs`, `bugsee-native/tests/crash_subprocess.rs`, `bugsee-ffi/tests/lifecycle.rs`, and the `bugsee-{log,tracing,reqwest}` capture tests. These cover launch→emit→export→bundle, rotation/eviction, hard-link snapshot, `kill -9`→recovery, and wire-format assertions against `report-bundle-structure` expectations.
+- **A new `HttpTransport` test** exercising the default HTTP transport against a mock server (added alongside this doc pass).
+- **A record-reader proptest** — property test over `RecordIter` on torn/truncated/garbage buffers (added alongside this doc pass).
 
-**Matrices:** panic (API/thread/task/holding-Mutex/`&str`/`String`/custom/panicking-Drop/double-panic/panic-in-observer/hook-before+after/multi-init); FFI (panic from C/JNI, C++/ObjC exception from callback, reentrancy, nested); native-fatal subprocess (SIGSEGV/SIGBUS/SIGILL/abort/stack-overflow/panic=abort/alloc-abort → artifact + next-launch recovery); correlation (abort→one event, caught→no dup, stale-snapshot→not correlated, cross-thread→not correlated); persistence (rotation, hybrid eviction, hard-link refcount, timestamp-filter, committed-length under concurrent write, `kill -9`→recovery); coexistence (both init orders).
+**Wire-format conformance (contract-critical):** the `wire_format`/`bundle` E2E tests assert envelope versions, lowercase enums, null-tolerance, and custom-data flattening; signature golden vectors pin grouping. **Planned (not yet wired):** full golden-fixture schema validation against the published `report-bundle-structure` schemas for every type, and the strongest end-to-end gate — feeding a produced `*.bundle.zip` to the actual worker ingest in CI and asserting it parses.
 
-**Rigor:** `loom` (queue + committed-length protocol), `miri`/ASan/TSan (mmap/FFI/native), **fuzz** the part reader (torn/truncated/garbage → never UB). **CI matrix:** Linux/Win/macOS full; Android+iOS FFI smoke.
+**Matrices:** panic (API/thread/task/holding-Mutex/`&str`/`String`/custom/panicking-Drop/double-panic/panic-in-observer/hook-before+after/multi-init); FFI (panic from C/JNI, C++/ObjC exception from callback, reentrancy, nested); native-fatal subprocess (SIGSEGV/SIGBUS/SIGILL/abort/stack-overflow/panic=abort/alloc-abort → artifact + next-launch recovery); correlation (abort→one event, caught→no dup, stale-snapshot→not correlated, cross-thread→not correlated); persistence (rotation, hybrid eviction, hard-link refcount, timestamp-filter, torn-tail/truncated-record recovery, `kill -9`→recovery); coexistence (both init orders).
+
+**CI (as built — `.github/workflows/ci.yml`):** on every push/PR, `cargo build`/`test`/`clippy -D warnings`/`fmt --check` across the workspace, plus a separate job pinning the MSRV toolchain (1.85) that builds the workspace.
+
+**Rigor — planned, not yet in CI:** `loom` (queue interleavings — note the "committed-length protocol" no longer applies now that capture is single-threaded), `miri`/ASan/TSan (FFI/native `unsafe`), a **fuzz** target over the part reader (the record-reader **proptest** above is the currently-shipping approximation), and a **cross-platform CI matrix** (Linux/Win/macOS full; Android+iOS FFI smoke — the current workflow runs a single host).
 
 ## 14. Rollout plan (TDD, E2E-per-flow)
 
-- **Phase 0 — Harness:** workspace skeleton; mock Bugsee server (3-step API); bundle-schema validator; subprocess crash-runner; temp-data-dir fixtures; CI matrix + loom/miri/fuzz jobs.
+- **Phase 0 — Harness:** workspace skeleton; mock Bugsee server (3-step API); bundle-schema validator; subprocess crash-runner; temp-data-dir fixtures; CI (build/test/clippy/fmt + pinned-MSRV job — **done**). Cross-platform matrix + loom/miri/fuzz jobs are **planned follow-ups**.
 - **Phase 1 — Ingestible bundle (core):** data model → capture worker → disk parts → hybrid window → hard-link snapshot → timestamp-filter export → JSON → ZIP(zstd-93) → 3-step transport → offline queue. E2E: `launch→emit→upload→valid bundle`; `create_report→mutate→upload`.
 - **Phase 2 — Handled errors + caught panics:** `bugsee-panic` observer + boundary guards, `capture_error/message`, `bugsee-tracing`/`log`, panic signature feed, quarantine.
 - **Phase 3 — Fatal + next-launch + correlation:** `bugsee-native`, recovery, correlation, native signature feed, best-effort flush, abnormal-exit inference.
@@ -249,7 +265,7 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 - **Phase 5 — Hardening:** retry/backoff maturity, `before_send`/`before_breadcrumb`, default sanitizer, sampling, rate limits, coexistence.
 - **Phase 6 — Mobile/FFI:** `bugsee-ffi` C ABI, per-platform native backend, optional out-of-process minidump (desktop), reflink tier.
 
-**Gate:** a phase ships only when its E2E flows are green **and** unit/property/fuzz/loom pass.
+**Gate:** a phase ships only when its E2E flows are green **and** unit + property tests pass under the CI job (build/test/clippy/fmt + MSRV). Fuzz/loom/miri are aspirational gates, tracked as planned follow-ups rather than currently enforced.
 
 ## 15. Open backend-coordination items
 

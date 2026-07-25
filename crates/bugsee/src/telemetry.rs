@@ -68,7 +68,13 @@ mod tests {
         let sample = sampler.sample();
         let names: Vec<&str> = sample.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"ram"), "system memory sampled: {names:?}");
-        assert!(names.contains(&"process_memory"), "process memory sampled: {names:?}");
-        assert!(names.contains(&"cpu_usage"), "process cpu sampled: {names:?}");
+        assert!(
+            names.contains(&"process_memory"),
+            "process memory sampled: {names:?}"
+        );
+        assert!(
+            names.contains(&"cpu_usage"),
+            "process cpu sampled: {names:?}"
+        );
     }
 }

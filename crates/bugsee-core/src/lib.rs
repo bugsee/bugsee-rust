@@ -31,7 +31,9 @@ pub mod transport;
 pub mod util;
 
 pub use model::{
-    entry::{Breadcrumb, CaptureEntry, EventEntry, LogEntry, NetworkEntry, SystemEvent, TraceEntry},
+    entry::{
+        Breadcrumb, CaptureEntry, EventEntry, LogEntry, NetworkEntry, SystemEvent, TraceEntry,
+    },
     enums::{BreadcrumbLevel, IssueType, LogLevel, LogSource, NetworkStage, Severity, TriggerType},
     envelope::Envelope,
     environment::Environment,

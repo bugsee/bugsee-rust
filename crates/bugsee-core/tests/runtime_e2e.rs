@@ -87,16 +87,27 @@ fn launch_capture_upload_produces_valid_bundle() {
 
     // The bundle is a valid ZIP with the required documents.
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).expect("valid zip");
-    let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+    let names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
     assert!(names.iter().any(|n| n == "manifest.json"));
     assert!(names.iter().any(|n| n == "request.json"));
     assert!(names.iter().any(|n| n == ".apptoken"));
-    assert!(names.iter().any(|n| n.ends_with(".log.json")), "log capture file present: {names:?}");
-    assert!(names.iter().any(|n| n.ends_with(".events.user.json")), "event capture file present: {names:?}");
+    assert!(
+        names.iter().any(|n| n.ends_with(".log.json")),
+        "log capture file present: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with(".events.user.json")),
+        "event capture file present: {names:?}"
+    );
 
     // request.json reflects the scope (email) and the code_upload trigger.
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let req: Value = serde_json::from_slice(&rbytes).unwrap();
     assert_eq!(req["type"], "bug");
     assert_eq!(req["source"]["type"], "code_upload");
@@ -104,17 +115,28 @@ fn launch_capture_upload_produces_valid_bundle() {
 
     // manifest.json lists the capture files and carries the scope attribute.
     let mut mbytes = Vec::new();
-    zip.by_name("manifest.json").unwrap().read_to_end(&mut mbytes).unwrap();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_end(&mut mbytes)
+        .unwrap();
     let man: Value = serde_json::from_slice(&mbytes).unwrap();
     assert_eq!(man["version"], 1);
     assert_eq!(man["attrs"]["userTier"], "premium");
-    let types: Vec<&str> = man["files"].as_array().unwrap().iter().map(|f| f["type"].as_str().unwrap()).collect();
+    let types: Vec<&str> = man["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
     assert!(types.contains(&"log"));
     assert!(types.contains(&"events.user"));
 
     // The .apptoken carries the raw token.
     let mut token = String::new();
-    zip.by_name(".apptoken").unwrap().read_to_string(&mut token).unwrap();
+    zip.by_name(".apptoken")
+        .unwrap()
+        .read_to_string(&mut token)
+        .unwrap();
     assert_eq!(token, "APP_TOKEN_123");
 }
 

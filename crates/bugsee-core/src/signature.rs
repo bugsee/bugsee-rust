@@ -105,7 +105,10 @@ mod tests {
     #[test]
     fn sha1_empty_is_known_vector() {
         assert_eq!(sha1_hex(&[]), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(sha1_hex(&[b"abc"]), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            sha1_hex(&[b"abc"]),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
     }
 
     #[test]
@@ -115,7 +118,9 @@ mod tests {
         let b = panic_signature("index out of bounds", "len is 3", &frames, false, None);
         assert_eq!(a, b);
         assert_eq!(a.len(), 40);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -133,7 +138,10 @@ mod tests {
         let frames = vec!["a::b".to_string()];
         let s1 = panic_signature("E", "failed id 12345", &frames, true, None);
         let s2 = panic_signature("E", "failed id 98761", &frames, true, None);
-        assert_eq!(s1, s2, "digit runs are normalized so ids don't fragment groups");
+        assert_eq!(
+            s1, s2,
+            "digit runs are normalized so ids don't fragment groups"
+        );
     }
 
     #[test]

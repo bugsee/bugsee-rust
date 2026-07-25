@@ -9,7 +9,9 @@
 
 use std::io::{Cursor, Read};
 
-use bugsee_core::bundle::{bundle_filename, compression_for, write_bundle, BundleEntry, EntryCompression};
+use bugsee_core::bundle::{
+    bundle_filename, compression_for, write_bundle, BundleEntry, EntryCompression,
+};
 use bugsee_core::model::enums::{IssueType, Severity, TriggerType};
 use bugsee_core::model::environment::Environment;
 use bugsee_core::model::report::{FileDescriptor, IssueRequest, Manifest, Source, TimeWindow};
@@ -48,7 +50,10 @@ fn compression_policy_matches_mobile() {
 fn bundle_filename_shape() {
     let name = bundle_filename();
     assert!(name.ends_with(".bundle.zip"));
-    assert_eq!(name.len(), "xxxxxxxxxxxxxxxxxxxx".len() + ".bundle.zip".len());
+    assert_eq!(
+        name.len(),
+        "xxxxxxxxxxxxxxxxxxxx".len() + ".bundle.zip".len()
+    );
 }
 
 #[test]
@@ -69,11 +74,15 @@ fn bundle_roundtrip_layout_and_compression() {
 
     let entries = vec![
         BundleEntry::new(".apptoken", b"APP_TOKEN_RAW".to_vec()),
-        BundleEntry::new("request.json", serde_json::to_vec(&sample_request()).unwrap()),
+        BundleEntry::new(
+            "request.json",
+            serde_json::to_vec(&sample_request()).unwrap(),
+        ),
         BundleEntry::new("manifest.json", serde_json::to_vec(&manifest).unwrap()),
         BundleEntry::new(
             log_file,
-            br#"{"version":2,"events":[{"timestamp":1,"level":3,"source":1,"message":"hi"}]}"#.to_vec(),
+            br#"{"version":2,"events":[{"timestamp":1,"level":3,"source":1,"message":"hi"}]}"#
+                .to_vec(),
         ),
         BundleEntry::new(
             "crash.json",
@@ -90,7 +99,11 @@ fn bundle_roundtrip_layout_and_compression() {
     // Flat archive — no directory separators in any name.
     for i in 0..zip.len() {
         let f = zip.by_index(i).unwrap();
-        assert!(!f.name().contains('/'), "archive must be flat: {}", f.name());
+        assert!(
+            !f.name().contains('/'),
+            "archive must be flat: {}",
+            f.name()
+        );
     }
 
     // request.json must be STORED; JSON capture files must be Zstd (method 93).
@@ -109,12 +122,18 @@ fn bundle_roundtrip_layout_and_compression() {
 
     // .apptoken round-trips as raw bytes.
     let mut token = String::new();
-    zip.by_name(".apptoken").unwrap().read_to_string(&mut token).unwrap();
+    zip.by_name(".apptoken")
+        .unwrap()
+        .read_to_string(&mut token)
+        .unwrap();
     assert_eq!(token, "APP_TOKEN_RAW");
 
     // manifest.json parses back to the contract shape.
     let mut mbytes = Vec::new();
-    zip.by_name("manifest.json").unwrap().read_to_end(&mut mbytes).unwrap();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_end(&mut mbytes)
+        .unwrap();
     let mv: Value = serde_json::from_slice(&mbytes).unwrap();
     assert_eq!(mv["version"], 1);
     assert_eq!(mv["time"]["start"], 1_720_512_345_678i64);
@@ -123,10 +142,16 @@ fn bundle_roundtrip_layout_and_compression() {
 
     // request.json parses back with the crash metadata.
     let mut rbytes = Vec::new();
-    zip.by_name("request.json").unwrap().read_to_end(&mut rbytes).unwrap();
+    zip.by_name("request.json")
+        .unwrap()
+        .read_to_end(&mut rbytes)
+        .unwrap();
     let rv: Value = serde_json::from_slice(&rbytes).unwrap();
     assert_eq!(rv["type"], "crash");
     assert_eq!(rv["severity"], 3);
     assert_eq!(rv["source"]["type"], "crash");
-    assert_eq!(rv["environment"]["platform"]["type"], serde_json::json!(std::env::consts::OS));
+    assert_eq!(
+        rv["environment"]["platform"]["type"],
+        serde_json::json!(std::env::consts::OS)
+    );
 }

@@ -27,14 +27,28 @@ fn full_c_abi_lifecycle() {
     );
     assert_eq!(bugsee_is_active(), 1);
 
-    assert_eq!(unsafe { bugsee_log(BugseeStatus::Ok as i32 + 3, c("hello").as_ptr()) }, BugseeStatus::Ok);
-    assert_eq!(unsafe { bugsee_event(c("app_started").as_ptr()) }, BugseeStatus::Ok);
     assert_eq!(
-        unsafe { bugsee_event_with_params(c("promo").as_ptr(), c(r#"{"code":"SAVE10"}"#).as_ptr()) },
+        unsafe { bugsee_log(BugseeStatus::Ok as i32 + 3, c("hello").as_ptr()) },
         BugseeStatus::Ok
     );
-    assert_eq!(unsafe { bugsee_trace(c("temp").as_ptr(), c("21.5").as_ptr()) }, BugseeStatus::Ok);
-    assert_eq!(unsafe { bugsee_set_email(c("user@example.com").as_ptr()) }, BugseeStatus::Ok);
+    assert_eq!(
+        unsafe { bugsee_event(c("app_started").as_ptr()) },
+        BugseeStatus::Ok
+    );
+    assert_eq!(
+        unsafe {
+            bugsee_event_with_params(c("promo").as_ptr(), c(r#"{"code":"SAVE10"}"#).as_ptr())
+        },
+        BugseeStatus::Ok
+    );
+    assert_eq!(
+        unsafe { bugsee_trace(c("temp").as_ptr(), c("21.5").as_ptr()) },
+        BugseeStatus::Ok
+    );
+    assert_eq!(
+        unsafe { bugsee_set_email(c("user@example.com").as_ptr()) },
+        BugseeStatus::Ok
+    );
     assert_eq!(
         unsafe { bugsee_set_attribute(c("tier").as_ptr(), c(r#""premium""#).as_ptr()) },
         BugseeStatus::Ok
@@ -50,7 +64,10 @@ fn full_c_abi_lifecycle() {
         BugseeStatus::InvalidArgument
     );
     // Null arguments are rejected.
-    assert_eq!(unsafe { bugsee_event(std::ptr::null()) }, BugseeStatus::InvalidArgument);
+    assert_eq!(
+        unsafe { bugsee_event(std::ptr::null()) },
+        BugseeStatus::InvalidArgument
+    );
 
     assert_eq!(bugsee_pause(), BugseeStatus::Ok);
     assert_eq!(bugsee_is_active(), 0, "paused is not active");
