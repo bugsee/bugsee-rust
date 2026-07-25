@@ -73,13 +73,21 @@ pub fn panic_signature(
     handled: bool,
     domain: Option<&str>,
 ) -> String {
+    // A `0x00` separator between every variable-length segment prevents the
+    // `H(a ‖ b) == H(ab)` ambiguity (a boundary-shifted name/reason/frame must
+    // not collide with a different split).
+    const SEP: &[u8] = b"\x00";
     let mut h = Sha1::new();
     h.update(name.as_bytes());
+    h.update(SEP);
     h.update(normalize_reason(reason).as_bytes());
+    h.update(SEP);
     for frame in frames {
         h.update(normalize_frame(frame).as_bytes());
+        h.update(SEP);
     }
     h.update(if handled { b"1" } else { b"0" });
+    h.update(SEP);
     if let Some(d) = domain {
         h.update(d.as_bytes());
     }
@@ -89,10 +97,13 @@ pub fn panic_signature(
 /// Signature for a native fatal crash: `signal + module + relative-PC` per frame
 /// of the crashing thread.
 pub fn native_signature(signal: &str, frames: &[(String, u64)]) -> String {
+    const SEP: &[u8] = b"\x00";
     let mut h = Sha1::new();
     h.update(signal.as_bytes());
+    h.update(SEP);
     for (module, rel_pc) in frames {
         h.update(module.as_bytes());
+        h.update(SEP);
         h.update(rel_pc.to_le_bytes());
     }
     hex(h.finalize())

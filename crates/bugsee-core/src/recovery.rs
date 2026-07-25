@@ -25,6 +25,9 @@ use crate::signature::panic_signature;
 pub const MINIDUMP_NAME: &str = "crash.minidump";
 /// The async-signal-safe crash-info marker written by the native handler.
 pub const CRASH_INFO_NAME: &str = "crash.info";
+/// The install-time module map (`base→name`) written by the native handler.
+/// MUST match `bugsee_native`'s `MODULES_NAME`.
+pub const MODULES_NAME: &str = "crash.modules";
 /// POSIX `SIGABRT` — the signal an aborting Rust panic raises.
 const SIGABRT: i32 = 6;
 
@@ -51,6 +54,11 @@ pub struct RecoveredReport {
 
 /// Find prior generations (`< current_generation`) whose liveness marker
 /// survived — i.e. that ended abnormally.
+///
+/// A surviving marker whose owning process is **still alive** is skipped: with a
+/// shared data dir, a concurrently-running peer (which claimed a lower generation
+/// because it launched earlier) has a live marker that is *not* a crash. Its
+/// marker is left in place for a future launch to recover once the peer is gone.
 pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSession> {
     let mut pending = Vec::new();
     let sessions = data_dir.join("sessions");
@@ -58,7 +66,9 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         Ok(r) => r,
         Err(_) => return pending,
     };
+    let self_pid = std::process::id();
     for entry in read.flatten() {
+        let marker = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(gen_str) = name.strip_suffix(".alive") else {
             continue;
@@ -69,6 +79,27 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         if generation >= current_generation {
             continue;
         }
+        // Decide from the marker's recorded owner pid whether this is a real
+        // crash or a still-running shared-dir peer.
+        let owner = std::fs::read_to_string(&marker).unwrap_or_default();
+        let owner = owner.trim();
+        if owner.is_empty() {
+            // Present but not yet populated: `Session::begin` creates the marker
+            // (O_EXCL) and writes the pid a moment later, so a peer launching
+            // concurrently can observe this empty window. Skip this launch rather
+            // than misclassify a live peer's fresh session as a crash — recovering
+            // it would upload a phantom report AND delete the peer's live marker.
+            continue;
+        }
+        if let Ok(pid) = owner.parse::<u32>() {
+            // Skip a marker still owned by a live *other* process. Our own pid is
+            // never skipped (a live process cannot share our pid, so a marker
+            // bearing it is a dead prior incarnation — recover it).
+            if pid != self_pid && process_is_alive(pid) {
+                continue;
+            }
+        }
+        // Non-empty but unparseable content ⇒ the owner is gone; recover.
         let parts_dir = data_dir.join("parts").join(generation.to_string());
         let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
         let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
@@ -88,10 +119,35 @@ fn exists_opt(p: PathBuf) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Build the crash report for a pending session. Precedence: an aborting panic
-/// (`SIGABRT` + a panic snapshot) correlates into one event; otherwise a native
-/// crash yields the thin native variant, a lone panic snapshot yields a fatal
-/// panic, and anything else is an abnormal termination.
+/// Whether a process with `pid` currently exists.
+///
+/// Uses `kill(pid, 0)`, which sends no signal and only probes existence: `0`
+/// (permitted) or `EPERM` (exists, not permitted) both mean *alive*; `ESRCH`
+/// means gone. A rare pid-reuse false-positive can defer recovering a real crash
+/// to a later launch — acceptable vs. corrupting a running peer's live session.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 performs only an error/permission check and
+    // has no side effects; it is safe to call with any pid value.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// No portable liveness probe off-unix: treat as dead so recovery still proceeds
+/// (single-process is the common case; a live shared-dir peer is a unix concern).
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Build the crash report for a pending session. Precedence: a *fresh* aborting
+/// panic (`SIGABRT` + a recent panic snapshot) correlates into one managed event;
+/// any other native signal yields the thin native variant; and a session with no
+/// native signal at all (including one carrying only a stale/contained panic
+/// snapshot) is reported as an abnormal termination.
 pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
     let has_native = pending.minidump.is_some() || pending.crash_info.is_some();
     let signal = read_signal_info(pending);
@@ -101,12 +157,20 @@ pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport
         .and_then(|p| PanicInfo::read_from(p));
 
     match (has_native, panic) {
-        (true, Some(info)) if signal.as_ref().map(|s| s.number) == Some(SIGABRT) => {
-            build_correlated(pending, info, signal, timestamp)
+        // Correlate ONLY a fresh panic snapshot with a SIGABRT — a stale snapshot
+        // left by a caught/foreign-contained panic must not be welded onto an
+        // unrelated later crash.
+        (true, Some(info))
+            if signal.as_ref().map(|s| s.number) == Some(SIGABRT)
+                && signal.as_ref().map(|s| is_fresh(s, &info)).unwrap_or(false) =>
+        {
+            build_correlated(pending, info, timestamp)
         }
         (true, _) => build_native(pending, timestamp),
-        (false, Some(info)) => build_fatal_panic(info, timestamp),
-        (false, None) => build_abnormal_exit(timestamp),
+        // A lone panic snapshot with NO native signal means the panic was
+        // contained (the process did not die from it) — report the abnormal exit,
+        // not a fabricated fatal panic.
+        (false, _) => build_abnormal_exit(timestamp),
     }
 }
 
@@ -120,51 +184,15 @@ fn read_signal_info(pending: &PendingSession) -> Option<SignalInfo> {
 /// the panic frames/message, with the signal recorded via the exception
 /// `domain` (the contract reserves the `signal` object for the native variant,
 /// so a managed variant must not emit it).
-fn build_correlated(
-    pending: &PendingSession,
-    info: PanicInfo,
-    signal: Option<SignalInfo>,
-    timestamp: i64,
-) -> RecoveredReport {
+fn build_correlated(pending: &PendingSession, info: PanicInfo, timestamp: i64) -> RecoveredReport {
     let frame_sigs: Vec<String> = info
         .frames
         .iter()
         .filter(|f| !f.hidden)
         .map(|f| f.trace.clone())
         .collect();
-    let domain = signal.map(|s| format!("Signal::{}", signal_name(s.number)));
-    let signature = panic_signature("panic", &info.reason, &frame_sigs, false, domain.as_deref());
-    let crash = CrashReport {
-        uuid: None,
-        timestamp,
-        handled: false,
-        obfuscated: false,
-        ndk_crash: false,
-        exception_type: "exception".into(),
-        signatures: vec![signature.clone()],
-        exception: ExceptionInfo {
-            name: "panic".into(),
-            reason: reason_with_location(&info),
-            domain,
-            frames: info.frames,
-            cause: None,
-        },
-    };
-    RecoveredReport {
-        meta: crash_meta(vec![signature], TriggerType::Crash),
-        crash_json: crash.to_bytes().unwrap_or_default(),
-        extra_files: read_minidump(pending),
-    }
-}
-
-/// A Rust panic that ended the process without a native marker.
-fn build_fatal_panic(info: PanicInfo, timestamp: i64) -> RecoveredReport {
-    let frame_sigs: Vec<String> = info
-        .frames
-        .iter()
-        .filter(|f| !f.hidden)
-        .map(|f| f.trace.clone())
-        .collect();
+    // A plain managed crash: `domain` is null (matches the live `build_panic`
+    // path and the contract; the SIGABRT is implied by the aborting panic).
     let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
     let crash = CrashReport {
         uuid: None,
@@ -185,7 +213,7 @@ fn build_fatal_panic(info: PanicInfo, timestamp: i64) -> RecoveredReport {
     RecoveredReport {
         meta: crash_meta(vec![signature], TriggerType::Crash),
         crash_json: crash.to_bytes().unwrap_or_default(),
-        extra_files: Vec::new(),
+        extra_files: read_minidump(pending),
     }
 }
 
@@ -211,16 +239,71 @@ fn read_minidump(pending: &PendingSession) -> Vec<ExtraFile> {
 }
 
 /// Remove a recovered session's on-disk state. The liveness marker is removed
-/// **first**: a crash between the two steps then leaks a parts directory (later
-/// GC'able) rather than leaving a marker that would re-recover a phantom empty
-/// report or duplicate the already-delivered one.
+/// **first**: a crash between the steps then leaks a parts directory (later
+/// GC'able via [`gc_orphans`]) rather than leaving a marker that would re-recover
+/// a phantom empty report or duplicate the already-delivered one.
 pub fn discard(data_dir: &Path, pending: &PendingSession) {
-    let _ = std::fs::remove_file(
-        data_dir
-            .join("sessions")
-            .join(format!("{}.alive", pending.generation)),
-    );
+    let sessions = data_dir.join("sessions");
+    let _ = std::fs::remove_file(sessions.join(format!("{}.alive", pending.generation)));
+    let _ = std::fs::remove_file(sessions.join(format!("{}.attempts", pending.generation)));
     let _ = std::fs::remove_dir_all(&pending.parts_dir);
+}
+
+/// The recovery-attempt-counter sidecar path for a generation.
+fn attempts_path(data_dir: &Path, generation: u64) -> PathBuf {
+    data_dir
+        .join("sessions")
+        .join(format!("{generation}.attempts"))
+}
+
+/// Increment and return a pending session's recovery-attempt count. Bumped
+/// **before** each attempt so a pending that repeatedly panics the build/assemble
+/// path (a corrupt-parts poison pill) still converges to the cap and is abandoned
+/// instead of re-running — and aborting the whole recovery loop — every launch.
+pub fn bump_attempts(data_dir: &Path, pending: &PendingSession) -> u32 {
+    let path = attempts_path(data_dir, pending.generation);
+    let next = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let _ = std::fs::write(&path, next.to_string());
+    next
+}
+
+/// Reap leftover on-disk state from generations that no longer have a liveness
+/// marker — already recovered, or cleanly shut down: orphan `parts/<n>` dirs and
+/// stray `.attempts` sidecars for `n < current_generation`. Bounds unbounded disk
+/// growth from clean-exit part dirs and crash-interrupted discards (DESIGN.md §5).
+///
+/// Only marker-less generations are touched, so a live shared-dir peer's session
+/// (marker present) and any pending awaiting recovery are never disturbed.
+pub fn gc_orphans(data_dir: &Path, current_generation: u64) {
+    let sessions = data_dir.join("sessions");
+    let alive = |generation: u64| sessions.join(format!("{generation}.alive")).exists();
+
+    if let Ok(read) = std::fs::read_dir(data_dir.join("parts")) {
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(generation) = name.parse::<u64>() {
+                if generation < current_generation && !alive(generation) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+    if let Ok(read) = std::fs::read_dir(&sessions) {
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(gen_str) = name.strip_suffix(".attempts") {
+                if let Ok(generation) = gen_str.parse::<u64>() {
+                    if generation < current_generation && !alive(generation) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn build_abnormal_exit(timestamp: i64) -> RecoveredReport {
@@ -256,7 +339,14 @@ fn build_abnormal_exit(timestamp: i64) -> RecoveredReport {
 
 fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
     // Thin native variant: frames/threads are reconstructed server-side from the
-    // minidump; signatures are computed server-side too, so we send none.
+    // minidump. When the crash handler captured the crashing thread's frames, we
+    // ALSO compute a stable client-side dedup signature from module-relative
+    // offsets (mirroring the iOS/Android native feed) — this is what lets the
+    // local blacklist suppress a native crash-on-launch loop.
+    let signal = read_signal_info(pending);
+    let signature = native_frame_signature(pending, signal.as_ref());
+    let signatures: Vec<String> = signature.clone().into_iter().collect();
+
     let mut crash = serde_json::json!({
         "uuid": serde_json::Value::Null,
         "timestamp": timestamp,
@@ -264,26 +354,78 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
         "obfuscated": false,
         "ndkCrash": true,
         "exception_type": "native",
-        "signatures": [],
+        "signatures": signatures,
     });
-    if let Some(sig) = read_signal_info(pending) {
-        crash["signal"] = serde_json::json!({
-            "number": sig.number,
-            "name": signal_name(sig.number),
-            "code": sig.code,
-            "addr": sig.addr,
-            "code_name": serde_json::Value::Null,
-            "abort_message": serde_json::Value::Null,
-            "cause": serde_json::Value::Null,
-        });
-    }
+    // The native variant always carries a `signal` object (part of its thin
+    // shape). If no crash-info marker was written (e.g. a minidump-only session),
+    // emit it with unknown/nulled fields rather than omitting it entirely.
+    let number = signal.as_ref().map(|s| s.number).unwrap_or(0);
+    crash["signal"] = serde_json::json!({
+        "number": number,
+        "name": signal_name(number),
+        "code": signal.as_ref().map(|s| s.code).unwrap_or(0),
+        "addr": signal.as_ref().map(|s| s.addr.clone()).unwrap_or_else(|| "0x0".into()),
+        "code_name": serde_json::Value::Null,
+        "abort_message": serde_json::Value::Null,
+        "cause": serde_json::Value::Null,
+    });
     let crash_json = serde_json::to_vec(&crash).unwrap_or_default();
 
     RecoveredReport {
-        meta: crash_meta(Vec::new(), TriggerType::Crash),
+        meta: crash_meta(signature.into_iter().collect(), TriggerType::Crash),
         crash_json,
         extra_files: read_minidump(pending),
     }
+}
+
+/// Compute a native crash dedup signature from the crashing thread's frame PCs
+/// resolved to `(module, offset)` via the install-time module map. Returns `None`
+/// when no frames or module map are available (recovery then sends no client
+/// signature, leaving dedup to the server, rather than a too-coarse one).
+fn native_frame_signature(pending: &PendingSession, signal: Option<&SignalInfo>) -> Option<String> {
+    let signal = signal?;
+    if signal.frames.is_empty() {
+        return None;
+    }
+    let modules = read_modules(&pending.parts_dir.join(MODULES_NAME));
+    if modules.is_empty() {
+        return None;
+    }
+    // Absolute PC → (module, pc - base); frames in modules loaded after the
+    // install-time snapshot resolve to nothing and are skipped.
+    let frames: Vec<(String, u64)> = signal
+        .frames
+        .iter()
+        .filter_map(|&pc| resolve_module_offset(pc, &modules))
+        .collect();
+    if frames.is_empty() {
+        return None;
+    }
+    Some(crate::signature::native_signature(
+        signal_name(signal.number),
+        &frames,
+    ))
+}
+
+/// The module with the largest base ≤ `pc`, and the offset within it.
+fn resolve_module_offset(pc: usize, modules: &[(usize, String)]) -> Option<(String, u64)> {
+    modules
+        .iter()
+        .filter(|(base, _)| *base <= pc)
+        .max_by_key(|(base, _)| *base)
+        .map(|(base, name)| (name.clone(), (pc - base) as u64))
+}
+
+/// Read the module map (`<base_hex>\t<name>` per line) written at install time.
+fn read_modules(path: &Path) -> Vec<(usize, String)> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let (base, name) = line.split_once('\t')?;
+            let base = usize::from_str_radix(base.trim(), 16).ok()?;
+            Some((base, name.to_string()))
+        })
+        .collect()
 }
 
 /// Parsed native crash-info marker.
@@ -291,6 +433,11 @@ struct SignalInfo {
     number: i32,
     code: i32,
     addr: String,
+    /// Crash time (epoch ms) written by the native handler; `0` if unknown.
+    time: i64,
+    /// Absolute PCs of the crashing thread's frames (resolved to module offsets
+    /// at signature time); empty if the handler captured none.
+    frames: Vec<usize>,
 }
 
 /// Parse the async-signal-safe `key=value` crash-info marker.
@@ -298,6 +445,8 @@ fn parse_crash_info(text: &str) -> SignalInfo {
     let mut number = 0;
     let mut code = 0;
     let mut addr = "0x0".to_string();
+    let mut time = 0;
+    let mut frames = Vec::new();
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -306,10 +455,35 @@ fn parse_crash_info(text: &str) -> SignalInfo {
             "signal" => number = v.trim().parse().unwrap_or(0),
             "code" => code = v.trim().parse().unwrap_or(0),
             "address" | "addr" => addr = v.trim().to_string(),
+            "time" => time = v.trim().parse().unwrap_or(0),
+            "frame" => {
+                let hex = v.trim().trim_start_matches("0x");
+                if let Ok(pc) = usize::from_str_radix(hex, 16) {
+                    frames.push(pc);
+                }
+            }
             _ => {}
         }
     }
-    SignalInfo { number, code, addr }
+    SignalInfo {
+        number,
+        code,
+        addr,
+        time,
+        frames,
+    }
+}
+
+/// Max gap (ms) between a native crash and a panic snapshot for them to be
+/// treated as the same event. Prevents a stale `panic.info` (from a caught /
+/// foreign-contained panic) from being welded onto an unrelated later crash.
+const CORRELATION_WINDOW_MS: i64 = 10_000;
+
+/// Whether a panic snapshot is fresh enough (vs. the crash time) to correlate.
+fn is_fresh(signal: &SignalInfo, info: &PanicInfo) -> bool {
+    signal.time != 0
+        && info.timestamp != 0
+        && (signal.time - info.timestamp).abs() <= CORRELATION_WINDOW_MS
 }
 
 /// POSIX signal name for a number (common fatal signals).

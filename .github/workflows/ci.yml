@@ -42,18 +42,24 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   msrv:
-    name: build (MSRV 1.85)
+    name: build (MSRV 1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install pinned MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@1.86.0
 
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
 
+      # --locked forces the committed Cargo.lock: MSRV is only meaningful against
+      # the exact dependency graph it was verified with (newer transitive deps can
+      # silently raise the floor). Scope is deliberately lib/bin only (no
+      # --all-targets): MSRV is a promise about the consumer-facing crates, and
+      # dev-deps (proptest, …) may float a higher floor that would give a false
+      # MSRV failure unrelated to what downstreams actually compile.
       - name: Build (MSRV)
-        run: cargo build --workspace
+        run: cargo build --workspace --locked

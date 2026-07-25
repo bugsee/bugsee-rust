@@ -60,19 +60,28 @@ pub fn deliver(
     report: &AssembledReport,
 ) -> Result<(), TransportError> {
     for attempt in 0..2 {
-        // Ensure we hold an access token.
+        // Ensure we hold an access token, never holding the lock across the
+        // (blocking) network call: read under the lock, register outside it, then
+        // briefly re-lock to store — so a future second locker of `session` can't
+        // stall behind a token refresh.
         let token = {
-            let mut guard = session.lock().unwrap();
-            if guard.is_none() {
-                *guard = Some(transport.register_session(app_token, environment_json)?);
+            let existing = session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match existing {
+                Some(t) => Some(t),
+                None => {
+                    let fresh = transport.register_session(app_token, environment_json)?;
+                    let mut guard = session.lock().unwrap_or_else(|e| e.into_inner());
+                    // Another path may have registered while we were unlocked;
+                    // keep the existing token if so, else store ours.
+                    Some(guard.get_or_insert(fresh).clone())
+                }
             }
-            guard.clone()
         };
 
         match transport.create_issue(app_token, token.as_deref(), &report.request_json) {
             Ok(endpoint) => return transport.upload_bundle(&endpoint, &report.zip),
             Err(TransportError::SessionExpired) if attempt == 0 => {
-                *session.lock().unwrap() = None; // force re-register, retry
+                *session.lock().unwrap_or_else(|e| e.into_inner()) = None; // re-register, retry
                 continue;
             }
             Err(e) => return Err(e),

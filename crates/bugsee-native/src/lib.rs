@@ -22,6 +22,13 @@ use std::path::PathBuf;
 
 use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 
+/// Max crashing-thread frames captured for the dedup signature.
+const MAX_FRAMES: usize = 64;
+/// Module-map file (base→name) written next to `crash.info` at install time and
+/// read back by recovery to turn crash-time frame PCs into stable module offsets.
+/// MUST match `bugsee_core::recovery::MODULES_NAME`.
+const MODULES_NAME: &str = "crash.modules";
+
 /// Keeps the native crash handler installed for its lifetime.
 pub struct NativeHandler {
     _handler: CrashHandler,
@@ -31,6 +38,13 @@ pub struct NativeHandler {
 /// a fatal crash. Keep the returned guard alive for the handler to stay active.
 pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
     let path_bytes = path_to_cbytes(&crash_info_path);
+
+    // Snapshot the loaded module map NOW: `dyld`/`dl_iterate_phdr` are not
+    // async-signal-safe, so this cannot run at crash time. Recovery joins these
+    // bases with the crash-time frame PCs to derive ASLR-invariant offsets.
+    if let Some(dir) = crash_info_path.parent() {
+        write_modules_file(&dir.join(MODULES_NAME));
+    }
 
     let handler = CrashHandler::attach(unsafe {
         crash_handler::make_crash_event(move |cc: &CrashContext| {
@@ -68,12 +82,15 @@ fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
     let si = cc.siginfo;
+    let mut frames = [0usize; MAX_FRAMES];
+    let n = capture_frames(cc, &mut frames);
     unsafe {
         write_marker(
             path_cbytes,
             si.ssi_signo as i32,
             si.ssi_code,
             si.ssi_addr as usize,
+            &frames[..n],
         );
     }
 }
@@ -81,20 +98,48 @@ fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
 // Apple platforms deliver a Mach exception — map it to the closest signal.
 #[cfg(target_vendor = "apple")]
 fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
+    // Mach exception kinds + codes we special-case (mach/exception_types.h).
+    const EXC_BAD_ACCESS: u32 = 1;
+    const EXC_SOFTWARE: u32 = 5;
+    // EXC_SOFTWARE code[0] marking a delivered Unix signal; the subcode (code[1])
+    // then holds the *signal number*, NOT a fault address.
+    const EXC_SOFT_SIGNAL: i64 = 0x10003;
+    const SIGSEGV: i32 = 11;
+    const SIGABRT: i32 = 6;
+
     let (signo, code, addr) = match &cc.exception {
-        Some(e) => (
-            mach_to_signal(e.kind),
-            e.code as i32,
-            e.subcode.unwrap_or(0) as usize,
-        ),
+        Some(e) => {
+            if e.kind == EXC_SOFTWARE && e.code as i64 == EXC_SOFT_SIGNAL {
+                // A Unix signal delivered as a Mach exception (e.g. SIGABRT from a
+                // Swift fatalError / uncaught NSException): the real signal is in
+                // the subcode, and there is no fault address.
+                (
+                    e.subcode.map(|s| s as i32).unwrap_or(SIGABRT),
+                    e.code as i32,
+                    0,
+                )
+            } else if e.kind == EXC_BAD_ACCESS {
+                // Only EXC_BAD_ACCESS carries a fault address in the subcode.
+                (SIGSEGV, e.code as i32, e.subcode.unwrap_or(0) as usize)
+            } else {
+                // Other exceptions: map kind→signal; the subcode is not a reliable
+                // address for these, so don't record it as one.
+                (mach_to_signal(e.kind), e.code as i32, 0)
+            }
+        }
         None => (0, 0, 0),
     };
+    let mut frames = [0usize; MAX_FRAMES];
+    let n = unsafe { capture_frames(cc, &mut frames) };
     unsafe {
-        write_marker(path_cbytes, signo, code, addr);
+        write_marker(path_cbytes, signo, code, addr, &frames[..n]);
     }
 }
 
 /// Map a Mach exception kind to the closest POSIX signal number (BSD values).
+/// `EXC_BAD_ACCESS`/`EXC_SOFTWARE` are handled by the caller; an unknown kind
+/// maps to `0` (UNKNOWN) rather than masquerading as `SIGABRT` — which would make
+/// it spuriously eligible for panic↔SIGABRT correlation on the next launch.
 #[cfg(target_vendor = "apple")]
 fn mach_to_signal(kind: u32) -> i32 {
     match kind {
@@ -102,7 +147,7 @@ fn mach_to_signal(kind: u32) -> i32 {
         2 => 4,  // EXC_BAD_INSTRUCTION -> SIGILL
         3 => 8,  // EXC_ARITHMETIC      -> SIGFPE
         6 => 5,  // EXC_BREAKPOINT      -> SIGTRAP
-        _ => 6,  // default             -> SIGABRT
+        _ => 0,  // EXC_CRASH/RESOURCE/GUARD/… -> UNKNOWN (not SIGABRT)
     }
 }
 
@@ -110,7 +155,7 @@ fn mach_to_signal(kind: u32) -> i32 {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn on_crash(path_cbytes: &[u8], _cc: &CrashContext) {
     unsafe {
-        write_marker(path_cbytes, 0, 0, 0);
+        write_marker(path_cbytes, 0, 0, 0, &[]);
     }
 }
 
@@ -138,20 +183,25 @@ impl StackBuf {
             self.byte(b);
         }
     }
-    fn dec(&mut self, mut v: i64) {
-        if v < 0 {
+    fn dec(&mut self, v: i64) {
+        // Work in unsigned magnitude so `i64::MIN` (whose negation overflows) is
+        // handled correctly: `(v as u64).wrapping_neg()` is the two's-complement
+        // magnitude for any negative `v`, including `i64::MIN`.
+        let mut m: u64 = if v < 0 {
             self.byte(b'-');
-            v = -v;
-        }
-        if v == 0 {
+            (v as u64).wrapping_neg()
+        } else {
+            v as u64
+        };
+        if m == 0 {
             self.byte(b'0');
             return;
         }
         let mut tmp = [0u8; 20];
         let mut n = 0;
-        while v > 0 {
-            tmp[n] = b'0' + (v % 10) as u8;
-            v /= 10;
+        while m > 0 {
+            tmp[n] = b'0' + (m % 10) as u8;
+            m /= 10;
             n += 1;
         }
         while n > 0 {
@@ -181,7 +231,7 @@ impl StackBuf {
 
 /// Write the crash-info marker using only async-signal-safe primitives.
 #[cfg(unix)]
-unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize) {
+unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize, frames: &[usize]) {
     let fd = unsafe {
         libc::open(
             path_cbytes.as_ptr() as *const libc::c_char,
@@ -192,6 +242,21 @@ unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize) {
     if fd < 0 {
         return;
     }
+    // Crash time (epoch ms) via clock_gettime — async-signal-safe, lets
+    // next-launch recovery bound panic↔crash correlation by freshness.
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // `tv_sec`/`tv_nsec` are `time_t`/`c_long`, whose widths vary by target
+    // (e.g. 32-bit on some platforms), so the casts to `i64` are needed for
+    // portability even where clippy sees them as no-ops on this host.
+    #[allow(clippy::unnecessary_cast)]
+    let time_ms = if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } == 0 {
+        ts.tv_sec as i64 * 1000 + ts.tv_nsec as i64 / 1_000_000
+    } else {
+        0
+    };
     let mut b = StackBuf::new();
     b.s(b"signal=");
     b.dec(signo as i64);
@@ -199,14 +264,240 @@ unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize) {
     b.dec(code as i64);
     b.s(b"\naddress=0x");
     b.hex(addr);
+    b.s(b"\ntime=");
+    b.dec(time_ms);
     b.byte(b'\n');
     unsafe {
         let _ = libc::write(fd, b.buf.as_ptr() as *const libc::c_void, b.len);
+    }
+    // Append one `frame=0x<pc>` line per captured absolute PC. Each line is
+    // formatted in its own stack buffer and written immediately (no heap), so an
+    // arbitrary frame count never overruns a single fixed buffer.
+    for &pc in frames {
+        let mut fb = StackBuf::new();
+        fb.s(b"frame=0x");
+        fb.hex(pc);
+        fb.byte(b'\n');
+        unsafe {
+            let _ = libc::write(fd, fb.buf.as_ptr() as *const libc::c_void, fb.len);
+        }
+    }
+    unsafe {
         let _ = libc::close(fd);
     }
 }
 
 #[cfg(not(unix))]
-unsafe fn write_marker(_path_cbytes: &[u8], _signo: i32, _code: i32, _addr: usize) {
+unsafe fn write_marker(
+    _path_cbytes: &[u8],
+    _signo: i32,
+    _code: i32,
+    _addr: usize,
+    _frames: &[usize],
+) {
     // Windows marker writing is added with the Windows exception path.
+}
+
+// ---------------------------------------------------------------------------
+// Module map (captured at install) + crash-time frame capture.
+// ---------------------------------------------------------------------------
+
+/// Write the loaded-module map (`<base_hex>\t<name>` per line) so recovery can
+/// turn crash-time frame PCs into ASLR-invariant `pc - base` module offsets.
+fn write_modules_file(path: &std::path::Path) {
+    let modules = snapshot_modules();
+    if modules.is_empty() {
+        return;
+    }
+    let mut body = String::with_capacity(modules.len() * 32);
+    for (base, name) in modules {
+        body.push_str(&format!("{base:x}\t{name}\n"));
+    }
+    let _ = std::fs::write(path, body);
+}
+
+/// The trailing path component (module file name).
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Enumerate loaded modules as `(load_base, name)`. NOT async-signal-safe — call
+/// only from `install` (normal context).
+#[cfg(target_vendor = "apple")]
+fn snapshot_modules() -> Vec<(usize, String)> {
+    use mach2::dyld::{_dyld_get_image_header, _dyld_get_image_name, _dyld_image_count};
+    let mut modules = Vec::new();
+    let count = unsafe { _dyld_image_count() };
+    for i in 0..count {
+        let header = unsafe { _dyld_get_image_header(i) } as usize;
+        let name_ptr = unsafe { _dyld_get_image_name(i) };
+        if header == 0 || name_ptr.is_null() {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
+        modules.push((header, basename(&name)));
+    }
+    modules
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn snapshot_modules() -> Vec<(usize, String)> {
+    extern "C" fn collect(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        unsafe {
+            let modules = &mut *(data as *mut Vec<(usize, String)>);
+            let info = &*info;
+            let base = info.dlpi_addr as usize;
+            let name = if info.dlpi_name.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(info.dlpi_name)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            // The main executable reports an empty name.
+            let name = if name.is_empty() {
+                "main".to_string()
+            } else {
+                basename(&name)
+            };
+            modules.push((base, name));
+        }
+        0
+    }
+    let mut modules: Vec<(usize, String)> = Vec::new();
+    unsafe {
+        libc::dl_iterate_phdr(Some(collect), &mut modules as *mut _ as *mut libc::c_void);
+    }
+    modules
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn snapshot_modules() -> Vec<(usize, String)> {
+    Vec::new()
+}
+
+/// Capture up to [`MAX_FRAMES`] absolute PCs of the crashing thread into `out`,
+/// returning the count. Must be async-signal-safe.
+///
+/// Apple: the handler runs on a *separate* thread, so read the crashed thread's
+/// registers via `thread_get_state` and walk its frame-pointer chain with the
+/// fault-safe `mach_vm_read_overwrite`.
+#[cfg(target_vendor = "apple")]
+unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::thread_act::thread_get_state;
+    use mach2::thread_status::thread_state_t;
+
+    #[cfg(target_arch = "aarch64")]
+    let (pc, mut fp) = {
+        use mach2::structs::arm_thread_state64_t;
+        use mach2::thread_status::ARM_THREAD_STATE64;
+        let mut state = arm_thread_state64_t::new();
+        let mut count = arm_thread_state64_t::count();
+        let kr = unsafe {
+            thread_get_state(
+                cc.thread,
+                ARM_THREAD_STATE64,
+                &mut state as *mut _ as thread_state_t,
+                &mut count,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            return 0;
+        }
+        (state.__pc as usize, state.__fp as usize)
+    };
+    #[cfg(target_arch = "x86_64")]
+    let (pc, mut fp) = {
+        use mach2::structs::x86_thread_state64_t;
+        use mach2::thread_status::x86_THREAD_STATE64;
+        let mut state = x86_thread_state64_t::new();
+        let mut count = x86_thread_state64_t::count();
+        let kr = unsafe {
+            thread_get_state(
+                cc.thread,
+                x86_THREAD_STATE64,
+                &mut state as *mut _ as thread_state_t,
+                &mut count,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            return 0;
+        }
+        (state.__rip as usize, state.__rbp as usize)
+    };
+
+    let mut n = 0;
+    if pc != 0 {
+        out[n] = pc;
+        n += 1;
+    }
+    // Frame-pointer chain: [fp] = caller's fp, [fp + word] = return address
+    // (same layout on arm64 and x86_64).
+    while n < out.len() && fp >= 0x1000 {
+        let mut slot = [0usize; 2];
+        if !unsafe { read_task_mem(cc.task, fp, &mut slot) } {
+            break;
+        }
+        let (next_fp, ra) = (slot[0], slot[1]);
+        if ra == 0 {
+            break;
+        }
+        out[n] = ra;
+        n += 1;
+        // Stack grows down, so a valid caller frame is at a strictly higher
+        // address; anything else means the chain is corrupt — stop.
+        if next_fp <= fp {
+            break;
+        }
+        fp = next_fp;
+    }
+    n
+}
+
+/// Fault-safe read of two words at `addr` from `task` (returns false on bad
+/// memory instead of faulting — critical on the crash path).
+#[cfg(target_vendor = "apple")]
+unsafe fn read_task_mem(
+    task: mach2::mach_types::task_t,
+    addr: usize,
+    dst: &mut [usize; 2],
+) -> bool {
+    use mach2::vm::mach_vm_read_overwrite;
+    let want = core::mem::size_of::<[usize; 2]>() as u64;
+    let mut outsize: u64 = 0;
+    let kr = unsafe {
+        mach_vm_read_overwrite(
+            task,
+            addr as u64,
+            want,
+            dst.as_mut_ptr() as u64,
+            &mut outsize,
+        )
+    };
+    kr == mach2::kern_return::KERN_SUCCESS && outsize == want
+}
+
+/// Linux/Android: the handler runs on the crashing thread, so a signal-safe
+/// unwind of the current stack captures the fault (handles x86_64 and aarch64).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn capture_frames(_cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
+    let mut n = 0;
+    unsafe {
+        backtrace::trace_unsynchronized(|frame| {
+            if n < out.len() {
+                out[n] = frame.ip() as usize;
+                n += 1;
+                true
+            } else {
+                false
+            }
+        });
+    }
+    n
 }

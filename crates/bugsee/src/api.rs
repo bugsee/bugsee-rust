@@ -95,14 +95,27 @@ impl Bugsee {
         let panic_info_path = recorder.panic_info_path();
 
         // Install the native crash handler pointing at this generation's marker.
+        // Replace under a brief lock, then drop the OLD handler outside it.
         #[cfg(feature = "native")]
         if options.native_crash_capture {
             if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
-                *NATIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
+                let old = NATIVE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .replace(handler);
+                drop(old);
             }
         }
 
-        *RECORDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(recorder);
+        // Install the new recorder and drop any previous one OUTSIDE the lock:
+        // `Recorder::drop` joins the worker/uploader threads (blocking up to a few
+        // seconds), and doing that under the global lock would stall every
+        // concurrent capture call — the same hazard `stop()` guards against.
+        let old = RECORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(recorder);
+        drop(old);
         PAUSED.store(false, Ordering::SeqCst);
 
         #[cfg(feature = "panic")]
@@ -194,11 +207,13 @@ impl Bugsee {
         if PAUSED.load(Ordering::SeqCst) {
             return;
         }
-        // Consult the recorder's hook on the caller path. `with_recorder` returns
-        // `None` when not launched (no-op, matching every other capture method);
-        // an inner `None` means the hook dropped the breadcrumb.
-        if let Some(Some(crumb)) = Self::with_recorder(|r| r.before_breadcrumb(entry)) {
-            Self::capture(CaptureEntry::Breadcrumb(crumb));
+        // Run the host `before_breadcrumb` hook OFF the global lock (the hook may
+        // call back into Bugsee — under the lock that would self-deadlock).
+        // `None` handle = not launched (no-op); inner `None` = hook dropped it.
+        if let Some(h) = Self::handle() {
+            if let Some(crumb) = h.before_breadcrumb(entry) {
+                h.capture(CaptureEntry::Breadcrumb(crumb));
+            }
         }
     }
 
@@ -281,7 +296,8 @@ impl Bugsee {
     /// disk) so later eviction cannot erode it while the report is held open.
     pub fn create_report() -> Report {
         let now = epoch_ms();
-        let snapshot = Self::with_recorder(|r| r.create_snapshot(now)).flatten();
+        // Off-lock: create_snapshot blocks on the worker; must not hold the mutex.
+        let snapshot = Self::handle().and_then(|h| h.create_snapshot(now));
         Report::new(snapshot, now)
     }
 
@@ -295,7 +311,8 @@ impl Bugsee {
 
     /// Block until pending work drains, or `timeout` elapses.
     pub fn flush(timeout: Duration) -> bool {
-        Self::with_recorder(|r| r.flush(timeout)).unwrap_or(false)
+        // Off-lock: flush blocks; must not hold the mutex across the wait.
+        Self::handle().map(|h| h.flush(timeout)).unwrap_or(false)
     }
 
     fn capture(entry: CaptureEntry) {
@@ -312,6 +329,17 @@ impl Bugsee {
             .as_ref()
             .map(f)
     }
+
+    /// Clone a cheap [`bugsee_core::RecorderHandle`] out from under the global
+    /// lock, so blocking or host-callback work runs WITHOUT holding the mutex
+    /// (avoids the capture-wide stall and the re-entrant-callback deadlock).
+    fn handle() -> Option<bugsee_core::RecorderHandle> {
+        RECORDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|r| r.handle())
+    }
 }
 
 /// Submit a populated deferred report (called by `Report::upload`).
@@ -321,11 +349,12 @@ pub(crate) fn submit_report(meta: ReportMeta, window_end: i64) {
 
 /// Submit a report from a pre-taken snapshot (deferred `create_report` path).
 pub(crate) fn submit_snapshot(handle: bugsee_core::SnapshotHandle, meta: ReportMeta) {
-    if RECORDER.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
-        bugsee_core::Recorder::discard_snapshot(handle);
-        return;
+    // Take an off-lock handle; if the recorder is gone, the snapshot handle's
+    // Drop reclaims its dir (no leak, no TOCTOU).
+    match Bugsee::handle() {
+        Some(h) => h.upload_snapshot(handle, meta),
+        None => bugsee_core::Recorder::discard_snapshot(handle),
     }
-    Bugsee::with_recorder(|r| r.upload_snapshot(handle, meta));
 }
 
 /// Discard a snapshot handle (called by `Report::discard`/drop).

@@ -158,19 +158,63 @@ fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
 }
 
 /// Persist crash signatures the server told us to stop sending (`12004`).
+///
+/// Appends only the not-yet-present signatures, each on its own line, under
+/// `O_APPEND`. Appending (rather than read-modify-rewrite of the whole set) is
+/// safe under concurrent writers sharing the data dir: each small append is
+/// atomic, so no process can lose another's addition — which a rewrite would,
+/// silently un-blacklisting a signature and resurrecting a suppressed crash loop.
+/// Reads dedup, so a duplicate line from a rare append race is harmless.
 pub fn blacklist_add(data_dir: &Path, sigs: &[String]) {
     if sigs.is_empty() {
         return;
     }
-    let mut set = load_blacklist(data_dir);
-    let mut changed = false;
-    for s in sigs {
-        changed |= set.insert(s.clone());
+    let existing = load_blacklist(data_dir);
+    let fresh: Vec<&String> = sigs.iter().filter(|s| !existing.contains(*s)).collect();
+    if fresh.is_empty() {
+        return;
     }
-    if changed {
-        let _ = std::fs::create_dir_all(queue_dir(data_dir));
-        let body = set.into_iter().collect::<Vec<_>>().join("\n");
-        let _ = std::fs::write(blacklist_path(data_dir), body);
+    let _ = std::fs::create_dir_all(queue_dir(data_dir));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(blacklist_path(data_dir))
+    {
+        use std::io::Write;
+        for s in fresh {
+            let _ = writeln!(f, "{s}");
+        }
+    }
+}
+
+/// Reap orphaned queue sidecars: a `.req`/`.meta`/`.tmp` file with no matching
+/// `.bundle.zip`, left by a process killed mid-`enqueue`/`remove` (neither is
+/// crash-atomic across its multiple files). Without this they accumulate
+/// unbounded. Call once at startup on the worker thread, before any enqueue, so
+/// it never races this process's own queue writes.
+pub fn gc_orphans(data_dir: &Path) {
+    let dir = queue_dir(data_dir);
+    let read = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        // Sidecar name is `<bundle>.req|.meta|.tmp`; stripping the suffix yields
+        // the bundle file name it belongs to.
+        let bundle_name = name
+            .strip_suffix(".req")
+            .or_else(|| name.strip_suffix(".meta"))
+            .or_else(|| name.strip_suffix(".tmp"));
+        if let Some(bundle_name) = bundle_name {
+            if !dir.join(bundle_name).exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 }
 

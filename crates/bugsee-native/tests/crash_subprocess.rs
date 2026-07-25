@@ -72,6 +72,21 @@ fn native_handler_writes_marker_on_segfault() {
         content.contains("address=0x"),
         "fault address recorded: {content:?}"
     );
+    // The crashing thread's frames were captured (at least the faulting PC) for
+    // the client-side native dedup signature.
+    assert!(
+        content.contains("frame=0x"),
+        "crashing-thread frames captured: {content:?}"
+    );
+
+    // The module map was snapshotted at install time (base<TAB>name entries).
+    let modules = dir.join("crash.modules");
+    assert!(modules.exists(), "module map written at install");
+    let mods = std::fs::read_to_string(&modules).unwrap();
+    assert!(
+        mods.lines().next().is_some_and(|l| l.contains('\t')),
+        "module map has base\\tname rows: {mods:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

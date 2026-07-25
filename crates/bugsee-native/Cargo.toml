@@ -14,3 +14,12 @@ crash-handler = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Apple: read the crashed thread's registers/stack from the handler thread.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+mach2 = "0.4"
+
+# Linux/Android: the handler runs on the crashing thread, so a signal-safe
+# unwinder captures its own stack (handles both x86_64 and aarch64).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+backtrace = "0.3"

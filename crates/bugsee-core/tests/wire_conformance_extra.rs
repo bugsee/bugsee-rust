@@ -168,11 +168,14 @@ impl Drop for TempDir {
     }
 }
 
-/// Write the liveness marker for an abnormally-ended generation.
+/// Write the liveness marker for an abnormally-ended generation. The marker
+/// records the (now-dead) owning pid; `"0"` is a portable "owner gone" sentinel
+/// (recovery's `process_is_alive` treats pid 0 as dead), so recovery does not
+/// mistake the seeded generation for a still-running peer.
 fn seed_alive_marker(data: &Path, generation: u64) {
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(sessions.join(format!("{generation}.alive")), "1").unwrap();
+    std::fs::write(sessions.join(format!("{generation}.alive")), "0").unwrap();
 }
 
 #[test]
@@ -223,6 +226,160 @@ fn native_crash_json_matches_contract_4_14() {
     assert!(
         report.extra_files.iter().any(|f| f.file_type == "minidump"),
         "minidump bundled as an extra file"
+    );
+}
+
+#[test]
+fn native_crash_signature_from_module_offsets() {
+    let dir = TempDir::new();
+    seed_alive_marker(&dir.path, 1);
+    let gen_dir = dir.path.join("parts").join("1");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+
+    // Crashing thread frames (absolute PCs) + the install-time module map.
+    std::fs::write(
+        gen_dir.join("crash.info"),
+        "signal=11\ncode=1\naddress=0x0\ntime=0\nframe=0x1100\nframe=0x2200\n",
+    )
+    .unwrap();
+    // base<TAB>name — 0x1100 falls in MyApp (base 0x1000, offset 0x100); 0x2200
+    // falls in libsystem (base 0x2000, offset 0x200).
+    std::fs::write(
+        gen_dir.join("crash.modules"),
+        "1000\tMyApp\n2000\tlibsystem.dylib\n",
+    )
+    .unwrap();
+
+    let pending = find_pending(&dir.path, 2);
+    let report = build_report(&pending[0], 1_720_531_200_000);
+    let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
+
+    let sigs = crash["signatures"].as_array().expect("signatures array");
+    assert_eq!(sigs.len(), 1, "one client-side native dedup signature");
+    let sig = sigs[0].as_str().unwrap();
+    assert_eq!(sig.len(), 40, "lowercase SHA-1 hex");
+    assert!(sig
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+    // Deterministic: the same crash on the next launch yields the same signature.
+    let report2 = build_report(&find_pending(&dir.path, 2)[0], 999);
+    let crash2: Value = serde_json::from_slice(&report2.crash_json).unwrap();
+    assert_eq!(crash2["signatures"][0].as_str().unwrap(), sig, "stable");
+
+    // A different crash site (different frame offsets) yields a different sig.
+    std::fs::write(
+        gen_dir.join("crash.info"),
+        "signal=11\ncode=1\naddress=0x0\ntime=0\nframe=0x1900\n",
+    )
+    .unwrap();
+    let other: Value =
+        serde_json::from_slice(&build_report(&find_pending(&dir.path, 2)[0], 1).crash_json)
+            .unwrap();
+    assert_ne!(
+        other["signatures"][0].as_str().unwrap(),
+        sig,
+        "distinct site"
+    );
+}
+
+#[test]
+fn native_crash_json_without_crash_info_still_emits_signal() {
+    // A minidump-only session (no crash-info marker) must not produce an
+    // under-specified native payload — the `signal` object is always present,
+    // with unknown/nulled fields.
+    let dir = TempDir::new();
+    seed_alive_marker(&dir.path, 1);
+    let gen_dir = dir.path.join("parts").join("1");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    std::fs::write(gen_dir.join("crash.minidump"), b"MDMP\x00only").unwrap();
+
+    let pending = find_pending(&dir.path, 2);
+    assert_eq!(pending.len(), 1);
+    let report = build_report(&pending[0], 1_720_531_200_000);
+    let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
+
+    assert_eq!(crash["exception_type"], json!("native"));
+    assert!(
+        crash.get("signal").is_some(),
+        "native variant always carries a signal object"
+    );
+    assert_eq!(crash["signal"]["number"], json!(0));
+    assert_eq!(crash["signal"]["name"], json!("UNKNOWN"));
+    assert!(crash["signal"]["cause"].is_null());
+}
+
+#[test]
+fn correlated_panic_crash_json_matches_contract_4_14() {
+    use bugsee_core::model::crash::{Frame, FrameData};
+    use bugsee_core::panic_info::PanicInfo;
+
+    let dir = TempDir::new();
+    seed_alive_marker(&dir.path, 1);
+    let gen_dir = dir.path.join("parts").join("1");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+
+    // A SIGABRT native marker (with a fresh `time=`) + a panic snapshot whose
+    // timestamp is within the correlation window: the two fold into ONE managed
+    // crash event carrying the panic frames (not a thin native variant).
+    std::fs::write(
+        gen_dir.join("crash.info"),
+        "signal=6\ncode=0\naddress=0x0\ntime=1000\n",
+    )
+    .unwrap();
+    let info = PanicInfo {
+        reason: "index out of bounds".into(),
+        file: Some("src/checkout.rs".into()),
+        line: 42,
+        column: 9,
+        timestamp: 1000,
+        frames: vec![Frame {
+            trace: "app::checkout::settle".into(),
+            hidden: false,
+            data: FrameData {
+                source: Some("src/checkout.rs".into()),
+                member_class: Some("app::checkout".into()),
+                member: Some("settle".into()),
+                line: 42,
+            },
+        }],
+    };
+    info.write_to(&gen_dir.join("panic.info")).unwrap();
+
+    let pending = find_pending(&dir.path, 2);
+    assert_eq!(pending.len(), 1);
+    let report = build_report(&pending[0], 1_720_531_200_000);
+    let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
+
+    // Managed variant: exception object, no top-level `signal`, `domain` null
+    // (the SCREAMING inventory reserves domain for AppHang::*/AppExit::*/null),
+    // and no off-contract `mechanism` key.
+    assert_eq!(crash["handled"], json!(false));
+    assert_eq!(crash["ndkCrash"], json!(false));
+    assert_eq!(crash["exception_type"], json!("exception"));
+    assert!(crash.get("signal").is_none(), "no signal object on managed");
+    assert!(
+        crash.get("mechanism").is_none(),
+        "no off-contract mechanism"
+    );
+    assert_eq!(crash["exception"]["name"], json!("panic"));
+    assert!(
+        crash["exception"]["domain"].is_null(),
+        "domain null (Signal::* is off the contract inventory)"
+    );
+    let reason = crash["exception"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("index out of bounds") && reason.contains("checkout.rs:42:9"),
+        "reason carries message + panic location: {reason}"
+    );
+    assert_eq!(
+        crash["exception"]["frames"][0]["trace"],
+        json!("app::checkout::settle")
+    );
+    assert_eq!(
+        crash["signatures"].as_array().expect("signatures").len(),
+        1,
+        "one dedup signature"
     );
 }
 

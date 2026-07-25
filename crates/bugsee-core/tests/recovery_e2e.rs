@@ -54,7 +54,9 @@ fn seed_crashed_session(data: &Path, generation: u64) {
 
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(sessions.join(format!("{generation}.alive")), "4242").unwrap();
+    // Marker records the (dead) owner pid; "0" is a portable "owner gone"
+    // sentinel so recovery's liveness check does not treat it as a live peer.
+    std::fs::write(sessions.join(format!("{generation}.alive")), "0").unwrap();
 }
 
 #[test]
@@ -157,7 +159,7 @@ fn seed_native_crash(data: &Path, generation: u64) {
 
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(sessions.join(format!("{generation}.alive")), "1").unwrap();
+    std::fs::write(sessions.join(format!("{generation}.alive")), "0").unwrap();
 }
 
 #[test]
@@ -218,10 +220,12 @@ fn seed_aborting_panic(data: &Path, generation: u64) {
     let gen_dir = data.join("parts").join(generation.to_string());
     std::fs::create_dir_all(gen_dir.join("0")).unwrap();
 
-    // SIGABRT marker from the native handler.
+    // SIGABRT marker from the native handler. The `time=` matches the panic
+    // snapshot's timestamp below so the freshness check correlates them (a stale
+    // snapshot outside the window would fall through to a thin native report).
     std::fs::write(
         gen_dir.join("crash.info"),
-        "signal=6\ncode=0\naddress=0x0\n",
+        "signal=6\ncode=0\naddress=0x0\ntime=1000\n",
     )
     .unwrap();
 
@@ -247,7 +251,7 @@ fn seed_aborting_panic(data: &Path, generation: u64) {
 
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(sessions.join(format!("{generation}.alive")), "1").unwrap();
+    std::fs::write(sessions.join(format!("{generation}.alive")), "0").unwrap();
 }
 
 #[test]
@@ -271,10 +275,11 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
         .unwrap();
     let crash: Value = serde_json::from_slice(&cbytes).unwrap();
 
-    // One managed crash event carrying the Rust panic frames; the SIGABRT is
-    // recorded via the exception `domain` (the contract reserves the top-level
-    // `signal` object for the native variant, so a managed variant must not emit
-    // it, nor the non-contract `mechanism` key).
+    // One managed crash event carrying the Rust panic frames. The contract
+    // reserves the top-level `signal` object for the native variant (a managed
+    // variant must not emit it, nor the non-contract `mechanism` key), and the
+    // `domain` inventory is limited to AppHang::*/AppExit::*/null — so an aborting
+    // panic reports `domain: null` (the SIGABRT is implied by the aborting panic).
     assert_eq!(crash["handled"], false);
     assert_eq!(crash["ndkCrash"], false);
     assert!(
@@ -286,7 +291,10 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
         "no signal object on the managed variant"
     );
     assert_eq!(crash["exception"]["name"], "panic");
-    assert_eq!(crash["exception"]["domain"], "Signal::SIGABRT");
+    assert!(
+        crash["exception"]["domain"].is_null(),
+        "domain null: Signal::* is off the contract inventory"
+    );
     let reason = crash["exception"]["reason"].as_str().unwrap();
     assert!(reason.contains("index out of bounds") && reason.contains("checkout.rs:42:9"));
     assert_eq!(
@@ -294,6 +302,44 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
         "app::checkout::settle"
     );
     assert_eq!(crash["signatures"].as_array().unwrap().len(), 1);
+}
+
+/// A liveness marker still owned by a *live other* process (a peer sharing the
+/// data dir) is not recovered — it is not a crash. Once the owner exits, the same
+/// marker becomes recoverable.
+#[cfg(unix)]
+#[test]
+fn live_peer_marker_is_skipped_until_owner_exits() {
+    use bugsee_core::recovery::find_pending;
+
+    let dir = TempDir::new();
+    // A real, live child process whose pid we record as the marker's owner.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let live_pid = child.id();
+
+    let sessions = dir.path.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("1.alive"), live_pid.to_string()).unwrap();
+
+    // Owner alive → skipped (deferred, not resurrected as a crash).
+    assert!(
+        find_pending(&dir.path, 2).is_empty(),
+        "a live peer's session must not be recovered"
+    );
+
+    // Owner exits → the very same marker is now recoverable.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let pending = find_pending(&dir.path, 2);
+    assert_eq!(
+        pending.len(),
+        1,
+        "once the owner is gone the marker is recovered"
+    );
+    assert_eq!(pending[0].generation, 1);
 }
 
 #[test]

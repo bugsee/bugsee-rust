@@ -150,9 +150,12 @@ fn report_caught(payload: &(dyn std::any::Any + Send)) {
 
     // The observer persists a snapshot for EVERY panic (it can't know at hook
     // time whether the panic will be caught). Since this panic was contained,
-    // delete that snapshot so a later abnormal (non-native) exit does not
-    // misread it as a fatal panic. Only an *uncaught* panic leaves it behind.
-    if let Ok(guard) = SNAPSHOT_PATH.try_lock() {
+    // delete that snapshot so a later crash does not misread it as fatal. Use a
+    // BLOCKING lock (unlike the hook, which must `try_lock` to avoid a reentrant
+    // self-deadlock): this runs AFTER `catch_unwind` returns — the panic has
+    // fully unwound and released any locks — so a spuriously-lost `try_lock` race
+    // must not silently skip the cleanup and strand a stale snapshot.
+    if let Ok(guard) = SNAPSHOT_PATH.lock() {
         if let Some(path) = guard.as_ref() {
             let _ = std::fs::remove_file(path);
         }

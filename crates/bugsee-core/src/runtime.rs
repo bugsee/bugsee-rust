@@ -15,7 +15,12 @@
 //!   propagates a poisoned-mutex panic onto a host thread.
 //! - The worker and uploader wrap each iteration in `catch_unwind`, so a panic
 //!   in a host callback (`before_send`, `TelemetrySampler`, `Transport`) cannot
-//!   silently kill capture/delivery for the process lifetime.
+//!   silently kill capture/delivery for the process lifetime. NOTE: this
+//!   containment relies on the unwinding panic runtime; under `panic = "abort"`
+//!   `catch_unwind` is inert and a host-callback panic aborts the process. The
+//!   crate is intended to be built `panic = "unwind"` (its own release profile
+//!   sets this); native fatal-crash capture still works under `abort`, but
+//!   per-callback containment does not (DESIGN.md §5/§15).
 //! - The producer→worker channel is bounded by an in-flight counter (drop-newest
 //!   under back-pressure) so a burst or a stalled worker cannot grow RSS without
 //!   limit.
@@ -43,6 +48,9 @@ use crate::{queue, recovery};
 
 /// Maximum upload attempts before a queued report is abandoned.
 const UPLOAD_RETRY_CAP: u32 = 60;
+/// Maximum next-launch recovery attempts for one pending session before it is
+/// abandoned (guards against a corrupt-parts poison pill re-running every launch).
+const MAX_RECOVERY_ATTEMPTS: u32 = 3;
 /// Default in-flight capture-entry cap (drop-newest beyond this).
 const DEFAULT_MAX_QUEUED: usize = 8192;
 
@@ -109,10 +117,21 @@ impl RecorderConfig {
 }
 
 /// A handle to a report snapshot taken at `create_report` time. The window is
-/// hard-linked on disk immediately, so later eviction cannot erode it.
+/// hard-linked on disk immediately, so later eviction cannot erode it. Dropping
+/// the handle without delivering it removes the on-disk links — so no path
+/// (timeout, worker-gone, shutdown race) can leak the snapshot directory.
 pub struct SnapshotHandle {
     dir: PathBuf,
     window: TimeWindow,
+}
+
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        // Cleanup is unconditional: the assembler finishes reading the dir before
+        // the handle drops, and every not-delivered path (timeout, worker-gone,
+        // shutdown race) then reclaims the hard links here.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// State shared between the facade, the capture worker, and the uploader.
@@ -156,8 +175,11 @@ enum Msg {
 
 enum UploadMsg {
     Wake,
-    /// Force-drain and report whether the queue is empty afterward.
-    Drain(Sender<bool>),
+    /// Force-drain (up to `deadline`) and report whether the queue is empty.
+    Drain {
+        deadline: Duration,
+        ack: Sender<bool>,
+    },
     Stop(Sender<()>),
 }
 
@@ -223,7 +245,14 @@ impl Recorder {
             .name("bugsee-capture".into())
             .spawn(move || {
                 // Queue any crashed prior session before capturing this one.
-                run_recovery(&worker_shared, &worker_data_dir, generation);
+                // Contained: a panic here (e.g. a host before_send on a recovered
+                // crash) must not abort the thread before worker_loop starts.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Reap orphaned queue sidecars from a prior killed enqueue/
+                    // remove first (runs before this session enqueues anything).
+                    queue::gc_orphans(&worker_data_dir);
+                    run_recovery(&worker_shared, &worker_data_dir, generation);
+                }));
                 let _ = worker_upload_tx.send(UploadMsg::Wake);
                 worker_loop(
                     rx,
@@ -252,13 +281,18 @@ impl Recorder {
     /// Enqueue an entry. Never blocks; drops (newest) under back-pressure or if
     /// the worker is gone.
     pub fn capture(&self, entry: CaptureEntry) {
-        // Bounded back-pressure: drop rather than grow the in-flight queue.
-        if self.shared.queued.load(Ordering::Relaxed) >= self.shared.max_queued {
-            return;
-        }
-        self.shared.queued.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send(Msg::Capture(entry)).is_err() {
-            self.shared.queued.fetch_sub(1, Ordering::Relaxed);
+        capture_into(&self.shared, &self.tx, entry);
+    }
+
+    /// A cheap, cloneable handle for the operations the facade must run WITHOUT
+    /// holding its global lock — anything that blocks (`flush`, `create_snapshot`)
+    /// or runs host callbacks (`before_breadcrumb`). Holding a mutex across those
+    /// would stall all capture or (for a re-entrant callback) deadlock.
+    pub fn handle(&self) -> RecorderHandle {
+        RecorderHandle {
+            tx: self.tx.clone(),
+            upload_tx: self.upload_tx.clone(),
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -267,11 +301,7 @@ impl Recorder {
     /// configured the breadcrumb passes through unchanged. A panicking hook is
     /// contained and drops just that breadcrumb (never crashes the caller).
     pub fn before_breadcrumb(&self, crumb: Breadcrumb) -> Option<Breadcrumb> {
-        match &self.shared.before_breadcrumb {
-            Some(hook) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(crumb)))
-                .unwrap_or(None),
-            None => Some(crumb),
-        }
+        self.handle().before_breadcrumb(crumb)
     }
 
     /// Route the facade's pause state into the recorder so the worker skips
@@ -304,42 +334,24 @@ impl Recorder {
     /// Snapshot the window now (hard-links on disk), returning a handle to
     /// upload later. Blocks briefly on the worker; returns `None` on failure.
     pub fn create_snapshot(&self, window_end: i64) -> Option<SnapshotHandle> {
-        let (ack, rx) = channel();
-        if self.tx.send(Msg::Snapshot { window_end, ack }).is_err() {
-            return None;
-        }
-        rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+        self.handle().create_snapshot(window_end)
     }
 
     /// Deliver a report from a snapshot handle produced by [`create_snapshot`].
     pub fn upload_snapshot(&self, handle: SnapshotHandle, meta: ReportMeta) {
-        let _ = self.tx.send(Msg::UploadSnapshot { handle, meta });
+        self.handle().upload_snapshot(handle, meta)
     }
 
-    /// Discard a snapshot handle without uploading (removes its on-disk links).
+    /// Discard a snapshot handle without uploading. Dropping it reclaims the
+    /// on-disk links via `SnapshotHandle::Drop`.
     pub fn discard_snapshot(handle: SnapshotHandle) {
-        let _ = std::fs::remove_dir_all(&handle.dir);
+        drop(handle);
     }
 
     /// Block until captured work is persisted and the queue is fully drained, or
     /// `timeout` elapses. Returns `true` only if the outbound queue is empty.
     pub fn flush(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let (tx, rx) = channel();
-        if self.tx.send(Msg::Flush(tx)).is_err() {
-            return false;
-        }
-        if rx.recv_timeout(timeout).is_err() {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let (utx, urx) = channel();
-        if self.upload_tx.send(UploadMsg::Drain(utx)).is_err() {
-            return false;
-        }
-        // `true` means the queue actually drained, not merely that draining ran.
-        urx.recv_timeout(remaining.max(Duration::from_millis(1)))
-            .unwrap_or(false)
+        self.handle().flush(timeout)
     }
 
     /// Data directory root for this recorder.
@@ -371,25 +383,139 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        // Signal both threads to stop, then join. (Called only after the global
-        // lock has been released — see the facade's `stop`.)
+        // Signal both threads; JOIN only if they acknowledge within the timeout.
+        // A thread wedged in a host callback with no timeout is DETACHED (its
+        // JoinHandle dropped un-joined) rather than hanging the stopping thread
+        // forever. (Called only after the facade released its global lock.)
         let (tx, rx) = channel();
-        if self.tx.send(Msg::Stop(tx)).is_ok() {
-            let _ = rx.recv_timeout(Duration::from_secs(2));
-        }
+        let worker_acked =
+            self.tx.send(Msg::Stop(tx)).is_ok() && rx.recv_timeout(Duration::from_secs(2)).is_ok();
         if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+            if worker_acked {
+                let _ = handle.join();
+            }
         }
         let (utx, urx) = channel();
-        if self.upload_tx.send(UploadMsg::Stop(utx)).is_ok() {
-            let _ = urx.recv_timeout(Duration::from_secs(2));
-        }
+        let uploader_acked = self.upload_tx.send(UploadMsg::Stop(utx)).is_ok()
+            && urx.recv_timeout(Duration::from_secs(2)).is_ok();
         if let Some(handle) = self.uploader.take() {
-            let _ = handle.join();
+            if uploader_acked {
+                let _ = handle.join();
+            }
         }
-        // Clean shutdown: drop the liveness marker so next launch does not treat
-        // this session as an abnormal exit.
-        self.session.end();
+        // Only mark a genuinely clean shutdown. If either thread merely DETACHED
+        // (didn't ack in time — e.g. a slow flush), it may still be writing this
+        // session's data, so removing the marker now would make next-launch
+        // recovery miss the generation entirely if the process then dies mid-tail.
+        // Leaving the marker costs at worst a false-positive abnormal-exit report
+        // (or a clean re-skip by gc once the detached flush finishes) — far safer
+        // than silently losing a crash.
+        if worker_acked && uploader_acked {
+            self.session.end();
+        }
+    }
+}
+
+/// A cheap cloneable view of the recorder's channels + shared state. The facade
+/// clones one out under a brief lock, releases the lock, and then does any
+/// blocking / host-callback work through it — never holding the global mutex
+/// across a blocking wait or user code.
+#[derive(Clone)]
+pub struct RecorderHandle {
+    tx: Sender<Msg>,
+    upload_tx: Sender<UploadMsg>,
+    shared: Arc<Shared>,
+}
+
+impl RecorderHandle {
+    /// Enqueue a capture entry (bounded, drop-newest under back-pressure).
+    pub fn capture(&self, entry: CaptureEntry) {
+        capture_into(&self.shared, &self.tx, entry);
+    }
+
+    /// Trigger a report with an explicit window-end timestamp.
+    pub fn report_at(&self, meta: ReportMeta, window_end: i64, crash_json: Option<Vec<u8>>) {
+        let _ = self.tx.send(Msg::Report {
+            meta,
+            window_end,
+            crash_json,
+        });
+    }
+
+    /// Mutate the ambient scope.
+    pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
+        let mut guard = lock_recover(&self.shared.scope);
+        f(&mut guard)
+    }
+
+    /// Set the paused flag (gates telemetry sampling).
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Run the `before_breadcrumb` hook (panic-contained), off any caller lock.
+    pub fn before_breadcrumb(&self, crumb: Breadcrumb) -> Option<Breadcrumb> {
+        match &self.shared.before_breadcrumb {
+            Some(hook) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(crumb)))
+                .unwrap_or(None),
+            None => Some(crumb),
+        }
+    }
+
+    /// Snapshot the window now (blocks briefly on the worker). Returns `None` on
+    /// failure or timeout.
+    pub fn create_snapshot(&self, window_end: i64) -> Option<SnapshotHandle> {
+        let (ack, rx) = channel();
+        if self.tx.send(Msg::Snapshot { window_end, ack }).is_err() {
+            return None;
+        }
+        rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+    }
+
+    /// Deliver a report from a pre-taken snapshot.
+    pub fn upload_snapshot(&self, handle: SnapshotHandle, meta: ReportMeta) {
+        let _ = self.tx.send(Msg::UploadSnapshot { handle, meta });
+    }
+
+    /// Block until captured work is persisted and the queue drains, or `timeout`.
+    /// Returns `true` only if the outbound queue is empty.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (tx, rx) = channel();
+        if self.tx.send(Msg::Flush(tx)).is_err() {
+            return false;
+        }
+        if rx.recv_timeout(timeout).is_err() {
+            return false;
+        }
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let (utx, urx) = channel();
+        if self
+            .upload_tx
+            .send(UploadMsg::Drain {
+                deadline: remaining,
+                ack: utx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        urx.recv_timeout(remaining).unwrap_or(false)
+    }
+}
+
+/// Bounded, drop-newest capture enqueue shared by `Recorder` and `RecorderHandle`.
+fn capture_into(shared: &Arc<Shared>, tx: &Sender<Msg>, entry: CaptureEntry) {
+    // Atomically reserve a slot; if that pushes us over the cap, release it and
+    // drop (so the bound holds precisely even under concurrent producers).
+    if shared.queued.fetch_add(1, Ordering::Relaxed) >= shared.max_queued {
+        shared.queued.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    if tx.send(Msg::Capture(entry)).is_err() {
+        shared.queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -398,40 +524,60 @@ impl Drop for Recorder {
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
 fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
     for pending in recovery::find_pending(data_dir, current_generation) {
-        let span = export::report_span(&pending.parts_dir).ok().flatten();
-        let now = epoch_ms();
-        let (start, end) = span.unwrap_or((now, now));
-        let mut built = recovery::build_report(&pending, end);
-
-        // Apply before_send to recovered crashes too (host redaction/drop).
-        let keep = match &shared.before_send {
-            Some(hook) => hook(&mut built.meta),
-            None => true,
-        };
-        if !keep || queue::any_blacklisted(data_dir, &built.meta.signatures) {
+        // Count the attempt *before* processing: a corrupt session that panics
+        // the build/assemble path is a poison pill that would otherwise re-run —
+        // and abort the whole loop — on every launch. After the cap, abandon it.
+        let attempts = recovery::bump_attempts(data_dir, &pending);
+        if attempts > MAX_RECOVERY_ATTEMPTS {
             recovery::discard(data_dir, &pending);
             continue;
         }
-        merge_scope(shared, &mut built.meta);
+        // Isolate each pending so one corrupt session cannot block recovering the
+        // rest (a panic here would otherwise unwind the entire loop).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recover_one(shared, data_dir, &pending);
+        }));
+    }
+    // Reap parts/attempts left by cleanly-exited or already-recovered generations.
+    recovery::gc_orphans(data_dir, current_generation);
+}
 
-        let window = TimeWindow { start, end };
-        let delivered = reporting::assemble_with_extras(
-            &pending.parts_dir,
-            window,
-            &built.meta,
-            &shared.env,
-            Some(built.crash_json),
-            &built.extra_files,
-            &shared.app_token,
-            end,
-        )
-        .and_then(|assembled| queue::enqueue(data_dir, &assembled))
-        .is_ok();
+/// Build, filter, assemble and enqueue one pending session's crash report,
+/// discarding its on-disk evidence only once it is safely queued.
+fn recover_one(shared: &Shared, data_dir: &Path, pending: &recovery::PendingSession) {
+    let span = export::report_span(&pending.parts_dir).ok().flatten();
+    let now = epoch_ms();
+    let (start, end) = span.unwrap_or((now, now));
+    let mut built = recovery::build_report(pending, end);
 
-        // Only destroy the crash evidence once it is safely queued.
-        if delivered {
-            recovery::discard(data_dir, &pending);
-        }
+    // Apply before_send to recovered crashes too (host redaction/drop).
+    let keep = match &shared.before_send {
+        Some(hook) => hook(&mut built.meta),
+        None => true,
+    };
+    if !keep || queue::any_blacklisted(data_dir, &built.meta.signatures) {
+        recovery::discard(data_dir, pending);
+        return;
+    }
+    merge_scope(shared, &mut built.meta);
+
+    let window = TimeWindow { start, end };
+    let delivered = reporting::assemble_with_extras(
+        &pending.parts_dir,
+        window,
+        &built.meta,
+        &shared.env,
+        Some(built.crash_json),
+        &built.extra_files,
+        &shared.app_token,
+        end,
+    )
+    .and_then(|assembled| queue::enqueue(data_dir, &assembled))
+    .is_ok();
+
+    // Only destroy the crash evidence once it is safely queued.
+    if delivered {
+        recovery::discard(data_dir, pending);
     }
 }
 
@@ -557,14 +703,17 @@ fn take_snapshot(
     let report_id = crate::util::random_hex(8);
     let dir = data_dir.join("reports").join(&report_id);
     std::fs::create_dir_all(&dir).ok()?;
-    store.snapshot_into(&dir, window_start, window_end).ok()?;
-    Some(SnapshotHandle {
-        dir,
+    // Build the handle BEFORE snapshotting so a snapshot_into failure cleans up
+    // the created dir via the handle's Drop (no orphan on the error path).
+    let handle = SnapshotHandle {
+        dir: dir.clone(),
         window: TimeWindow {
             start: window_start,
             end: window_end,
         },
-    })
+    };
+    store.snapshot_into(&dir, window_start, window_end).ok()?;
+    Some(handle)
 }
 
 /// Assemble + enqueue a report from a pre-taken snapshot (deferred upload path).
@@ -577,11 +726,11 @@ fn deliver_snapshot(
     merge_scope(shared, &mut meta);
     if let Some(hook) = &shared.before_send {
         if !hook(&mut meta) {
-            let _ = std::fs::remove_dir_all(&handle.dir);
-            return false;
+            return false; // handle's Drop reclaims the snapshot dir
         }
     }
-    let result = reporting::assemble(
+    // The snapshot dir is reclaimed by `handle`'s Drop on return (any path).
+    reporting::assemble(
         &handle.dir,
         handle.window,
         &meta,
@@ -590,9 +739,8 @@ fn deliver_snapshot(
         &shared.app_token,
         handle.window.end,
     )
-    .and_then(|assembled| queue::enqueue(data_dir, &assembled));
-    let _ = std::fs::remove_dir_all(&handle.dir);
-    result.is_ok()
+    .and_then(|assembled| queue::enqueue(data_dir, &assembled))
+    .is_ok()
 }
 
 fn process_report(
@@ -673,9 +821,9 @@ fn uploader_loop(
                     drain(&shared, &data_dir, backoff_base, false)
                 }));
             }
-            Ok(UploadMsg::Drain(ack)) => {
+            Ok(UploadMsg::Drain { deadline, ack }) => {
                 let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain_until_empty(&shared, &data_dir, backoff_base, Duration::from_secs(5))
+                    drain_until_empty(&shared, &data_dir, backoff_base, deadline)
                 }))
                 .unwrap_or(false);
                 let _ = ack.send(empty);
