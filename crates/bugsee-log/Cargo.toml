@@ -1,0 +1,18 @@
+[package]
+name = "bugsee-log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "log crate adapter for the Bugsee Rust SDK — log records become captured log entries."
+
+[dependencies]
+bugsee = { path = "../bugsee", version = "0.1.0", default-features = false }
+log = { version = "0.4", features = ["std"] }
+
+[dev-dependencies]
+bugsee = { path = "../bugsee", version = "0.1.0" }
+zip = { version = "2", default-features = false, features = ["zstd"] }
+serde_json = { workspace = true }

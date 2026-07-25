@@ -167,6 +167,16 @@ impl Bugsee {
         Self::capture(CaptureEntry::Network(Box::new(entry)));
     }
 
+    /// Record a captured log entry (used by the tracing/log integrations).
+    pub fn capture_log(entry: bugsee_core::model::entry::LogEntry) {
+        Self::capture(CaptureEntry::Log(entry));
+    }
+
+    /// Record a captured breadcrumb (used by integrations).
+    pub fn capture_breadcrumb(entry: bugsee_core::model::entry::Breadcrumb) {
+        Self::capture(CaptureEntry::Breadcrumb(entry));
+    }
+
     /// Record a named value trace.
     pub fn trace(name: impl Into<String>, value: impl Into<Value>) {
         Self::capture(CaptureEntry::UserTrace(TraceEntry {

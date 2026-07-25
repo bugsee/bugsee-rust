@@ -6,6 +6,8 @@ members = [
     "crates/bugsee-native",
     "crates/bugsee",
     "crates/bugsee-reqwest",
+    "crates/bugsee-tracing",
+    "crates/bugsee-log",
 ]
 
 [workspace.package]
