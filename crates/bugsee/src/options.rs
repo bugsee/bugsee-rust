@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bugsee_core::capture::WindowCaps;
+use bugsee_core::reporting::ReportMeta;
+use bugsee_core::runtime::BeforeSend;
 use bugsee_core::transport::Transport;
 
 /// Configuration passed to [`crate::Bugsee::launch_with`].
@@ -26,6 +28,8 @@ pub struct LaunchOptions {
     pub(crate) transport: Option<Arc<dyn Transport>>,
     pub(crate) native_crash_capture: bool,
     pub(crate) system_telemetry: bool,
+    pub(crate) before_send: Option<BeforeSend>,
+    pub(crate) sample_rate: f64,
 }
 
 impl LaunchOptions {
@@ -41,7 +45,27 @@ impl LaunchOptions {
             transport: None,
             native_crash_capture: true,
             system_telemetry: true,
+            before_send: None,
+            sample_rate: 1.0,
         }
+    }
+
+    /// Fraction of non-fatal (`error`) reports to keep, in `[0.0, 1.0]`. Crashes
+    /// are never sampled out. Default `1.0` (keep everything).
+    pub fn sample_rate(mut self, rate: f64) -> Self {
+        self.sample_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Register a callback run on every report before delivery. Mutate the
+    /// metadata (summary/severity/labels/attributes/…) in place; return `false`
+    /// to drop the report.
+    pub fn before_send(
+        mut self,
+        f: impl Fn(&mut ReportMeta) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.before_send = Some(Box::new(f));
+        self
     }
 
     /// Enable/disable installing the native fatal-crash handler (default `true`).

@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
 use crate::model::entry::{CaptureEntry, TraceEntry};
+use crate::model::enums::IssueType;
 use crate::model::environment::Environment;
 use crate::model::report::TimeWindow;
 use crate::model::scope::Scope;
@@ -33,6 +34,10 @@ use crate::{queue, recovery};
 
 /// Maximum upload attempts before a queued report is abandoned.
 const UPLOAD_RETRY_CAP: u32 = 60;
+
+/// A callback run on every report before delivery. Mutate the metadata in place;
+/// return `false` to drop the report entirely.
+pub type BeforeSend = Box<dyn Fn(&mut ReportMeta) -> bool + Send + Sync>;
 
 /// Produces system/process telemetry samples appended as `traces.system` on
 /// each rotation tick. Implemented by the host layer (e.g. via `sysinfo`).
@@ -52,6 +57,11 @@ pub struct RecorderConfig {
     pub sampler: Option<Box<dyn TelemetrySampler>>,
     /// Base delay for upload retry backoff (doubles per attempt, capped at 300 s).
     pub upload_backoff_base: Duration,
+    /// Optional callback to mutate or drop reports before delivery.
+    pub before_send: Option<BeforeSend>,
+    /// Fraction of non-fatal (`error`) reports to keep, in `[0, 1]`. Crashes are
+    /// never sampled out.
+    pub sample_rate: f64,
 }
 
 impl RecorderConfig {
@@ -65,6 +75,8 @@ impl RecorderConfig {
             rotate_interval: Duration::from_secs(1),
             sampler: None,
             upload_backoff_base: Duration::from_secs(30),
+            before_send: None,
+            sample_rate: 1.0,
         }
     }
 }
@@ -77,6 +89,8 @@ struct Shared {
     app_token: String,
     session: Mutex<Option<String>>,
     transport: Arc<dyn Transport>,
+    before_send: Option<BeforeSend>,
+    sample_rate: f64,
 }
 
 enum Msg {
@@ -121,6 +135,8 @@ impl Recorder {
             app_token: config.app_token.clone(),
             session: Mutex::new(None),
             transport,
+            before_send: config.before_send,
+            sample_rate: config.sample_rate,
         });
 
         let session = Session::begin(&config.data_dir)?;
@@ -379,6 +395,21 @@ fn process_report(
         for (k, v) in &scope.attributes {
             meta.attrs.entry(k.clone()).or_insert_with(|| v.clone());
         }
+    }
+
+    // before_send: let the host mutate or drop the report before any disk work.
+    if let Some(hook) = &shared.before_send {
+        if !hook(&mut meta) {
+            return Ok(());
+        }
+    }
+
+    // Sampling: drop a fraction of non-fatal reports (never crashes).
+    if meta.issue_type == IssueType::Error
+        && shared.sample_rate < 1.0
+        && crate::util::random_unit_f64() >= shared.sample_rate
+    {
+        return Ok(());
     }
 
     let window_start = window_end.saturating_sub(caps.max_window_ms);

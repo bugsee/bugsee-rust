@@ -78,6 +78,8 @@ impl Bugsee {
         let mut config = RecorderConfig::new(data_dir, options.app_token.clone());
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
+        config.before_send = options.before_send;
+        config.sample_rate = options.sample_rate;
 
         #[cfg(feature = "telemetry")]
         if options.system_telemetry {

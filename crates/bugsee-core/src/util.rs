@@ -38,6 +38,18 @@ pub fn random_hex(n_bytes: usize) -> String {
     s
 }
 
+/// A random `f64` in `[0, 1)`. Fails open (returns `1.0`) if entropy is
+/// unavailable, so sampling never accidentally drops a report on error.
+pub fn random_unit_f64() -> f64 {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return 1.0;
+    }
+    let v = u64::from_le_bytes(buf);
+    // Use the top 53 bits for a uniform double in [0, 1).
+    (v >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
 /// Format an epoch-ms instant as ISO-8601 UTC with milliseconds and a `Z`
 /// suffix (e.g. `2026-07-25T14:23:51.117Z`).
 pub fn iso8601_ms(epoch_ms: i64) -> String {
