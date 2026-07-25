@@ -1,0 +1,23 @@
+[package]
+name = "bugsee-reqwest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "reqwest network-capture middleware for the Bugsee Rust SDK."
+
+[dependencies]
+bugsee = { path = "../bugsee", version = "0.1.0", default-features = false }
+reqwest = { version = "0.12", default-features = false }
+reqwest-middleware = "0.3"
+async-trait = "0.1"
+http = "1"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+bugsee = { path = "../bugsee", version = "0.1.0" }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false }
+zip = { version = "2", default-features = false, features = ["zstd"] }

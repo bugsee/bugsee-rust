@@ -5,6 +5,7 @@ members = [
     "crates/bugsee-panic",
     "crates/bugsee-native",
     "crates/bugsee",
+    "crates/bugsee-reqwest",
 ]
 
 [workspace.package]

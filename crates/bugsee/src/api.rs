@@ -162,6 +162,11 @@ impl Bugsee {
         }));
     }
 
+    /// Record a captured network entry (used by the network-capture integration).
+    pub fn capture_network(entry: bugsee_core::model::entry::NetworkEntry) {
+        Self::capture(CaptureEntry::Network(Box::new(entry)));
+    }
+
     /// Record a named value trace.
     pub fn trace(name: impl Into<String>, value: impl Into<Value>) {
         Self::capture(CaptureEntry::UserTrace(TraceEntry {
