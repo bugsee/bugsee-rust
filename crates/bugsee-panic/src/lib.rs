@@ -17,9 +17,12 @@
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Once, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use bugsee_core::model::crash::{Frame, FrameData};
+use bugsee_core::panic_info::PanicInfo;
+use bugsee_core::util::epoch_ms;
 
 /// A captured panic, handed to the reporter.
 pub struct PanicReport {
@@ -52,6 +55,23 @@ thread_local! {
 
 static REPORTER: OnceLock<Arc<dyn PanicReporter>> = OnceLock::new();
 static INSTALL: Once = Once::new();
+/// Where to persist the panic snapshot for next-launch abort correlation.
+static SNAPSHOT_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Set the on-disk path where the observer persists a panic snapshot (used to
+/// correlate an aborting panic with its `SIGABRT` on the next launch).
+pub fn set_snapshot_path(path: PathBuf) {
+    if let Ok(mut guard) = SNAPSHOT_PATH.lock() {
+        *guard = Some(path);
+    }
+}
+
+/// Clear the persisted-snapshot path.
+pub fn clear_snapshot_path() {
+    if let Ok(mut guard) = SNAPSHOT_PATH.lock() {
+        *guard = None;
+    }
+}
 
 /// Install the chained global panic observer and register `reporter`.
 /// Idempotent — the hook is installed at most once; the first reporter wins.
@@ -67,6 +87,24 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
             };
             let reason = payload_message(info.payload());
             let frames = capture_frames();
+
+            // Persist a snapshot so an aborting panic can be correlated with its
+            // SIGABRT on the next launch. try_lock avoids any deadlock if the
+            // panic happened while the path was being set.
+            if let Ok(guard) = SNAPSHOT_PATH.try_lock() {
+                if let Some(path) = guard.as_ref() {
+                    let snapshot = PanicInfo {
+                        reason: reason.clone(),
+                        file: file.clone(),
+                        line,
+                        column,
+                        timestamp: epoch_ms(),
+                        frames: frames.clone(),
+                    };
+                    let _ = snapshot.write_to(path);
+                }
+            }
+
             LAST_PANIC.with(|slot| {
                 *slot.borrow_mut() = Some(CapturedContext {
                     reason,

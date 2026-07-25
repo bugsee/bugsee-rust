@@ -28,12 +28,16 @@
 mod api;
 mod frames;
 mod options;
+mod perf;
 mod report;
+#[cfg(feature = "telemetry")]
+mod telemetry;
 #[cfg(feature = "net")]
 pub mod transport;
 
 pub use api::{Bugsee, LaunchGuard, ResultExt};
 pub use options::LaunchOptions;
+pub use perf::{Span, Transaction};
 pub use report::Report;
 
 /// Panic boundary guards. Wrap SDK-owned execution roots (FFI entry points,
@@ -47,5 +51,6 @@ pub use bugsee_core as core;
 pub use bugsee_core::model::enums::{
     BreadcrumbLevel, IssueType, LogLevel, LogSource, Severity, TriggerType,
 };
+pub use bugsee_core::model::perf::Status;
 pub use bugsee_core::reporting::{Attachment, ReportMeta};
 pub use bugsee_core::transport::{Transport, TransportError};

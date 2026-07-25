@@ -17,6 +17,7 @@ use serde_json::Map;
 use crate::model::crash::{CrashReport, ExceptionInfo};
 use crate::model::enums::{IssueType, Severity, TriggerType};
 use crate::model::report::Source;
+use crate::panic_info::{PanicInfo, PANIC_INFO_NAME};
 use crate::reporting::{ExtraFile, ReportMeta};
 use crate::signature::panic_signature;
 
@@ -24,6 +25,8 @@ use crate::signature::panic_signature;
 pub const MINIDUMP_NAME: &str = "crash.minidump";
 /// The async-signal-safe crash-info marker written by the native handler.
 pub const CRASH_INFO_NAME: &str = "crash.info";
+/// POSIX `SIGABRT` — the signal an aborting Rust panic raises.
+const SIGABRT: i32 = 6;
 
 /// A prior generation awaiting recovery.
 pub struct PendingSession {
@@ -34,6 +37,8 @@ pub struct PendingSession {
     pub minidump: Option<PathBuf>,
     /// Path to the native crash-info marker, if present.
     pub crash_info: Option<PathBuf>,
+    /// Path to a persisted panic snapshot, if the observer wrote one.
+    pub panic_info: Option<PathBuf>,
 }
 
 /// A report built from a pending session, ready to assemble + deliver.
@@ -67,11 +72,13 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         let parts_dir = data_dir.join("parts").join(generation.to_string());
         let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
         let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
+        let panic_info = exists_opt(parts_dir.join(PANIC_INFO_NAME));
         pending.push(PendingSession {
             generation,
             parts_dir,
             minidump,
             crash_info,
+            panic_info,
         });
     }
     pending
@@ -81,15 +88,136 @@ fn exists_opt(p: PathBuf) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Build the crash report for a pending session. A native crash (minidump or
-/// crash-info marker) yields the thin native variant; anything else is an
-/// abnormal termination.
+/// Build the crash report for a pending session. Precedence: an aborting panic
+/// (`SIGABRT` + a panic snapshot) correlates into one event; otherwise a native
+/// crash yields the thin native variant, a lone panic snapshot yields a fatal
+/// panic, and anything else is an abnormal termination.
 pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
-    if pending.minidump.is_some() || pending.crash_info.is_some() {
-        build_native(pending, timestamp)
-    } else {
-        build_abnormal_exit(timestamp)
+    let has_native = pending.minidump.is_some() || pending.crash_info.is_some();
+    let signal = read_signal_info(pending);
+    let panic = pending
+        .panic_info
+        .as_ref()
+        .and_then(|p| PanicInfo::read_from(p));
+
+    match (has_native, panic) {
+        (true, Some(info)) if signal.as_ref().map(|s| s.number) == Some(SIGABRT) => {
+            build_correlated(pending, info, signal, timestamp)
+        }
+        (true, _) => build_native(pending, timestamp),
+        (false, Some(info)) => build_fatal_panic(info, timestamp),
+        (false, None) => build_abnormal_exit(timestamp),
     }
+}
+
+fn read_signal_info(pending: &PendingSession) -> Option<SignalInfo> {
+    let path = pending.crash_info.as_ref()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(parse_crash_info(&text))
+}
+
+/// A Rust panic that aborted into `SIGABRT` — one event carrying both the panic
+/// frames/message and the native signal.
+fn build_correlated(
+    pending: &PendingSession,
+    info: PanicInfo,
+    signal: Option<SignalInfo>,
+    timestamp: i64,
+) -> RecoveredReport {
+    let frame_sigs: Vec<String> = info
+        .frames
+        .iter()
+        .filter(|f| !f.hidden)
+        .map(|f| f.trace.clone())
+        .collect();
+    let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
+    let reason = reason_with_location(&info);
+
+    let signal_json = signal.map(|s| {
+        serde_json::json!({
+            "number": s.number,
+            "name": signal_name(s.number),
+            "code": s.code,
+            "addr": s.addr,
+        })
+    });
+    let crash_json = serde_json::to_vec(&serde_json::json!({
+        "uuid": serde_json::Value::Null,
+        "timestamp": timestamp,
+        "handled": false,
+        "obfuscated": false,
+        "ndkCrash": false,
+        "exception_type": "exception",
+        "mechanism": "rust_panic",
+        "signatures": [signature.clone()],
+        "exception": {
+            "name": "panic",
+            "reason": reason,
+            "domain": serde_json::Value::Null,
+            "frames": info.frames,
+        },
+        "signal": signal_json,
+    }))
+    .unwrap_or_default();
+
+    RecoveredReport {
+        meta: crash_meta(vec![signature], TriggerType::Crash),
+        crash_json,
+        extra_files: read_minidump(pending),
+    }
+}
+
+/// A Rust panic that ended the process without a native marker.
+fn build_fatal_panic(info: PanicInfo, timestamp: i64) -> RecoveredReport {
+    let frame_sigs: Vec<String> = info
+        .frames
+        .iter()
+        .filter(|f| !f.hidden)
+        .map(|f| f.trace.clone())
+        .collect();
+    let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
+    let crash = CrashReport {
+        uuid: None,
+        timestamp,
+        handled: false,
+        obfuscated: false,
+        ndk_crash: false,
+        exception_type: "exception".into(),
+        signatures: vec![signature.clone()],
+        exception: ExceptionInfo {
+            name: "panic".into(),
+            reason: reason_with_location(&info),
+            domain: None,
+            frames: info.frames,
+            cause: None,
+        },
+    };
+    RecoveredReport {
+        meta: crash_meta(vec![signature], TriggerType::Crash),
+        crash_json: crash.to_bytes().unwrap_or_default(),
+        extra_files: Vec::new(),
+    }
+}
+
+fn reason_with_location(info: &PanicInfo) -> String {
+    match &info.file {
+        Some(file) => format!("{} ({}:{}:{})", info.reason, file, info.line, info.column),
+        None => info.reason.clone(),
+    }
+}
+
+fn read_minidump(pending: &PendingSession) -> Vec<ExtraFile> {
+    let mut extra = Vec::new();
+    if let Some(dump) = &pending.minidump {
+        if let Ok(data) = std::fs::read(dump) {
+            extra.push(ExtraFile {
+                filename: format!("{}.minidump", crate::util::random_hex(10)),
+                file_type: "minidump".into(),
+                data,
+            });
+        }
+    }
+    extra
 }
 
 /// Remove a recovered session's on-disk state (parts + marker).
@@ -134,12 +262,6 @@ fn build_abnormal_exit(timestamp: i64) -> RecoveredReport {
 }
 
 fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
-    let signal = pending
-        .crash_info
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| parse_crash_info(&s));
-
     // Thin native variant: frames/threads are reconstructed server-side from the
     // minidump; signatures are computed server-side too, so we send none.
     let mut crash = serde_json::json!({
@@ -151,7 +273,7 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
         "exception_type": "native",
         "signatures": [],
     });
-    if let Some(sig) = signal {
+    if let Some(sig) = read_signal_info(pending) {
         crash["signal"] = serde_json::json!({
             "number": sig.number,
             "name": signal_name(sig.number),
@@ -161,21 +283,10 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
     }
     let crash_json = serde_json::to_vec(&crash).unwrap_or_default();
 
-    let mut extra_files = Vec::new();
-    if let Some(dump) = &pending.minidump {
-        if let Ok(data) = std::fs::read(dump) {
-            extra_files.push(ExtraFile {
-                filename: format!("{}.minidump", crate::util::random_hex(10)),
-                file_type: "minidump".into(),
-                data,
-            });
-        }
-    }
-
     RecoveredReport {
         meta: crash_meta(Vec::new(), TriggerType::Crash),
         crash_json,
-        extra_files,
+        extra_files: read_minidump(pending),
     }
 }
 

@@ -79,7 +79,15 @@ impl Bugsee {
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
 
+        #[cfg(feature = "telemetry")]
+        if options.system_telemetry {
+            config.sampler = Some(Box::new(crate::telemetry::SysinfoSampler::new()));
+        }
+
         let recorder = Recorder::launch(config, transport)?;
+
+        #[cfg(feature = "panic")]
+        let panic_info_path = recorder.panic_info_path();
 
         // Install the native crash handler pointing at this generation's marker.
         #[cfg(feature = "native")]
@@ -93,7 +101,12 @@ impl Bugsee {
         PAUSED.store(false, Ordering::SeqCst);
 
         #[cfg(feature = "panic")]
-        bugsee_panic::install(std::sync::Arc::new(PanicSink));
+        {
+            bugsee_panic::install(std::sync::Arc::new(PanicSink));
+            // Persist panic snapshots so an aborting panic correlates with its
+            // SIGABRT on the next launch.
+            bugsee_panic::set_snapshot_path(panic_info_path);
+        }
 
         Ok(LaunchGuard { _private: () })
     }
@@ -229,6 +242,14 @@ impl Bugsee {
         Report::new(epoch_ms())
     }
 
+    /// Start an APM transaction. Open child spans on it and `finish()` to record.
+    pub fn start_transaction(
+        name: impl Into<String>,
+        operation: impl Into<String>,
+    ) -> crate::perf::Transaction {
+        crate::perf::Transaction::start(name.into(), operation.into())
+    }
+
     /// Block until pending work drains, or `timeout` elapses.
     pub fn flush(timeout: Duration) -> bool {
         Self::with_recorder(|r| r.flush(timeout)).unwrap_or(false)
@@ -249,6 +270,14 @@ impl Bugsee {
 /// Submit a populated deferred report (called by `Report::upload`).
 pub(crate) fn submit_report(meta: ReportMeta, window_end: i64) {
     Bugsee::with_recorder(|r| r.report_at(meta, window_end, None));
+}
+
+/// Capture a completed APM transaction (called by `perf::Transaction::finish`).
+pub(crate) fn submit_transaction(transaction: bugsee_core::model::perf::Transaction) {
+    if PAUSED.load(Ordering::SeqCst) {
+        return;
+    }
+    Bugsee::with_recorder(|r| r.capture(CaptureEntry::Performance(Box::new(transaction))));
 }
 
 /// Bridges the panic observer to the recorder: a caught panic becomes a

@@ -134,6 +134,8 @@ pub enum CaptureEntry {
     Network(Box<NetworkEntry>),
     SystemTrace(TraceEntry),
     UserTrace(TraceEntry),
+    /// An APM transaction (exported to `performance.json`, not the event envelope).
+    Performance(Box<super::perf::Transaction>),
 }
 
 impl CaptureEntry {
@@ -148,6 +150,7 @@ impl CaptureEntry {
             CaptureEntry::Network(_) => "network",
             CaptureEntry::SystemTrace(_) => "traces.system",
             CaptureEntry::UserTrace(_) => "traces.user",
+            CaptureEntry::Performance(_) => "performance",
         }
     }
 
@@ -161,6 +164,7 @@ impl CaptureEntry {
             CaptureEntry::Network(e) => e.timestamp,
             CaptureEntry::SystemTrace(e) => e.timestamp,
             CaptureEntry::UserTrace(e) => e.timestamp,
+            CaptureEntry::Performance(e) => e.timestamp,
         }
     }
 
@@ -175,6 +179,7 @@ impl CaptureEntry {
             CaptureEntry::Network(e) => serde_json::to_value(e),
             CaptureEntry::SystemTrace(e) => serde_json::to_value(e),
             CaptureEntry::UserTrace(e) => serde_json::to_value(e),
+            CaptureEntry::Performance(e) => serde_json::to_value(e),
         }
     }
 }

@@ -16,8 +16,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use serde_json::Value;
+
 use crate::capture::{export, PartStore, WindowCaps};
-use crate::model::entry::CaptureEntry;
+use crate::model::entry::{CaptureEntry, TraceEntry};
 use crate::model::environment::Environment;
 use crate::model::report::TimeWindow;
 use crate::model::scope::Scope;
@@ -27,6 +29,13 @@ use crate::session::Session;
 use crate::transport::{self, Transport};
 use crate::util::epoch_ms;
 
+/// Produces system/process telemetry samples appended as `traces.system` on
+/// each rotation tick. Implemented by the host layer (e.g. via `sysinfo`).
+pub trait TelemetrySampler: Send {
+    /// Return `(trace_name, value)` pairs for this tick (e.g. `cpu_usage`).
+    fn sample(&mut self) -> Vec<(String, Value)>;
+}
+
 /// Configuration for a [`Recorder`].
 pub struct RecorderConfig {
     pub data_dir: PathBuf,
@@ -34,6 +43,8 @@ pub struct RecorderConfig {
     pub sdk_version: String,
     pub caps: WindowCaps,
     pub rotate_interval: Duration,
+    /// Optional telemetry sampler run each rotation tick.
+    pub sampler: Option<Box<dyn TelemetrySampler>>,
 }
 
 impl RecorderConfig {
@@ -45,6 +56,7 @@ impl RecorderConfig {
             sdk_version: env!("CARGO_PKG_VERSION").to_string(),
             caps: WindowCaps::default(),
             rotate_interval: Duration::from_secs(1),
+            sampler: None,
         }
     }
 }
@@ -106,13 +118,22 @@ impl Recorder {
         let data_dir = config.data_dir.clone();
         let worker_data_dir = data_dir.clone();
         let caps = config.caps;
+        let sampler = config.sampler;
 
         let worker = std::thread::Builder::new()
             .name("bugsee-capture".into())
             .spawn(move || {
                 // Deliver any crashed prior session before capturing this one.
                 run_recovery(&worker_shared, &worker_data_dir, generation);
-                worker_loop(rx, store, worker_shared, rotate_interval, worker_data_dir, caps);
+                worker_loop(
+                    rx,
+                    store,
+                    worker_shared,
+                    rotate_interval,
+                    worker_data_dir,
+                    caps,
+                    sampler,
+                );
             })?;
 
         Ok(Recorder {
@@ -171,10 +192,19 @@ impl Recorder {
     /// Path where the native crash handler should write its crash-info marker
     /// for this generation (picked up by next-launch recovery).
     pub fn crash_info_path(&self) -> PathBuf {
+        self.gen_dir().join(crate::recovery::CRASH_INFO_NAME)
+    }
+
+    /// Path where the panic observer should persist its snapshot for this
+    /// generation (used for next-launch abort correlation).
+    pub fn panic_info_path(&self) -> PathBuf {
+        self.gen_dir().join(crate::panic_info::PANIC_INFO_NAME)
+    }
+
+    fn gen_dir(&self) -> PathBuf {
         self.data_dir
             .join("parts")
             .join(self.session.generation().to_string())
-            .join(crate::recovery::CRASH_INFO_NAME)
     }
 
     /// Configured window caps.
@@ -228,6 +258,7 @@ fn run_recovery(shared: &Shared, data_dir: &std::path::Path, current_generation:
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     rx: Receiver<Msg>,
     mut store: PartStore,
@@ -235,6 +266,7 @@ fn worker_loop(
     rotate_interval: Duration,
     data_dir: PathBuf,
     caps: WindowCaps,
+    mut sampler: Option<Box<dyn TelemetrySampler>>,
 ) {
     loop {
         match rx.recv_timeout(rotate_interval) {
@@ -264,6 +296,21 @@ fn worker_loop(
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
+                if let Some(sampler) = sampler.as_mut() {
+                    let ts = epoch_ms();
+                    for (name, value) in sampler.sample() {
+                        let entry = TraceEntry {
+                            timestamp: ts,
+                            display_id: None,
+                            name: Some(name),
+                            value,
+                            custom: Default::default(),
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&entry) {
+                            let _ = store.append("traces.system", ts, &bytes);
+                        }
+                    }
+                }
                 let _ = store.rotate();
             }
             Err(RecvTimeoutError::Disconnected) => break,

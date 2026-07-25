@@ -20,6 +20,7 @@ pub mod bundle;
 pub mod capture;
 pub mod errors;
 pub mod model;
+pub mod panic_info;
 pub mod recovery;
 pub mod reporting;
 pub mod runtime;
@@ -33,9 +34,10 @@ pub use model::{
     enums::{BreadcrumbLevel, IssueType, LogLevel, LogSource, NetworkStage, Severity, TriggerType},
     envelope::Envelope,
     environment::Environment,
+    perf::{Span, Status, Transaction},
     report::{FileDescriptor, IssueRequest, Manifest, Source, TimeWindow},
     scope::Scope,
 };
 pub use reporting::{AssembledReport, ReportMeta};
-pub use runtime::{Recorder, RecorderConfig};
+pub use runtime::{Recorder, RecorderConfig, TelemetrySampler};
 pub use transport::{deliver, MockTransport, Transport, TransportError};

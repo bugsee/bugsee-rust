@@ -25,6 +25,8 @@ pub struct ChannelDocument {
 
 const ENVELOPE_PREFIX: &[u8] = br#"{"version":2,"events":["#;
 const ENVELOPE_SUFFIX: &[u8] = b"]}";
+/// APM uses a `{"transactions":[…]}` envelope instead of the event envelope.
+const PERF_PREFIX: &[u8] = br#"{"transactions":["#;
 
 /// Read the hard-linked parts under `report_dir`, keep entries whose timestamp
 /// is within `[start, end]`, and return one document per non-empty channel.
@@ -69,8 +71,13 @@ pub fn export_report(
         if count == 0 {
             continue;
         }
-        let mut bytes = Vec::with_capacity(ENVELOPE_PREFIX.len() + events.len() + ENVELOPE_SUFFIX.len());
-        bytes.extend_from_slice(ENVELOPE_PREFIX);
+        let prefix: &[u8] = if channel == "performance" {
+            PERF_PREFIX
+        } else {
+            ENVELOPE_PREFIX
+        };
+        let mut bytes = Vec::with_capacity(prefix.len() + events.len() + ENVELOPE_SUFFIX.len());
+        bytes.extend_from_slice(prefix);
         bytes.extend_from_slice(&events);
         bytes.extend_from_slice(ENVELOPE_SUFFIX);
         docs.push(ChannelDocument { channel, bytes });

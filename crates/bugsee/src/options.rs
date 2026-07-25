@@ -25,6 +25,7 @@ pub struct LaunchOptions {
     pub(crate) endpoint: Option<String>,
     pub(crate) transport: Option<Arc<dyn Transport>>,
     pub(crate) native_crash_capture: bool,
+    pub(crate) system_telemetry: bool,
 }
 
 impl LaunchOptions {
@@ -39,6 +40,7 @@ impl LaunchOptions {
             endpoint: None,
             transport: None,
             native_crash_capture: true,
+            system_telemetry: true,
         }
     }
 
@@ -46,6 +48,12 @@ impl LaunchOptions {
     /// Disable when the host already owns native crash handling.
     pub fn native_crash_capture(mut self, enabled: bool) -> Self {
         self.native_crash_capture = enabled;
+        self
+    }
+
+    /// Enable/disable periodic system/process telemetry sampling (default `true`).
+    pub fn system_telemetry(mut self, enabled: bool) -> Self {
+        self.system_telemetry = enabled;
         self
     }
 

@@ -171,6 +171,75 @@ fn native_crash_is_recovered_with_minidump_and_signal() {
     assert!(types.contains(&"log"), "pre-crash log window bundled");
 }
 
+/// Seed a prior generation that panicked and aborted: SIGABRT crash-info plus a
+/// persisted panic snapshot.
+fn seed_aborting_panic(data: &Path, generation: u64) {
+    use bugsee_core::model::crash::{Frame, FrameData};
+    use bugsee_core::panic_info::PanicInfo;
+
+    std::fs::write(data.join("gen"), generation.to_string()).unwrap();
+    let gen_dir = data.join("parts").join(generation.to_string());
+    std::fs::create_dir_all(gen_dir.join("0")).unwrap();
+
+    // SIGABRT marker from the native handler.
+    std::fs::write(gen_dir.join("crash.info"), "signal=6\ncode=0\naddress=0x0\n").unwrap();
+
+    // Panic snapshot from the observer.
+    let info = PanicInfo {
+        reason: "index out of bounds".into(),
+        file: Some("src/checkout.rs".into()),
+        line: 42,
+        column: 9,
+        timestamp: 1000,
+        frames: vec![Frame {
+            trace: "app::checkout::settle".into(),
+            hidden: false,
+            data: FrameData {
+                source: Some("src/checkout.rs".into()),
+                member_class: Some("app::checkout".into()),
+                member: Some("settle".into()),
+                line: 42,
+            },
+        }],
+    };
+    info.write_to(&gen_dir.join("panic.info")).unwrap();
+
+    let sessions = data.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join(format!("{generation}.alive")), "1").unwrap();
+}
+
+#[test]
+fn aborting_panic_correlates_with_sigabrt_into_one_event() {
+    let dir = TempDir::new();
+    seed_aborting_panic(&dir.path, 1);
+
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir.path, "T"), transport.clone()).unwrap();
+    assert!(recorder.flush(Duration::from_secs(5)));
+
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1, "exactly one correlated event, not two");
+
+    let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
+    let mut cbytes = Vec::new();
+    zip.by_name("crash.json").unwrap().read_to_end(&mut cbytes).unwrap();
+    let crash: Value = serde_json::from_slice(&cbytes).unwrap();
+
+    // One event carrying BOTH the Rust panic context and the native signal.
+    assert_eq!(crash["mechanism"], "rust_panic");
+    assert_eq!(crash["handled"], false);
+    assert_eq!(crash["ndkCrash"], false);
+    assert_eq!(crash["exception"]["name"], "panic");
+    let reason = crash["exception"]["reason"].as_str().unwrap();
+    assert!(reason.contains("index out of bounds") && reason.contains("checkout.rs:42:9"));
+    assert_eq!(crash["exception"]["frames"][0]["trace"], "app::checkout::settle");
+    assert_eq!(crash["signal"]["name"], "SIGABRT");
+    assert_eq!(crash["signal"]["number"], 6);
+    assert_eq!(crash["signatures"].as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn clean_shutdown_is_not_recovered() {
     let dir = TempDir::new();

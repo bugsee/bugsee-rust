@@ -16,5 +16,6 @@ pub mod entry;
 pub mod enums;
 pub mod envelope;
 pub mod environment;
+pub mod perf;
 pub mod report;
 pub mod scope;
