@@ -128,7 +128,17 @@ impl PartStore {
             if self.parts.len() <= 1 {
                 break;
             }
-            let newest_end = self.parts.last().map(|p| p.end_ts).unwrap_or(i64::MIN);
+            // The newest real timestamp across all parts. `rotate()` calls
+            // `evict()` right after pushing a fresh empty part (end_ts = MIN), so
+            // `parts.last()` would always be that empty part — using it made the
+            // time cap dead. Exclude empty parts here.
+            let newest_end = self
+                .parts
+                .iter()
+                .map(|p| p.end_ts)
+                .filter(|&t| t != i64::MIN)
+                .max()
+                .unwrap_or(i64::MIN);
             let oldest = &self.parts[0];
             let span_exceeded = newest_end != i64::MIN
                 && oldest.start_ts != i64::MAX

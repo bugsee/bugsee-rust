@@ -11,6 +11,7 @@
 //! sidecar (the retry counter). The uploader drains this directory with retry
 //! caps; a fresh launch resumes it (DESIGN.md §10).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::reporting::AssembledReport;
@@ -46,6 +47,10 @@ pub fn queue_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Persist an assembled report to the queue.
+///
+/// The bundle is written to a temp file and atomically `rename`d into place as
+/// the final step, so a concurrent reader (the uploader) or a crash mid-write
+/// never observes a partially-written `.bundle.zip`.
 pub fn enqueue(data_dir: &Path, report: &AssembledReport) -> std::io::Result<()> {
     let dir = queue_dir(data_dir);
     std::fs::create_dir_all(&dir)?;
@@ -53,8 +58,10 @@ pub fn enqueue(data_dir: &Path, report: &AssembledReport) -> std::io::Result<()>
     std::fs::write(sibling(&bundle, "req"), &report.request_json)?;
     // meta: "<retry> <next_attempt_epoch_ms>".
     std::fs::write(sibling(&bundle, "meta"), "0 0")?;
-    // Write the bundle last so a partially-written entry is never picked up.
-    std::fs::write(&bundle, &report.zip)?;
+    // Write to a temp path, then atomically rename into place last.
+    let tmp = sibling(&bundle, "tmp");
+    std::fs::write(&tmp, &report.zip)?;
+    std::fs::rename(&tmp, &bundle)?;
     Ok(())
 }
 
@@ -119,4 +126,52 @@ pub fn bundle_name(report: &QueuedReport) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// The crash dedup signatures a report carries (parsed from its `request.json`).
+pub fn signatures_of(report: &AssembledReport) -> Vec<String> {
+    serde_json::from_slice::<serde_json::Value>(&report.request_json)
+        .ok()
+        .and_then(|v| {
+            v.get("signatures")
+                .and_then(|s| s.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        })
+        .unwrap_or_default()
+}
+
+fn blacklist_path(data_dir: &Path) -> PathBuf {
+    queue_dir(data_dir).join(".blacklist")
+}
+
+fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(blacklist_path(data_dir))
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Persist crash signatures the server told us to stop sending (`12004`).
+pub fn blacklist_add(data_dir: &Path, sigs: &[String]) {
+    if sigs.is_empty() {
+        return;
+    }
+    let mut set = load_blacklist(data_dir);
+    let mut changed = false;
+    for s in sigs {
+        changed |= set.insert(s.clone());
+    }
+    if changed {
+        let _ = std::fs::create_dir_all(queue_dir(data_dir));
+        let body = set.into_iter().collect::<Vec<_>>().join("\n");
+        let _ = std::fs::write(blacklist_path(data_dir), body);
+    }
+}
+
+/// Whether any of `sigs` is locally blacklisted (report should be suppressed).
+pub fn any_blacklisted(data_dir: &Path, sigs: &[String]) -> bool {
+    if sigs.is_empty() {
+        return false;
+    }
+    let set = load_blacklist(data_dir);
+    sigs.iter().any(|s| set.contains(s))
 }

@@ -33,16 +33,17 @@ pub enum BugseeStatus {
     NotLaunched = 4,
 }
 
-/// Borrow a C string as `&str`, or `None` if null / not valid UTF-8.
+/// Copy a C string into an owned `String` (UTF-8), or `None` if null / not valid
+/// UTF-8. Returning an owned value avoids any borrow outliving the C pointer.
 ///
 /// # Safety
 /// `ptr` must be null or a valid, NUL-terminated C string that stays alive for
 /// the duration of the call.
-unsafe fn cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
+unsafe fn cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    unsafe { CStr::from_ptr(ptr) }.to_str().ok().map(str::to_owned)
 }
 
 /// Run `f` inside a panic boundary, mapping a contained panic to `Panic`.
@@ -180,7 +181,7 @@ pub unsafe extern "C" fn bugsee_event_with_params(
             return BugseeStatus::InvalidArgument;
         };
         let params = match unsafe { cstr(params_json) } {
-            Some(json) => match serde_json::from_str::<Map<String, Value>>(json) {
+            Some(json) => match serde_json::from_str::<Map<String, Value>>(&json) {
                 Ok(m) => m,
                 Err(_) => return BugseeStatus::InvalidArgument,
             },
@@ -204,7 +205,7 @@ pub unsafe extern "C" fn bugsee_trace(
         let (Some(name), Some(json)) = (unsafe { cstr(name) }, unsafe { cstr(value_json) }) else {
             return BugseeStatus::InvalidArgument;
         };
-        match serde_json::from_str::<Value>(json) {
+        match serde_json::from_str::<Value>(&json) {
             Ok(value) => {
                 Bugsee::trace(name, value);
                 BugseeStatus::Ok
@@ -242,7 +243,7 @@ pub unsafe extern "C" fn bugsee_set_attribute(
         let (Some(key), Some(json)) = (unsafe { cstr(key) }, unsafe { cstr(value_json) }) else {
             return BugseeStatus::InvalidArgument;
         };
-        match serde_json::from_str::<Value>(json) {
+        match serde_json::from_str::<Value>(&json) {
             Ok(value) => {
                 Bugsee::set_attribute(key, value);
                 BugseeStatus::Ok
@@ -262,8 +263,8 @@ pub unsafe extern "C" fn bugsee_capture_exception(
     reason: *const c_char,
 ) -> BugseeStatus {
     guarded(|| {
-        let name = unsafe { cstr(name) }.unwrap_or("Exception");
-        let reason = unsafe { cstr(reason) }.unwrap_or("");
+        let name = unsafe { cstr(name) }.unwrap_or_else(|| "Exception".to_string());
+        let reason = unsafe { cstr(reason) }.unwrap_or_default();
         Bugsee::capture_message(LogLevel::Error, format!("{name}: {reason}"));
         BugseeStatus::Ok
     })

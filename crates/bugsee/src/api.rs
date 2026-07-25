@@ -95,11 +95,11 @@ impl Bugsee {
         #[cfg(feature = "native")]
         if options.native_crash_capture {
             if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
-                *NATIVE.lock().unwrap() = Some(handler);
+                *NATIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
             }
         }
 
-        *RECORDER.lock().unwrap() = Some(recorder);
+        *RECORDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(recorder);
         PAUSED.store(false, Ordering::SeqCst);
 
         #[cfg(feature = "panic")]
@@ -117,14 +117,21 @@ impl Bugsee {
     pub fn stop() {
         #[cfg(feature = "native")]
         {
-            let _ = NATIVE.lock().unwrap().take();
+            let handler = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(handler);
         }
-        let _ = RECORDER.lock().unwrap().take();
+        // Take the recorder out and RELEASE the lock before dropping it — its
+        // Drop joins the worker/uploader threads and must never run while the
+        // global lock is held (that would deadlock every concurrent capture call
+        // if a thread were wedged).
+        let recorder = RECORDER.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(recorder);
     }
 
     /// Whether the SDK is launched and not paused.
     pub fn is_active() -> bool {
-        RECORDER.lock().unwrap().is_some() && !PAUSED.load(Ordering::SeqCst)
+        RECORDER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            && !PAUSED.load(Ordering::SeqCst)
     }
 
     /// Pause capture (events are dropped until [`Bugsee::resume`]).
@@ -254,9 +261,12 @@ impl Bugsee {
         Self::with_recorder(|r| r.report(built.meta, Some(built.crash_json)));
     }
 
-    /// Begin a deferred report, snapshotting the window now.
+    /// Begin a deferred report, snapshotting the window **now** (hard-linked on
+    /// disk) so later eviction cannot erode it while the report is held open.
     pub fn create_report() -> Report {
-        Report::new(epoch_ms())
+        let now = epoch_ms();
+        let snapshot = Self::with_recorder(|r| r.create_snapshot(now)).flatten();
+        Report::new(snapshot, now)
     }
 
     /// Start an APM transaction. Open child spans on it and `finish()` to record.
@@ -280,13 +290,27 @@ impl Bugsee {
     }
 
     fn with_recorder<R>(f: impl FnOnce(&Recorder) -> R) -> Option<R> {
-        RECORDER.lock().unwrap().as_ref().map(f)
+        RECORDER.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(f)
     }
 }
 
 /// Submit a populated deferred report (called by `Report::upload`).
 pub(crate) fn submit_report(meta: ReportMeta, window_end: i64) {
     Bugsee::with_recorder(|r| r.report_at(meta, window_end, None));
+}
+
+/// Submit a report from a pre-taken snapshot (deferred `create_report` path).
+pub(crate) fn submit_snapshot(handle: bugsee_core::SnapshotHandle, meta: ReportMeta) {
+    if RECORDER.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        bugsee_core::Recorder::discard_snapshot(handle);
+        return;
+    }
+    Bugsee::with_recorder(|r| r.upload_snapshot(handle, meta));
+}
+
+/// Discard a snapshot handle (called by `Report::discard`/drop).
+pub(crate) fn discard_snapshot(handle: bugsee_core::SnapshotHandle) {
+    bugsee_core::Recorder::discard_snapshot(handle);
 }
 
 /// Capture a completed APM transaction (called by `perf::Transaction::finish`).

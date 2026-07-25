@@ -147,6 +147,17 @@ where
 
 fn report_caught(payload: &(dyn std::any::Any + Send)) {
     let ctx = LAST_PANIC.with(|slot| slot.borrow_mut().take());
+
+    // The observer persists a snapshot for EVERY panic (it can't know at hook
+    // time whether the panic will be caught). Since this panic was contained,
+    // delete that snapshot so a later abnormal (non-native) exit does not
+    // misread it as a fatal panic. Only an *uncaught* panic leaves it behind.
+    if let Ok(guard) = SNAPSHOT_PATH.try_lock() {
+        if let Some(path) = guard.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     let Some(reporter) = REPORTER.get() else {
         return;
     };

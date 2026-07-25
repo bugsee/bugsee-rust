@@ -114,6 +114,32 @@ fn byte_cap_evicts_oldest_parts() {
 }
 
 #[test]
+fn time_cap_evicts_parts_beyond_the_window() {
+    // Regression: time-based eviction previously never fired (it read the
+    // freshly-rotated empty part's end_ts).
+    let dir = TempDir::new("timecap");
+    let caps = WindowCaps {
+        max_window_ms: 100, // 100 ms window
+        max_bytes: u64::MAX, // isolate the time cap
+    };
+    let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
+    // One entry per part, timestamps 0,50,100,...,500 — span 500 ms >> 100 ms.
+    for i in 0..=10 {
+        store.append("log", i * 50, &log_payload(&format!("m{i}"))).unwrap();
+        store.rotate().unwrap();
+    }
+    let (start, end) = store.retained_span().expect("some retained span");
+    assert!(
+        end - start <= 150,
+        "retained span {} ms should be near the 100 ms cap, not 500 ms",
+        end - start
+    );
+    let parts_root = dir.path.join("parts").join("0");
+    let remaining = std::fs::read_dir(&parts_root).unwrap().count();
+    assert!(remaining < 11, "old parts evicted by the time cap ({remaining} remain)");
+}
+
+#[test]
 fn hard_link_snapshot_survives_eviction() {
     let dir = TempDir::new("refcount");
     let caps = WindowCaps {

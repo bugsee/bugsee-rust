@@ -11,18 +11,20 @@
 use bugsee_core::model::enums::{IssueType, Severity, TriggerType};
 use bugsee_core::model::report::Source;
 use bugsee_core::reporting::{Attachment, ReportMeta};
+use bugsee_core::SnapshotHandle;
 use serde_json::{Map, Value};
 
 /// A report captured at a point in time, awaiting population and upload.
 pub struct Report {
     pub(crate) meta: ReportMeta,
-    /// Window end pinned at `create_report()` time.
-    pub(crate) window_end: i64,
-    uploaded: bool,
+    /// The window snapshot taken at creation (hard-linked on disk).
+    snapshot: Option<SnapshotHandle>,
+    /// Fallback window end, used only when no snapshot could be taken.
+    window_end: i64,
 }
 
 impl Report {
-    pub(crate) fn new(window_end: i64) -> Self {
+    pub(crate) fn new(snapshot: Option<SnapshotHandle>, window_end: i64) -> Self {
         Report {
             meta: ReportMeta {
                 issue_type: IssueType::Bug,
@@ -39,8 +41,8 @@ impl Report {
                 attrs: Map::new(),
                 attachments: Vec::new(),
             },
+            snapshot,
             window_end,
-            uploaded: false,
         }
     }
 
@@ -101,12 +103,29 @@ impl Report {
 
     /// Submit the report. Consumes the builder.
     pub fn upload(mut self) {
-        self.uploaded = true;
-        crate::api::submit_report(self.meta.clone(), self.window_end);
+        let meta = self.meta.clone();
+        match self.snapshot.take() {
+            // Deliver from the snapshot taken at create time.
+            Some(handle) => crate::api::submit_snapshot(handle, meta),
+            // No snapshot was taken — fall back to pinning the window now.
+            None => crate::api::submit_report(meta, self.window_end),
+        }
     }
 
-    /// Discard the report without uploading.
-    pub fn discard(self) {
-        // Drop without submitting.
+    /// Discard the report without uploading (releases the snapshot's links).
+    pub fn discard(mut self) {
+        if let Some(handle) = self.snapshot.take() {
+            crate::api::discard_snapshot(handle);
+        }
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        // A report dropped without upload/discard must still release its
+        // snapshot's on-disk hard links.
+        if let Some(handle) = self.snapshot.take() {
+            crate::api::discard_snapshot(handle);
+        }
     }
 }

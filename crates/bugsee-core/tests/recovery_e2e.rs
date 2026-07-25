@@ -227,16 +227,19 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
     zip.by_name("crash.json").unwrap().read_to_end(&mut cbytes).unwrap();
     let crash: Value = serde_json::from_slice(&cbytes).unwrap();
 
-    // One event carrying BOTH the Rust panic context and the native signal.
-    assert_eq!(crash["mechanism"], "rust_panic");
+    // One managed crash event carrying the Rust panic frames; the SIGABRT is
+    // recorded via the exception `domain` (the contract reserves the top-level
+    // `signal` object for the native variant, so a managed variant must not emit
+    // it, nor the non-contract `mechanism` key).
     assert_eq!(crash["handled"], false);
     assert_eq!(crash["ndkCrash"], false);
+    assert!(crash.get("mechanism").is_none(), "no off-contract mechanism key");
+    assert!(crash.get("signal").is_none(), "no signal object on the managed variant");
     assert_eq!(crash["exception"]["name"], "panic");
+    assert_eq!(crash["exception"]["domain"], "Signal::SIGABRT");
     let reason = crash["exception"]["reason"].as_str().unwrap();
     assert!(reason.contains("index out of bounds") && reason.contains("checkout.rs:42:9"));
     assert_eq!(crash["exception"]["frames"][0]["trace"], "app::checkout::settle");
-    assert_eq!(crash["signal"]["name"], "SIGABRT");
-    assert_eq!(crash["signal"]["number"], 6);
     assert_eq!(crash["signatures"].as_array().unwrap().len(), 1);
 }
 

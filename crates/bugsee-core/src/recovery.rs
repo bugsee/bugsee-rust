@@ -116,8 +116,10 @@ fn read_signal_info(pending: &PendingSession) -> Option<SignalInfo> {
     Some(parse_crash_info(&text))
 }
 
-/// A Rust panic that aborted into `SIGABRT` — one event carrying both the panic
-/// frames/message and the native signal.
+/// A Rust panic that aborted into `SIGABRT` — one managed crash event carrying
+/// the panic frames/message, with the signal recorded via the exception
+/// `domain` (the contract reserves the `signal` object for the native variant,
+/// so a managed variant must not emit it).
 fn build_correlated(
     pending: &PendingSession,
     info: PanicInfo,
@@ -130,39 +132,27 @@ fn build_correlated(
         .filter(|f| !f.hidden)
         .map(|f| f.trace.clone())
         .collect();
-    let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
-    let reason = reason_with_location(&info);
-
-    let signal_json = signal.map(|s| {
-        serde_json::json!({
-            "number": s.number,
-            "name": signal_name(s.number),
-            "code": s.code,
-            "addr": s.addr,
-        })
-    });
-    let crash_json = serde_json::to_vec(&serde_json::json!({
-        "uuid": serde_json::Value::Null,
-        "timestamp": timestamp,
-        "handled": false,
-        "obfuscated": false,
-        "ndkCrash": false,
-        "exception_type": "exception",
-        "mechanism": "rust_panic",
-        "signatures": [signature.clone()],
-        "exception": {
-            "name": "panic",
-            "reason": reason,
-            "domain": serde_json::Value::Null,
-            "frames": info.frames,
+    let domain = signal.map(|s| format!("Signal::{}", signal_name(s.number)));
+    let signature = panic_signature("panic", &info.reason, &frame_sigs, false, domain.as_deref());
+    let crash = CrashReport {
+        uuid: None,
+        timestamp,
+        handled: false,
+        obfuscated: false,
+        ndk_crash: false,
+        exception_type: "exception".into(),
+        signatures: vec![signature.clone()],
+        exception: ExceptionInfo {
+            name: "panic".into(),
+            reason: reason_with_location(&info),
+            domain,
+            frames: info.frames,
+            cause: None,
         },
-        "signal": signal_json,
-    }))
-    .unwrap_or_default();
-
+    };
     RecoveredReport {
         meta: crash_meta(vec![signature], TriggerType::Crash),
-        crash_json,
+        crash_json: crash.to_bytes().unwrap_or_default(),
         extra_files: read_minidump(pending),
     }
 }
@@ -220,14 +210,17 @@ fn read_minidump(pending: &PendingSession) -> Vec<ExtraFile> {
     extra
 }
 
-/// Remove a recovered session's on-disk state (parts + marker).
+/// Remove a recovered session's on-disk state. The liveness marker is removed
+/// **first**: a crash between the two steps then leaks a parts directory (later
+/// GC'able) rather than leaving a marker that would re-recover a phantom empty
+/// report or duplicate the already-delivered one.
 pub fn discard(data_dir: &Path, pending: &PendingSession) {
-    let _ = std::fs::remove_dir_all(&pending.parts_dir);
     let _ = std::fs::remove_file(
         data_dir
             .join("sessions")
             .join(format!("{}.alive", pending.generation)),
     );
+    let _ = std::fs::remove_dir_all(&pending.parts_dir);
 }
 
 fn build_abnormal_exit(timestamp: i64) -> RecoveredReport {
@@ -279,6 +272,9 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
             "name": signal_name(sig.number),
             "code": sig.code,
             "addr": sig.addr,
+            "code_name": serde_json::Value::Null,
+            "abort_message": serde_json::Value::Null,
+            "cause": serde_json::Value::Null,
         });
     }
     let crash_json = serde_json::to_vec(&crash).unwrap_or_default();

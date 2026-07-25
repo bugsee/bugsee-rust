@@ -98,6 +98,36 @@ fn config(dir: &std::path::Path) -> RecorderConfig {
 }
 
 #[test]
+fn worker_survives_a_panicking_before_send() {
+    let dir = TempDir::new();
+    let mock = Arc::new(MockTransport::default());
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = calls.clone();
+
+    let mut config = config(&dir.path);
+    config.before_send = Some(Box::new(move |_meta| {
+        // Panic on the first report; succeed afterward.
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom inside a host before_send callback");
+        }
+        true
+    }));
+
+    let recorder = Recorder::launch(config, mock.clone()).unwrap();
+    recorder.report(bugsee_core::reporting::manual_upload_meta(), None); // panics in before_send
+    recorder.capture(log_entry());
+    recorder.report(bugsee_core::reporting::manual_upload_meta(), None); // must still be delivered
+    assert!(recorder.flush(Duration::from_secs(5)));
+
+    assert!(calls.load(Ordering::SeqCst) >= 2, "before_send ran for both reports");
+    assert_eq!(
+        mock.uploaded_bundles.lock().unwrap().len(),
+        1,
+        "the worker survived the panic and delivered the second report"
+    );
+}
+
+#[test]
 fn transient_failures_are_retried_until_delivered() {
     let dir = TempDir::new();
     let flaky = Arc::new(FlakyTransport::new(2)); // fail twice, then succeed

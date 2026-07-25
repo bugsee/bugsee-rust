@@ -47,6 +47,17 @@ pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
 
 /// NUL-terminated path bytes, prepared at install time so the crash-time path
 /// performs no allocation.
+#[cfg(unix)]
+fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    // Use the real OS bytes (paths are not guaranteed UTF-8); a lossy conversion
+    // would target the wrong file and silently lose the crash marker.
+    let mut bytes = path.as_os_str().as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+#[cfg(not(unix))]
 fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
     let mut bytes = path.to_string_lossy().into_owned().into_bytes();
     bytes.push(0);

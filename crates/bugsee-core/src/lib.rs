@@ -40,5 +40,5 @@ pub use model::{
     scope::Scope,
 };
 pub use reporting::{AssembledReport, ReportMeta};
-pub use runtime::{Recorder, RecorderConfig, TelemetrySampler};
+pub use runtime::{Recorder, RecorderConfig, SnapshotHandle, TelemetrySampler};
 pub use transport::{deliver, MockTransport, Transport, TransportError};

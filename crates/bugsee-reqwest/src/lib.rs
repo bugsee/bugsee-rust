@@ -45,7 +45,9 @@ impl Middleware for BugseeMiddleware {
         extensions: &mut Extensions,
         next: Next<'_>,
     ) -> reqwest_middleware::Result<Response> {
-        let id = random_hex(3);
+        // 64-bit id so before/complete entries don't mispair under collision in
+        // a busy capture window.
+        let id = random_hex(8);
         let method = req.method().to_string();
         let url = sanitize_url(req.url());
         let req_size = req
@@ -143,34 +145,56 @@ fn is_sensitive_param(name: &str) -> bool {
     )
 }
 
-/// Header names whose values are redacted.
+/// Header names whose values are redacted — an explicit list plus a substring
+/// heuristic covering the common credential-bearing headers (`x-auth-token`,
+/// `api-key`, `x-session-token`, …).
 fn is_sensitive_header(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    matches!(
+    if matches!(
         n.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
-    )
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+    ) {
+        return true;
+    }
+    // `www-authenticate` is a public challenge header, not a secret.
+    if n == "www-authenticate" {
+        return false;
+    }
+    ["token", "secret", "password", "api-key", "apikey", "auth", "session"]
+        .iter()
+        .any(|needle| n.contains(needle))
 }
 
 const FILTERED: &str = "[FILTERED]";
 
-/// Redact sensitive query-parameter values, preserving the rest of the URL.
+/// Redact URL-embedded credentials (`user:pass@host`) and sensitive query
+/// parameters, preserving the rest of the URL.
 pub fn sanitize_url(url: &reqwest::Url) -> String {
-    if url.query().is_none() {
-        return url.to_string();
-    }
-    let pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .map(|(k, v)| {
-            if is_sensitive_param(&k) {
-                (k.into_owned(), FILTERED.to_string())
-            } else {
-                (k.into_owned(), v.into_owned())
-            }
-        })
-        .collect();
     let mut out = url.clone();
-    out.query_pairs_mut().clear().extend_pairs(pairs);
+
+    // Collect redacted query pairs before mutating (borrow ends here).
+    let has_query = out.query().is_some();
+    let pairs: Vec<(String, String)> = if has_query {
+        out.query_pairs()
+            .map(|(k, v)| {
+                if is_sensitive_param(&k) {
+                    (k.into_owned(), FILTERED.to_string())
+                } else {
+                    (k.into_owned(), v.into_owned())
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Strip any embedded username/password so credentials never reach the wire.
+    let _ = out.set_username("");
+    let _ = out.set_password(None);
+
+    if has_query {
+        out.query_pairs_mut().clear().extend_pairs(pairs);
+    }
     out.to_string()
 }
 
