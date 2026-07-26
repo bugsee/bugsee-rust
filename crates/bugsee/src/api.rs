@@ -105,6 +105,14 @@ impl Bugsee {
                     .replace(handler);
                 drop(old);
             }
+        } else {
+            // Native capture is disabled on this (re)launch: uninstall any handler
+            // a prior launch installed, so it stops intercepting fatal signals (it
+            // would otherwise also point at a stale generation's marker path and
+            // conflict with a host-owned crash handler). Take under the lock, drop
+            // outside it — mirrors `stop()`.
+            let old = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(old);
         }
 
         // Install the new recorder and drop any previous one OUTSIDE the lock:

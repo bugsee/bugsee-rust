@@ -32,6 +32,9 @@ impl QueuedReport {
     fn meta_path(&self) -> PathBuf {
         sibling(&self.bundle, "meta")
     }
+    fn endpoint_path(&self) -> PathBuf {
+        sibling(&self.bundle, "endpoint")
+    }
 }
 
 fn sibling(bundle: &Path, ext: &str) -> PathBuf {
@@ -112,11 +115,33 @@ pub fn next_attempt(report: &QueuedReport) -> i64 {
     read_meta(report).1
 }
 
-/// Delete a queued report (all three files).
+/// The cached presigned upload endpoint for a report, if a prior attempt created
+/// the issue but the PUT failed transiently. A retry resumes at the PUT (step 3)
+/// instead of re-POSTing `create_issue` (which would mint a duplicate issue, or
+/// trip server dedup `12003` and drop the bundle without ever uploading it).
+pub fn endpoint(report: &QueuedReport) -> Option<String> {
+    std::fs::read_to_string(report.endpoint_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Cache the presigned upload endpoint so the next attempt resumes at the PUT.
+pub fn set_endpoint(report: &QueuedReport, endpoint: &str) {
+    let _ = std::fs::write(report.endpoint_path(), endpoint);
+}
+
+/// Drop any cached presigned endpoint (it expired, or the issue must be recreated).
+pub fn clear_endpoint(report: &QueuedReport) {
+    let _ = std::fs::remove_file(report.endpoint_path());
+}
+
+/// Delete a queued report (bundle + all sidecars).
 pub fn remove(report: &QueuedReport) {
     let _ = std::fs::remove_file(&report.bundle);
     let _ = std::fs::remove_file(report.req_path());
     let _ = std::fs::remove_file(report.meta_path());
+    let _ = std::fs::remove_file(report.endpoint_path());
 }
 
 /// The bundle file's base name (for reconstructing an [`AssembledReport`]).
@@ -209,6 +234,7 @@ pub fn gc_orphans(data_dir: &Path) {
         let bundle_name = name
             .strip_suffix(".req")
             .or_else(|| name.strip_suffix(".meta"))
+            .or_else(|| name.strip_suffix(".endpoint"))
             .or_else(|| name.strip_suffix(".tmp"));
         if let Some(bundle_name) = bundle_name {
             if !dir.join(bundle_name).exists() {

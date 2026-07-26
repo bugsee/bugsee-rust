@@ -50,6 +50,10 @@ impl Middleware for BugseeMiddleware {
         let id = random_hex(8);
         let method = req.method().to_string();
         let url = sanitize_url(req.url());
+        // The raw URL (possibly credential-bearing) is kept ONLY to scrub it out
+        // of a failure's error message below — never captured as-is. `req` is
+        // moved into `next.run`, so grab it now.
+        let raw_url = req.url().as_str().to_string();
 
         // Capture the in-memory request body. A streaming body can't be read
         // back as bytes, so `body()`/`as_bytes()` yields `None` there. Own
@@ -89,7 +93,11 @@ impl Middleware for BugseeMiddleware {
                 ));
             }
             Err(err) => {
-                Bugsee::capture_network(error_entry(&id, &method, &url, err.to_string()));
+                // reqwest's error `Display` embeds the full request URL verbatim,
+                // so storing it raw would leak the very credentials `sanitize_url`
+                // strips from the `url` field. Scrub URLs out of the message.
+                let msg = sanitize_error_message(&err.to_string(), &raw_url, &url);
+                Bugsee::capture_network(error_entry(&id, &method, &url, msg));
             }
         }
         result
@@ -205,26 +213,17 @@ fn is_sensitive_param(name: &str) -> bool {
     STEMS.iter().any(|stem| n.contains(stem))
 }
 
-/// Header names whose values are redacted — an explicit list plus a substring
-/// heuristic covering the common credential-bearing headers (`x-auth-token`,
-/// `api-key`, `x-session-token`, …).
+/// Header names whose values are redacted. Delegates to the SAME normalized
+/// credential matcher as query/form/JSON keys ([`is_sensitive_param`]) so header
+/// redaction is never *weaker* than param redaction — the previous bespoke list
+/// leaked `signature`/`csrf`/`key`/`bearer` headers and underscore variants such
+/// as `api_key` (which matched neither `api-key` nor `apikey`).
 fn is_sensitive_header(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    if matches!(
-        n.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
-    ) {
-        return true;
-    }
     // `www-authenticate` is a public challenge header, not a secret.
-    if n == "www-authenticate" {
+    if name.eq_ignore_ascii_case("www-authenticate") {
         return false;
     }
-    [
-        "token", "secret", "password", "api-key", "apikey", "auth", "session",
-    ]
-    .iter()
-    .any(|needle| n.contains(needle))
+    is_sensitive_param(name)
 }
 
 const FILTERED: &str = "[FILTERED]";
@@ -269,6 +268,48 @@ pub fn sanitize_url(url: &reqwest::Url) -> String {
         out.set_fragment(Some(&f));
     }
     out.to_string()
+}
+
+/// Scrub URLs out of a network error message so a failed-request entry's `error`
+/// field can't leak credentials that [`sanitize_url`] strips from the `url`
+/// field. Replaces the (raw) request URL with its sanitized form, then redacts
+/// any other embedded `http(s)` URL (e.g. a redirect target) as defense in depth.
+fn sanitize_error_message(msg: &str, raw_url: &str, safe_url: &str) -> String {
+    let swapped = if raw_url.is_empty() {
+        msg.to_string()
+    } else {
+        msg.replace(raw_url, safe_url)
+    };
+    redact_urls_in_text(&swapped)
+}
+
+/// Find and sanitize every `http://`/`https://` URL token embedded in free text.
+fn redact_urls_in_text(text: &str) -> String {
+    fn url_start(s: &str) -> Option<usize> {
+        match (s.find("http://"), s.find("https://")) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = url_start(rest) {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        // A URL token runs until whitespace or a character that commonly wraps
+        // one in an error string.
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>' | ',' | '`'))
+            .unwrap_or(tail.len());
+        let token = &tail[..end];
+        match reqwest::Url::parse(token) {
+            Ok(u) => out.push_str(&sanitize_url(&u)),
+            Err(_) => out.push_str(token),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Redact the values of sensitive keys in an `&`-joined `key=value` string
@@ -431,6 +472,60 @@ mod tests {
         let v = sanitize_headers(&headers);
         assert_eq!(v["authorization"], FILTERED);
         assert_eq!(v["content-type"], "application/json");
+    }
+
+    #[test]
+    fn header_redaction_is_not_weaker_than_param_redaction() {
+        // These all leaked under the old bespoke header list; they must redact now
+        // (headers reuse the normalized-substring param matcher).
+        for h in [
+            "x-signature",
+            "csrf-token",
+            "x-xsrf-token",
+            "api_key",      // underscore variant
+            "X-Auth-Token", // case
+            "x-bearer",
+            "proxy-authorization",
+            "set-cookie",
+        ] {
+            assert!(is_sensitive_header(h), "{h} must be redacted");
+        }
+        // …but a public challenge header and ordinary headers are preserved.
+        assert!(!is_sensitive_header("www-authenticate"));
+        for h in ["content-type", "accept", "user-agent", "x-request-id"] {
+            assert!(!is_sensitive_header(h), "{h} must NOT be redacted");
+        }
+    }
+
+    #[test]
+    fn error_message_does_not_leak_url_credentials() {
+        let raw = "https://user:pass@api.example.com/v1/pay?token=SECRET";
+        let safe = sanitize_url(&reqwest::Url::parse(raw).unwrap());
+        // Simulate reqwest's error Display, which embeds the raw request URL.
+        let msg = format!("error sending request for url ({raw}): connection refused");
+        let scrubbed = sanitize_error_message(&msg, raw, &safe);
+        assert!(
+            !scrubbed.contains("SECRET"),
+            "query secret leaked: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("user:pass"),
+            "userinfo leaked: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("connection refused"),
+            "diagnostic text preserved: {scrubbed}"
+        );
+
+        // A different URL (e.g. a redirect target) embedded in the message is also
+        // redacted even though it isn't the request URL.
+        let other = "https://evil.example/#access_token=LEAK";
+        let msg2 = format!("redirected to {other}");
+        let scrubbed2 = sanitize_error_message(&msg2, "", "");
+        assert!(
+            !scrubbed2.contains("LEAK"),
+            "redirect token leaked: {scrubbed2}"
+        );
     }
 
     #[test]

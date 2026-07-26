@@ -32,17 +32,46 @@ pub fn sha1_hex(inputs: &[&[u8]]) -> String {
 }
 
 /// Normalize a Rust frame descriptor so grouping is stable across builds:
-/// strip the trailing `::h<hex>` symbol hash and collapse closure markers.
+/// strip the rustc `::h<hex>` symbol hash and collapse closure markers.
+///
+/// Real frames are `"{symbol} ({file}:{line})"`, and `backtrace`'s `Display`
+/// symbol RETAINS the hash (e.g. `app::pay::h1406d87bf3ffb336`). Because the
+/// hash is followed by `" (file:line)"`, a "the whole tail is hex" test never
+/// fires — so we strip every `::h<16-hex>` run *wherever* it appears, bounded by
+/// a non-hex-digit boundary. That is exactly the rustc symbol-hash shape (16 hex
+/// digits) and so leaves a real module segment such as `::hasher` untouched.
 pub fn normalize_frame(frame: &str) -> String {
-    let mut f = frame.to_string();
-    // Drop a trailing rustc symbol hash like `::h3a4b5c6d7e8f9012`.
-    if let Some(idx) = f.rfind("::h") {
-        let tail = &f[idx + 3..];
-        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_hexdigit()) {
-            f.truncate(idx);
+    strip_symbol_hashes(frame).replace("{{closure}}", "{closure}")
+}
+
+/// Remove every `::h<exactly 16 hex digits>` rustc symbol-hash occurrence,
+/// preserving all other bytes (UTF-8 safe: it copies string slices and only
+/// byte-matches the ASCII marker `::h` and ASCII hex digits).
+fn strip_symbol_hashes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0; // byte index up to which `out` already holds `s`
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"::h" {
+            let start = i + 3;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            // A rustc symbol hash is exactly 16 hex digits terminated by a
+            // non-hex boundary (space, `(`, `:`, `<`, end, …). Only then strip.
+            if j - start == 16 {
+                out.push_str(&s[copied..i]);
+                copied = j;
+                i = j;
+                continue;
+            }
         }
+        i += 1;
     }
-    f.replace("{{closure}}", "{closure}")
+    out.push_str(&s[copied..]);
+    out
 }
 
 /// Normalize a panic/exception message so dynamic values (indices, ids) don't
@@ -142,6 +171,38 @@ mod tests {
         );
         // A non-hash `::h...` tail is preserved.
         assert_eq!(normalize_frame("app::hasher::run"), "app::hasher::run");
+    }
+
+    #[test]
+    fn real_frame_format_hash_is_stripped_and_build_stable() {
+        // The actual producers emit "{symbol-with-hash} ({file}:{line})"; the
+        // hash sits in the MIDDLE of the string, not at the end.
+        assert_eq!(
+            normalize_frame("sigcheck::main::h1406d87bf3ffb336 (src/main.rs:10)"),
+            "sigcheck::main (src/main.rs:10)"
+        );
+        // Two builds differing only in the per-build symbol hash must produce the
+        // same signature — otherwise dedup/blacklist break on every recompile.
+        let a = panic_signature(
+            "panic",
+            "boom",
+            &["app::pay::h1111111111111111 (a.rs:1)".into()],
+            false,
+            None,
+        );
+        let b = panic_signature(
+            "panic",
+            "boom",
+            &["app::pay::h2222222222222222 (a.rs:1)".into()],
+            false,
+            None,
+        );
+        assert_eq!(a, b, "per-build symbol hash must not affect the signature");
+        // A generic frame with an inner hash is also stripped.
+        assert_eq!(
+            normalize_frame("core::ptr::drop_in_place::<T>::h00ff00ff00ff00ff (lib.rs:1)"),
+            "core::ptr::drop_in_place::<T> (lib.rs:1)"
+        );
     }
 
     #[test]

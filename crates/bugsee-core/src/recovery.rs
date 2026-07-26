@@ -407,23 +407,39 @@ fn native_frame_signature(pending: &PendingSession, signal: Option<&SignalInfo>)
     ))
 }
 
-/// The module with the largest base ≤ `pc`, and the offset within it.
-fn resolve_module_offset(pc: usize, modules: &[(usize, String)]) -> Option<(String, u64)> {
+/// The module whose loaded range `[base, base + size)` contains `pc` (the one
+/// with the largest such base), and the offset within it. A PC outside every
+/// module's range yields `None` — it is SKIPPED rather than misattributed to the
+/// nearest-below module with a bogus, ASLR-unstable offset that would defeat the
+/// crash-loop blacklist (F25).
+fn resolve_module_offset(pc: usize, modules: &[(usize, usize, String)]) -> Option<(String, u64)> {
     modules
         .iter()
-        .filter(|(base, _)| *base <= pc)
-        .max_by_key(|(base, _)| *base)
-        .map(|(base, name)| (name.clone(), (pc - base) as u64))
+        .filter(|(base, size, _)| *base <= pc && pc - *base < *size)
+        .max_by_key(|(base, _, _)| *base)
+        .map(|(base, _, name)| (name.clone(), (pc - base) as u64))
 }
 
-/// Read the module map (`<base_hex>\t<name>` per line) written at install time.
-fn read_modules(path: &Path) -> Vec<(usize, String)> {
+/// Read the module map (`<base_hex>\t<size_hex>\t<name>` per line) written at
+/// install time. A legacy 2-field line (`<base_hex>\t<name>`, from a marker that
+/// survived an SDK upgrade) is read with an unbounded size, preserving the old
+/// nearest-module behavior for that entry only.
+fn read_modules(path: &Path) -> Vec<(usize, usize, String)> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
         .filter_map(|line| {
-            let (base, name) = line.split_once('\t')?;
-            let base = usize::from_str_radix(base.trim(), 16).ok()?;
-            Some((base, name.to_string()))
+            let mut parts = line.splitn(3, '\t');
+            let base = usize::from_str_radix(parts.next()?.trim(), 16).ok()?;
+            let second = parts.next()?;
+            match parts.next() {
+                // New format: base \t size \t name.
+                Some(name) => {
+                    let size = usize::from_str_radix(second.trim(), 16).unwrap_or(usize::MAX);
+                    Some((base, size, name.to_string()))
+                }
+                // Legacy format: base \t name (size unknown → unbounded).
+                None => Some((base, usize::MAX, second.to_string())),
+            }
         })
         .collect()
 }

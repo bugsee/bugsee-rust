@@ -52,13 +52,36 @@ pub trait Transport: Send + Sync {
 
 /// Deliver one assembled report through `transport`, holding/refreshing the
 /// session token in `session`. Retries once on session expiry.
+///
+/// `cached_endpoint` is a presigned upload URL a prior attempt obtained but
+/// failed to PUT to; when set, delivery resumes at the PUT instead of re-creating
+/// the issue (avoiding a duplicate issue / a `12003` drop of an un-uploaded
+/// bundle). On a *transient* PUT failure the endpoint that should be persisted
+/// for the next retry is written to `endpoint_out`; on any other outcome
+/// `endpoint_out` is left `None` (the caller then clears any stale cache).
 pub fn deliver(
     transport: &dyn Transport,
     app_token: &str,
     environment_json: &[u8],
     session: &Mutex<Option<String>>,
     report: &AssembledReport,
+    cached_endpoint: Option<&str>,
+    endpoint_out: &mut Option<String>,
 ) -> Result<(), TransportError> {
+    // Resume at the PUT if we already have a presigned endpoint from a prior
+    // attempt. A transient failure keeps it cached; any other failure (e.g. the
+    // presigned URL expired → 403) falls through to recreate the issue.
+    if let Some(endpoint) = cached_endpoint {
+        match transport.upload_bundle(endpoint, &report.zip) {
+            Ok(()) => return Ok(()),
+            Err(TransportError::Transient(e)) => {
+                *endpoint_out = Some(endpoint.to_string());
+                return Err(TransportError::Transient(e));
+            }
+            Err(_) => { /* stale/expired endpoint — recreate the issue below */ }
+        }
+    }
+
     for attempt in 0..2 {
         // Ensure we hold an access token, never holding the lock across the
         // (blocking) network call: read under the lock, register outside it, then
@@ -79,7 +102,18 @@ pub fn deliver(
         };
 
         match transport.create_issue(app_token, token.as_deref(), &report.request_json) {
-            Ok(endpoint) => return transport.upload_bundle(&endpoint, &report.zip),
+            Ok(endpoint) => {
+                return match transport.upload_bundle(&endpoint, &report.zip) {
+                    Ok(()) => Ok(()),
+                    // Persist the endpoint so the retry resumes at the PUT rather
+                    // than re-POSTing create_issue (duplicate issue / 12003 drop).
+                    Err(TransportError::Transient(e)) => {
+                        *endpoint_out = Some(endpoint);
+                        Err(TransportError::Transient(e))
+                    }
+                    Err(e) => Err(e),
+                };
+            }
             Err(TransportError::SessionExpired) if attempt == 0 => {
                 *session.lock().unwrap_or_else(|e| e.into_inner()) = None; // re-register, retry
                 continue;

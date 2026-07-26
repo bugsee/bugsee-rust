@@ -8,6 +8,8 @@
 //! The default synchronous HTTP transport (ureq). Implements the 3-step
 //! delivery: register session → create issue → PUT bundle to the presigned URL.
 
+use std::time::Duration;
+
 use bugsee_core::transport::{Transport, TransportError};
 use serde_json::{Map, Value};
 
@@ -17,13 +19,25 @@ pub const DEFAULT_BASE_URL: &str = "https://api.bugsee.com/v2";
 /// A ureq-backed [`Transport`].
 pub struct HttpTransport {
     base_url: String,
+    agent: ureq::Agent,
 }
 
 impl HttpTransport {
     /// Build a transport against `endpoint` or the default base URL.
     pub fn new(endpoint: Option<String>) -> Self {
+        // Use one Agent with explicit timeouts so a stalled connection can never
+        // wedge the single uploader thread forever (the bare `ureq::get/post/put`
+        // helpers use a default agent with NO timeouts). The read/write timeouts
+        // are per-socket-operation, so they trip on a stalled peer without
+        // penalizing a slow-but-progressing large-bundle PUT.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(30))
+            .build();
         HttpTransport {
             base_url: endpoint.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            agent,
         }
     }
 }
@@ -58,7 +72,9 @@ impl Transport for HttpTransport {
     ) -> Result<String, TransportError> {
         let env: Value = serde_json::from_slice(environment_json).unwrap_or(Value::Null);
         let body = serde_json::json!({ "app_token": app_token, "environment": env });
-        let resp = ureq::post(&format!("{}/sessions", self.base_url))
+        let resp = self
+            .agent
+            .post(&format!("{}/sessions", self.base_url))
             .set("Content-Type", "application/json")
             .set("x-client-type", "rust")
             .send_json(body)
@@ -87,7 +103,9 @@ impl Transport for HttpTransport {
             body.insert("access_token".into(), Value::from(t));
         }
         let url = format!("{}/issues?app_token={}", self.base_url, app_token);
-        let resp = ureq::post(&url)
+        let resp = self
+            .agent
+            .post(&url)
             .set("Content-Type", "application/json")
             .set("x-client-type", "rust")
             .send_json(Value::Object(body))
@@ -103,7 +121,8 @@ impl Transport for HttpTransport {
     }
 
     fn upload_bundle(&self, endpoint: &str, zip: &[u8]) -> Result<(), TransportError> {
-        ureq::put(endpoint)
+        self.agent
+            .put(endpoint)
             .set("Content-Length", &zip.len().to_string())
             .send_bytes(zip)
             .map_err(map_ureq_error)?;

@@ -81,17 +81,50 @@ fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
 // Linux/Android deliver a POSIX signal — `siginfo` carries signo/code/addr.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
-    let si = cc.siginfo;
+    let si = &cc.siginfo;
+    let signo = si.ssi_signo as i32;
+    let code = si.ssi_code;
+    let addr = fault_address(si, signo);
+
+    // F29: persist the GUARANTEED marker (signal/code/addr) FIRST, THEN capture
+    // frames. Linux frame capture runs `backtrace::trace_unsynchronized` on the
+    // crashing thread, which is NOT async-signal-safe (it may lock / re-fault);
+    // if it does, the essential crash info has already been written rather than
+    // the whole report being lost.
+    unsafe {
+        write_marker(path_cbytes, signo, code, addr);
+    }
     let mut frames = [0usize; MAX_FRAMES];
     let n = capture_frames(cc, &mut frames);
     unsafe {
-        write_marker(
-            path_cbytes,
-            si.ssi_signo as i32,
-            si.ssi_code,
-            si.ssi_addr as usize,
-            &frames[..n],
-        );
+        append_frames(path_cbytes, &frames[..n]);
+    }
+}
+
+/// The fault address for a signal that carries one (SIGSEGV/SIGBUS/SIGILL/
+/// SIGFPE/SIGTRAP), read through the real `siginfo_t` layout; `0` otherwise.
+///
+/// `crash-handler` fills `cc.siginfo` by REINTERPRETING the delivered
+/// `siginfo_t` as a `signalfd_siginfo` (a raw byte copy), so `ssi_addr` (offset
+/// 72) does not line up with `siginfo_t::si_addr` (offset 16) and reads as ~0
+/// (F30). The copied bytes ARE a faithful `siginfo_t`, so read the address back
+/// through that layout.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fault_address(si: &libc::signalfd_siginfo, signo: i32) -> usize {
+    const SIGILL: i32 = 4;
+    const SIGTRAP: i32 = 5;
+    const SIGBUS: i32 = 7;
+    const SIGFPE: i32 = 8;
+    const SIGSEGV: i32 = 11;
+    if !matches!(signo, SIGILL | SIGTRAP | SIGBUS | SIGFPE | SIGSEGV) {
+        return 0;
+    }
+    // SAFETY: `si` is a byte-faithful copy of the original `siginfo_t` (both
+    // structs are 128 bytes), so reinterpreting back and reading `si_addr()` (the
+    // `_sigfault` union member) is valid for a fault signal.
+    unsafe {
+        let sip = si as *const libc::signalfd_siginfo as *const libc::siginfo_t;
+        (*sip).si_addr() as usize
     }
 }
 
@@ -129,10 +162,13 @@ fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
         }
         None => (0, 0, 0),
     };
+    unsafe {
+        write_marker(path_cbytes, signo, code, addr);
+    }
     let mut frames = [0usize; MAX_FRAMES];
     let n = unsafe { capture_frames(cc, &mut frames) };
     unsafe {
-        write_marker(path_cbytes, signo, code, addr, &frames[..n]);
+        append_frames(path_cbytes, &frames[..n]);
     }
 }
 
@@ -155,7 +191,7 @@ fn mach_to_signal(kind: u32) -> i32 {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn on_crash(path_cbytes: &[u8], _cc: &CrashContext) {
     unsafe {
-        write_marker(path_cbytes, 0, 0, 0, &[]);
+        write_marker(path_cbytes, 0, 0, 0);
     }
 }
 
@@ -229,9 +265,13 @@ impl StackBuf {
     }
 }
 
-/// Write the crash-info marker using only async-signal-safe primitives.
+/// Write the guaranteed crash-info marker (signal/code/address/time) using only
+/// async-signal-safe primitives. Frame lines are appended separately via
+/// [`append_frames`] so this essential header is persisted BEFORE any (possibly
+/// non-async-signal-safe) frame capture runs — a re-fault there then loses only
+/// the frames, not the whole crash report (F29).
 #[cfg(unix)]
-unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize, frames: &[usize]) {
+unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize) {
     let fd = unsafe {
         libc::open(
             path_cbytes.as_ptr() as *const libc::c_char,
@@ -269,10 +309,30 @@ unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize, f
     b.byte(b'\n');
     unsafe {
         let _ = libc::write(fd, b.buf.as_ptr() as *const libc::c_void, b.len);
+        let _ = libc::close(fd);
     }
-    // Append one `frame=0x<pc>` line per captured absolute PC. Each line is
-    // formatted in its own stack buffer and written immediately (no heap), so an
-    // arbitrary frame count never overruns a single fixed buffer.
+}
+
+/// Append one `frame=0x<pc>` line per captured absolute PC to an already-written
+/// marker (opened `O_APPEND`). Kept separate from [`write_marker`] so the header
+/// survives even if the frame capture that produced `frames` faulted (F29). Each
+/// line is formatted in its own stack buffer and written immediately (no heap),
+/// so an arbitrary frame count never overruns a single fixed buffer.
+#[cfg(unix)]
+unsafe fn append_frames(path_cbytes: &[u8], frames: &[usize]) {
+    if frames.is_empty() {
+        return;
+    }
+    let fd = unsafe {
+        libc::open(
+            path_cbytes.as_ptr() as *const libc::c_char,
+            libc::O_WRONLY | libc::O_APPEND,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
     for &pc in frames {
         let mut fb = StackBuf::new();
         fb.s(b"frame=0x");
@@ -288,13 +348,12 @@ unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize, f
 }
 
 #[cfg(not(unix))]
-unsafe fn write_marker(
-    _path_cbytes: &[u8],
-    _signo: i32,
-    _code: i32,
-    _addr: usize,
-    _frames: &[usize],
-) {
+unsafe fn write_marker(_path_cbytes: &[u8], _signo: i32, _code: i32, _addr: usize) {
+    // Windows marker writing is added with the Windows exception path.
+}
+
+#[cfg(not(unix))]
+unsafe fn append_frames(_path_cbytes: &[u8], _frames: &[usize]) {
     // Windows marker writing is added with the Windows exception path.
 }
 
@@ -302,16 +361,18 @@ unsafe fn write_marker(
 // Module map (captured at install) + crash-time frame capture.
 // ---------------------------------------------------------------------------
 
-/// Write the loaded-module map (`<base_hex>\t<name>` per line) so recovery can
-/// turn crash-time frame PCs into ASLR-invariant `pc - base` module offsets.
+/// Write the loaded-module map (`<base_hex>\t<size_hex>\t<name>` per line) so
+/// recovery can turn crash-time frame PCs into ASLR-invariant `pc - base` module
+/// offsets — and, using `size`, reject a PC that falls OUTSIDE the module's
+/// loaded range instead of misattributing it to the nearest-below module (F25).
 fn write_modules_file(path: &std::path::Path) {
     let modules = snapshot_modules();
     if modules.is_empty() {
         return;
     }
-    let mut body = String::with_capacity(modules.len() * 32);
-    for (base, name) in modules {
-        body.push_str(&format!("{base:x}\t{name}\n"));
+    let mut body = String::with_capacity(modules.len() * 40);
+    for (base, size, name) in modules {
+        body.push_str(&format!("{base:x}\t{size:x}\t{name}\n"));
     }
     let _ = std::fs::write(path, body);
 }
@@ -322,10 +383,12 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// Enumerate loaded modules as `(load_base, name)`. NOT async-signal-safe — call
-/// only from `install` (normal context).
+/// Enumerate loaded modules as `(load_base, vm_size, name)`. NOT
+/// async-signal-safe — call only from `install` (normal context). `vm_size` is
+/// the module's loaded address extent, used by recovery to reject an
+/// out-of-module PC (F25).
 #[cfg(target_vendor = "apple")]
-fn snapshot_modules() -> Vec<(usize, String)> {
+fn snapshot_modules() -> Vec<(usize, usize, String)> {
     use mach2::dyld::{_dyld_get_image_header, _dyld_get_image_name, _dyld_image_count};
     let mut modules = Vec::new();
     let count = unsafe { _dyld_image_count() };
@@ -336,22 +399,113 @@ fn snapshot_modules() -> Vec<(usize, String)> {
             continue;
         }
         let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
-        modules.push((header, basename(&name)));
+        modules.push((header, image_vmsize(header), basename(&name)));
     }
     modules
 }
 
+// Minimal Mach-O structures needed to compute a loaded image's vm extent (mach2
+// only exposes the 32-bit `mach_header`). Layout matches `<mach-o/loader.h>`.
+#[cfg(target_vendor = "apple")]
+const LC_SEGMENT_64: u32 = 0x19;
+
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct MachHeader64 {
+    magic: u32,
+    cputype: i32,
+    cpusubtype: i32,
+    filetype: u32,
+    ncmds: u32,
+    sizeofcmds: u32,
+    flags: u32,
+    reserved: u32,
+}
+
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct LoadCommand {
+    cmd: u32,
+    cmdsize: u32,
+}
+
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct SegmentCommand64 {
+    cmd: u32,
+    cmdsize: u32,
+    segname: [u8; 16],
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: i32,
+    initprot: i32,
+    nsects: u32,
+    flags: u32,
+}
+
+/// The loaded vm extent of the Mach-O image at `header`: the span from the lowest
+/// to the highest `LC_SEGMENT_64` vm address. `base + extent` bounds the module,
+/// so recovery can tell whether a crash PC actually belongs to it.
+#[cfg(target_vendor = "apple")]
+fn image_vmsize(header: usize) -> usize {
+    if header == 0 {
+        return 0;
+    }
+    // SAFETY: `header` is a valid loaded mach_header from dyld; we only read the
+    // header and walk `ncmds` load commands, each bounded by its own `cmdsize`.
+    unsafe {
+        let mh = &*(header as *const MachHeader64);
+        let mut lc = header + core::mem::size_of::<MachHeader64>();
+        let mut min_vmaddr = u64::MAX;
+        let mut max_vmend: u64 = 0;
+        for _ in 0..mh.ncmds {
+            let cmd = &*(lc as *const LoadCommand);
+            if cmd.cmdsize == 0 {
+                break; // malformed — avoid an infinite loop
+            }
+            if cmd.cmd == LC_SEGMENT_64 {
+                let seg = &*(lc as *const SegmentCommand64);
+                min_vmaddr = min_vmaddr.min(seg.vmaddr);
+                max_vmend = max_vmend.max(seg.vmaddr.saturating_add(seg.vmsize));
+            }
+            lc += cmd.cmdsize as usize;
+        }
+        if max_vmend > min_vmaddr {
+            (max_vmend - min_vmaddr) as usize
+        } else {
+            0
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn snapshot_modules() -> Vec<(usize, String)> {
+fn snapshot_modules() -> Vec<(usize, usize, String)> {
+    // Widths of `p_vaddr`/`p_memsz` differ between Elf32/Elf64 phdrs, so the
+    // `as u64` casts are needed for portability even where they are no-ops.
+    #[allow(clippy::unnecessary_cast)]
     extern "C" fn collect(
         info: *mut libc::dl_phdr_info,
         _size: libc::size_t,
         data: *mut libc::c_void,
     ) -> libc::c_int {
         unsafe {
-            let modules = &mut *(data as *mut Vec<(usize, String)>);
+            let modules = &mut *(data as *mut Vec<(usize, usize, String)>);
             let info = &*info;
             let base = info.dlpi_addr as usize;
+            // Module extent = the highest `p_vaddr + p_memsz` over PT_LOAD
+            // segments (relative to the load base), so recovery can bound offsets.
+            let mut extent: u64 = 0;
+            if !info.dlpi_phdr.is_null() && info.dlpi_phnum > 0 {
+                let phdrs = std::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize);
+                for ph in phdrs {
+                    if ph.p_type == libc::PT_LOAD {
+                        let end = (ph.p_vaddr as u64).saturating_add(ph.p_memsz as u64);
+                        extent = extent.max(end);
+                    }
+                }
+            }
             let name = if info.dlpi_name.is_null() {
                 String::new()
             } else {
@@ -365,11 +519,11 @@ fn snapshot_modules() -> Vec<(usize, String)> {
             } else {
                 basename(&name)
             };
-            modules.push((base, name));
+            modules.push((base, extent as usize, name));
         }
         0
     }
-    let mut modules: Vec<(usize, String)> = Vec::new();
+    let mut modules: Vec<(usize, usize, String)> = Vec::new();
     unsafe {
         libc::dl_iterate_phdr(Some(collect), &mut modules as *mut _ as *mut libc::c_void);
     }
@@ -377,8 +531,32 @@ fn snapshot_modules() -> Vec<(usize, String)> {
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-fn snapshot_modules() -> Vec<(usize, String)> {
+fn snapshot_modules() -> Vec<(usize, usize, String)> {
     Vec::new()
+}
+
+/// Strip ARM pointer-authentication (PAC) bits from a return address read off the
+/// stack. On arm64e these are signed; leaving them in breaks `pc - base` module
+/// offsets and the dedup signature. `xpaci` exists on all Apple Silicon
+/// (armv8.3+) and is a no-op on an unsigned pointer, so it is safe for both plain
+/// arm64 and arm64e binaries. Async-signal-safe (a single register op, no memory
+/// access, no side effects).
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+#[inline]
+fn strip_pac(ptr: usize) -> usize {
+    let mut p = ptr;
+    // SAFETY: `xpaci` only transforms the register value in place.
+    unsafe {
+        core::arch::asm!("xpaci {p}", p = inout(reg) p, options(nomem, nostack, preserves_flags));
+    }
+    p
+}
+
+/// x86_64 has no pointer authentication — return addresses are already plain.
+#[cfg(all(target_vendor = "apple", target_arch = "x86_64"))]
+#[inline]
+fn strip_pac(ptr: usize) -> usize {
+    ptr
 }
 
 /// Capture up to [`MAX_FRAMES`] absolute PCs of the crashing thread into `out`,
@@ -444,7 +622,10 @@ unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> us
         if !unsafe { read_task_mem(cc.task, fp, &mut slot) } {
             break;
         }
-        let (next_fp, ra) = (slot[0], slot[1]);
+        // On arm64e a return address on the stack is PAC-signed; strip the
+        // authentication bits so `pc - base` module offsets (and the dedup
+        // signature) are stable (F31). No-op for plain arm64 / x86_64.
+        let (next_fp, ra) = (slot[0], strip_pac(slot[1]));
         if ra == 0 {
             break;
         }

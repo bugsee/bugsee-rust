@@ -149,6 +149,27 @@ fn transient_failures_are_retried_until_delivered() {
 }
 
 #[test]
+fn forced_flush_offline_keeps_queued_report() {
+    // F13: a forced flush while offline re-attempts the report but must NEVER burn
+    // the durable retry cap and delete a still-deliverable crash bundle. (The old
+    // flush loop attempted every ~20 ms AND counted each failure toward the 60-cap,
+    // so it deleted the bundle in ~1.3 s.)
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(config(&dir.path), Arc::new(AlwaysFailUpload)).unwrap();
+    recorder.capture(log_entry());
+    recorder.report(bugsee_core::reporting::manual_upload_meta(), None);
+    // A flush long enough that the old code would have raced the cap and deleted.
+    assert!(
+        !recorder.flush(Duration::from_secs(2)),
+        "an offline flush cannot drain the queue"
+    );
+    assert!(
+        !queue::list_pending(&dir.path).is_empty(),
+        "the queued crash bundle survives an offline flush (F13)"
+    );
+}
+
+#[test]
 fn queued_report_survives_restart_and_delivers_next_launch() {
     let dir = TempDir::new();
 

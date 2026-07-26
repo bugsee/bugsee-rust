@@ -129,7 +129,14 @@ fn launch_capture_upload_produces_valid_bundle() {
         .map(|f| f["type"].as_str().unwrap())
         .collect();
     assert!(types.contains(&"log"));
-    assert!(types.contains(&"events.user"));
+    // The manifest `type` is the SHARED base per the cross-SDK contract; the
+    // user/system split stays in the FILENAME (asserted above as
+    // `.events.user.json`).
+    assert!(types.contains(&"events"));
+    assert!(
+        !types.contains(&"events.user"),
+        "compound type must not leak: {types:?}"
+    );
 
     // The .apptoken carries the raw token.
     let mut token = String::new();

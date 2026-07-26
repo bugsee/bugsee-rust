@@ -242,11 +242,11 @@ fn native_crash_signature_from_module_offsets() {
         "signal=11\ncode=1\naddress=0x0\ntime=0\nframe=0x1100\nframe=0x2200\n",
     )
     .unwrap();
-    // base<TAB>name — 0x1100 falls in MyApp (base 0x1000, offset 0x100); 0x2200
-    // falls in libsystem (base 0x2000, offset 0x200).
+    // base<TAB>size<TAB>name — 0x1100 falls in MyApp [0x1000,0x2000) at offset
+    // 0x100; 0x2200 falls in libsystem [0x2000,0x3000) at offset 0x200.
     std::fs::write(
         gen_dir.join("crash.modules"),
-        "1000\tMyApp\n2000\tlibsystem.dylib\n",
+        "1000\t1000\tMyApp\n2000\t1000\tlibsystem.dylib\n",
     )
     .unwrap();
 
@@ -280,6 +280,40 @@ fn native_crash_signature_from_module_offsets() {
         other["signatures"][0].as_str().unwrap(),
         sig,
         "distinct site"
+    );
+}
+
+#[test]
+fn native_signature_skips_pc_outside_every_module_range() {
+    // A PC that falls outside every module's [base, base+size) range (e.g. a
+    // frame from a module dlopen'd after the install-time snapshot) must be
+    // SKIPPED, not misattributed to the nearest-below module with a bogus,
+    // ASLR-unstable offset (F25).
+    let module_map = "1000\t1000\tMyApp\n"; // MyApp spans [0x1000, 0x2000)
+
+    let sig_for = |frames: &str| -> String {
+        let dir = TempDir::new();
+        seed_alive_marker(&dir.path, 1);
+        let gen_dir = dir.path.join("parts").join("1");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(
+            gen_dir.join("crash.info"),
+            format!("signal=11\ncode=1\naddress=0x0\ntime=0\n{frames}"),
+        )
+        .unwrap();
+        std::fs::write(gen_dir.join("crash.modules"), module_map).unwrap();
+        let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+        let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
+        crash["signatures"][0].as_str().unwrap().to_string()
+    };
+
+    // 0x1500 is in range (offset 0x500); 0x9999 is above MyApp's end (0x2000) and
+    // resolves to nothing, so it contributes nothing to the signature.
+    let with_out_of_range = sig_for("frame=0x1500\nframe=0x9999\n");
+    let in_range_only = sig_for("frame=0x1500\n");
+    assert_eq!(
+        with_out_of_range, in_range_only,
+        "an out-of-module PC must be skipped, not fold into the signature"
     );
 }
 

@@ -118,8 +118,14 @@ fn full_public_api_flow() {
         .map(|f| f["type"].as_str().unwrap())
         .collect();
     assert!(types.contains(&"log"));
-    assert!(types.contains(&"events.user"));
-    assert!(types.contains(&"traces.user"));
+    // Manifest `type` is the shared base per contract (events.user → events,
+    // traces.user → traces); the user/system split lives in the filename only.
+    assert!(types.contains(&"events"));
+    assert!(types.contains(&"traces"));
+    assert!(
+        !types.contains(&"events.user") && !types.contains(&"traces.user"),
+        "compound manifest type must not leak: {types:?}"
+    );
     assert!(types.contains(&"attachment"));
 
     drop(bundles);

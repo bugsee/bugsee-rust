@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-07-25 · `main` @ `524198f` · 96 tests green · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`)._
+_Snapshot: 2026-07-26 · `main` @ `dbdc7c5` + uncommitted review-fix pass · 101 tests green · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps this pass)._
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
@@ -31,6 +31,49 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. Open: sessions / release-health. |
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
+
+## Recent work — 4th adversarial pass (Opus-verified) + 14 fixes (working tree)
+
+A fourth review: **Fable** finders across 8 risk dimensions → **Opus** skeptics
+adversarially verifying each finding (2 lenses, default-to-refute). 34 unique
+findings → 25 confirmed, 5 contested, 4 refuted. The confirmed **5 high + 9
+medium** are fixed and validated (fmt · clippy `-D warnings` · 101 tests · MSRV
+`--locked`; the Linux-only native paths are cfg'd out on the macOS host and were
+verified by inspection against `crash-handler` 0.6.3 + `libc`, not executed).
+
+- **Durable queue (high):** a forced `flush()` no longer burns the durable
+  60-retry cap while offline — forced attempts are decoupled from the counter, so
+  a still-deliverable crash bundle can't be deleted in ~1.3 s. Retry now **resumes
+  at the presigned PUT** via a persisted `.endpoint` sidecar instead of re-POSTing
+  `create_issue` (no duplicate issues / no `12003`-drop of an un-uploaded bundle).
+- **PII (high):** failed-request network entries scrub the URL out of reqwest's
+  error `Display` (was leaking full credential-bearing URLs); header redaction is
+  unified onto the normalized param matcher (`signature`/`csrf`/`api_key` no
+  longer leak).
+- **Native (high/med):** the guaranteed crash marker is written **before** the
+  non-async-signal-safe Linux unwinder (a re-fault loses only frames, not the
+  report); the module map now records module **size** so recovery rejects
+  out-of-module PCs (ASLR-stable native signatures); Linux fault address read
+  through the real `siginfo_t` layout (was always `0x0`); arm64e return addresses
+  PAC-stripped (`xpaci`).
+- **Signatures (high):** `normalize_frame` strips the rustc `::h<16hex>` hash
+  inside the real `"{sym} (file:line)"` frame → build-stable dedup/blacklist
+  (previously the hash survived, changing the signature every recompile).
+- **Robustness (med):** `process_report` reclaims its hard-linked report dir on
+  every error path (no leak on disk-full); relaunch with `native_crash_capture=
+  false` uninstalls the previously-installed handler; the HTTP transport uses one
+  `ureq::Agent` with connect/read/write timeouts (a stalled connection no longer
+  wedges the uploader thread); rotation/eviction/telemetry run on a wall-clock
+  deadline (steady capture traffic can't starve the sliding window); manifest
+  `files[]` `type` uses the shared `events`/`traces` base (the user/system split
+  stays in the filename).
+- **Refuted (not bugs):** FFI second-panic (already guarded), app_token in error
+  strings (unreachable), recovered-env attribution (env is correct), cross-thread
+  panic-snapshot overwrite (not a real race).
+
+Two tests were passing *because of* bugs and were corrected: the FFI lifecycle
+flush (the old offline flush "succeeded" by deleting the queued report) and the
+`events.user`/`traces.user` manifest-type assertions.
 
 ## Recent work — three adversarial-review passes + native dedup (`524198f`)
 

@@ -105,7 +105,15 @@ pub fn assemble_with_extras(
 
     for doc in docs {
         let filename = format!("{}.{}.json", random_hex(8), doc.channel);
-        files.push(FileDescriptor::capture(&filename, &doc.channel));
+        // The manifest `type` is the SHARED base type per the cross-SDK contract
+        // (`events.user`/`events.system` → `events`, `traces.user`/`traces.system`
+        // → `traces`); the user/system split stays encoded in the FILENAME only.
+        // Type-keyed consumers (worker ingest, MCP get-resource) match on the base
+        // type, so emitting the compound type here made those files unresolvable.
+        // Channels without a dot (log, network, breadcrumbs, performance) are
+        // unchanged.
+        let file_type = doc.channel.split('.').next().unwrap_or(&doc.channel);
+        files.push(FileDescriptor::capture(&filename, file_type));
         entries.push(BundleEntry::new(filename, doc.bytes));
     }
 

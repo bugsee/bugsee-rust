@@ -608,8 +608,17 @@ fn worker_loop(
     mut sampler: Option<Box<dyn TelemetrySampler>>,
     upload_tx: Sender<UploadMsg>,
 ) {
+    // Rotation/eviction/telemetry must run on a wall-clock cadence, NOT only when
+    // `recv_timeout` times out. Under sustained capture traffic every `recv`
+    // returns `Ok` before the interval elapses, resetting the timer forever, so
+    // the old "only on Timeout" placement starved the sliding window: parts never
+    // rotated/evicted (bypassing `max_bytes`/`max_window`) and telemetry never
+    // sampled (F17). Instead we recv with a timeout bounded by the next rotation
+    // deadline and run the tick whenever that deadline passes, message or not.
+    let mut next_rotate = Instant::now() + rotate_interval;
     loop {
-        match rx.recv_timeout(rotate_interval) {
+        let timeout = next_rotate.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(timeout) {
             Ok(Msg::Capture(entry)) => {
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
                 // A panic while serializing/appending must not kill the worker.
@@ -663,33 +672,48 @@ fn worker_loop(
                 let _ = ack.send(());
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Skip telemetry sampling while paused; rotation/eviction still
-                    // runs so the window keeps sliding.
-                    if !shared.paused.load(Ordering::Relaxed) {
-                        if let Some(sampler) = sampler.as_mut() {
-                            let ts = epoch_ms();
-                            for (name, value) in sampler.sample() {
-                                let entry = TraceEntry {
-                                    timestamp: ts,
-                                    display_id: None,
-                                    name: Some(name),
-                                    value,
-                                    custom: Default::default(),
-                                };
-                                if let Ok(bytes) = serde_json::to_vec(&entry) {
-                                    let _ = store.append("traces.system", ts, &bytes);
-                                }
-                            }
-                        }
-                    }
-                    let _ = store.rotate();
-                }));
-            }
+            Err(RecvTimeoutError::Timeout) => { /* fall through to the rotation tick */ }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        // Run the rotation/eviction/telemetry tick whenever the interval has
+        // elapsed — via a message OR a timeout — so steady traffic can't starve it.
+        if Instant::now() >= next_rotate {
+            rotate_tick(&mut store, &shared, &mut sampler);
+            next_rotate = Instant::now() + rotate_interval;
+        }
     }
+}
+
+/// One rotation tick: sample telemetry (unless paused) then roll + evict the
+/// window. Panic-contained so a host `TelemetrySampler` panic can't kill the
+/// worker.
+fn rotate_tick(
+    store: &mut PartStore,
+    shared: &Shared,
+    sampler: &mut Option<Box<dyn TelemetrySampler>>,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Skip telemetry sampling while paused; rotation/eviction still runs so
+        // the window keeps sliding.
+        if !shared.paused.load(Ordering::Relaxed) {
+            if let Some(sampler) = sampler.as_mut() {
+                let ts = epoch_ms();
+                for (name, value) in sampler.sample() {
+                    let entry = TraceEntry {
+                        timestamp: ts,
+                        display_id: None,
+                        name: Some(name),
+                        value,
+                        custom: Default::default(),
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&entry) {
+                        let _ = store.append("traces.system", ts, &bytes);
+                    }
+                }
+            }
+        }
+        let _ = store.rotate();
+    }));
 }
 
 /// Snapshot the current window into a fresh report dir and return a handle.
@@ -779,14 +803,23 @@ fn process_report(
     let report_dir = data_dir.join("reports").join(&report_id);
     std::fs::create_dir_all(&report_dir)?;
 
-    store.snapshot_into(&report_dir, window_start, window_end)?;
-
+    // Own the report dir with a `SnapshotHandle` so EVERY exit path reclaims its
+    // hard links via Drop. The earlier manual `remove_dir_all` ran only after a
+    // successful assemble, so a `snapshot_into`/`assemble` failure (most plausibly
+    // disk-full) permanently orphaned a `reports/<id>` dir full of hard-linked
+    // parts, and `reports/` was never GC'd (F7).
     let window = TimeWindow {
         start: window_start,
         end: window_end,
     };
+    let handle = SnapshotHandle {
+        dir: report_dir,
+        window,
+    };
+
+    store.snapshot_into(&handle.dir, window_start, window_end)?;
     let assembled = reporting::assemble(
-        &report_dir,
+        &handle.dir,
         window,
         &meta,
         &shared.env,
@@ -795,10 +828,9 @@ fn process_report(
         window_end,
     )?;
 
-    // Persist to the durable queue; the uploader delivers it.
-    let enqueue_result = queue::enqueue(data_dir, &assembled);
-    let _ = std::fs::remove_dir_all(&report_dir);
-    enqueue_result
+    // Persist to the durable queue; the uploader delivers it. `handle`'s Drop
+    // reclaims the snapshot dir on return (success or the `?` paths above).
+    queue::enqueue(data_dir, &assembled)
 }
 
 fn uploader_loop(
@@ -856,43 +888,99 @@ fn drain(shared: &Shared, data_dir: &Path, backoff_base: Duration, force: bool) 
             continue; // still backing off
         }
         attempted = true;
-        let assembled = AssembledReport {
-            bundle_name: queue::bundle_name(&report),
+        // Scheduled/startup attempts are backoff-paced, so they count toward the
+        // durable retry cap.
+        deliver_queued(
+            shared,
+            data_dir,
+            backoff_base,
+            &report,
             zip,
             request_json,
-        };
-        match transport::deliver(
-            &*shared.transport,
-            &shared.app_token,
-            &shared.environment_json,
-            &shared.session,
-            &assembled,
-        ) {
-            Ok(()) => queue::remove(&report),
-            // A transient failure OR a still-expired session are both retryable.
-            Err(TransportError::Transient(_)) | Err(TransportError::SessionExpired) => {
-                let n = retry + 1;
-                if n >= UPLOAD_RETRY_CAP {
-                    queue::remove(&report);
-                } else {
-                    queue::set_meta(&report, n, now + backoff_delay(n, backoff_base));
-                }
-            }
-            Err(TransportError::TooManySimilar { signatures }) => {
-                // Blacklist so future identical crashes aren't re-uploaded.
-                let sigs = if signatures.is_empty() {
-                    queue::signatures_of(&assembled)
-                } else {
-                    signatures
-                };
-                queue::blacklist_add(data_dir, &sigs);
-                queue::remove(&report);
-            }
-            // Duplicate / permanent — abandon the report.
-            Err(_) => queue::remove(&report),
-        }
+            retry,
+            now,
+            true,
+        );
     }
     attempted
+}
+
+/// Deliver one already-loaded queued report, updating its durable retry/backoff
+/// state (or removing it) per the transport outcome.
+///
+/// `count_failure` controls whether a transient failure advances the durable
+/// retry counter toward the [`UPLOAD_RETRY_CAP`] abandon-and-delete threshold.
+/// It is `true` on the backoff-paced drain path (each attempt is a real, spaced
+/// try) and `false` on a forced flush, which may re-attempt a report many times
+/// before its deadline: counting there would race the counter to the cap in ~1 s
+/// and permanently delete a still-deliverable crash bundle (F13). A forced flush
+/// leaves the counter untouched — the scheduled path still abandons a genuinely
+/// dead report over its normal backoff schedule.
+#[allow(clippy::too_many_arguments)]
+fn deliver_queued(
+    shared: &Shared,
+    data_dir: &Path,
+    backoff_base: Duration,
+    report: &queue::QueuedReport,
+    zip: Vec<u8>,
+    request_json: Vec<u8>,
+    retry: u32,
+    now: i64,
+    count_failure: bool,
+) {
+    let assembled = AssembledReport {
+        bundle_name: queue::bundle_name(report),
+        zip,
+        request_json,
+    };
+    // Resume at the PUT if a prior attempt created the issue but the PUT failed
+    // (F14): re-POSTing create_issue mints a duplicate issue, or trips 12003 and
+    // deletes the bundle unuploaded.
+    let cached_endpoint = queue::endpoint(report);
+    let mut endpoint_out: Option<String> = None;
+    match transport::deliver(
+        &*shared.transport,
+        &shared.app_token,
+        &shared.environment_json,
+        &shared.session,
+        &assembled,
+        cached_endpoint.as_deref(),
+        &mut endpoint_out,
+    ) {
+        Ok(()) => queue::remove(report),
+        // A transient failure OR a still-expired session are both retryable.
+        Err(TransportError::Transient(_)) | Err(TransportError::SessionExpired) => {
+            // Persist the presigned endpoint if the failure left one to resume
+            // from; otherwise drop any stale cached endpoint (F14).
+            match endpoint_out {
+                Some(ep) => queue::set_endpoint(report, &ep),
+                None => queue::clear_endpoint(report),
+            }
+            if count_failure {
+                let n = retry + 1;
+                if n >= UPLOAD_RETRY_CAP {
+                    queue::remove(report);
+                } else {
+                    queue::set_meta(report, n, now + backoff_delay(n, backoff_base));
+                }
+            }
+            // else (forced flush): leave retry/backoff untouched — the report
+            // stays queued to be re-attempted within this flush and, if still
+            // failing, on the next scheduled drain / launch.
+        }
+        Err(TransportError::TooManySimilar { signatures }) => {
+            // Blacklist so future identical crashes aren't re-uploaded.
+            let sigs = if signatures.is_empty() {
+                queue::signatures_of(&assembled)
+            } else {
+                signatures
+            };
+            queue::blacklist_add(data_dir, &sigs);
+            queue::remove(report);
+        }
+        // Duplicate / permanent — abandon the report.
+        Err(_) => queue::remove(report),
+    }
 }
 
 /// Exponential backoff: `base * 2^(retry-1)`, capped at 300 s.
@@ -904,8 +992,13 @@ fn backoff_delay(retry: u32, base: Duration) -> i64 {
     ms as i64
 }
 
-/// Drain until the queue is empty or no report is deliverable before `deadline`.
-/// Returns whether the queue ended up empty.
+/// Drain until the queue is empty or `deadline` elapses, ignoring backoff so a
+/// report in its backoff window is still attempted on an explicit flush. Forced
+/// attempts do NOT count toward the durable retry cap (`count_failure = false`),
+/// so a fast-failing offline flush re-attempts a report until the deadline
+/// without ever racing its counter to the cap and deleting it (F13); a
+/// flaky-but-recovering transport still delivers within the flush. Returns
+/// whether the queue ended up empty.
 fn drain_until_empty(
     shared: &Shared,
     data_dir: &Path,
@@ -914,10 +1007,27 @@ fn drain_until_empty(
 ) -> bool {
     let start = Instant::now();
     loop {
-        // Force so a report in backoff is still attempted on an explicit flush.
-        drain(shared, data_dir, backoff_base, true);
-        let pending = queue::list_pending(data_dir);
-        if pending.is_empty() {
+        let now = epoch_ms();
+        for report in queue::list_pending(data_dir) {
+            let Ok((zip, request_json, retry, _next)) = queue::load(&report) else {
+                continue;
+            };
+            deliver_queued(
+                shared,
+                data_dir,
+                backoff_base,
+                &report,
+                zip,
+                request_json,
+                retry,
+                now,
+                false,
+            );
+            if start.elapsed() >= deadline {
+                break;
+            }
+        }
+        if queue::list_pending(data_dir).is_empty() {
             return true;
         }
         if start.elapsed() >= deadline {
