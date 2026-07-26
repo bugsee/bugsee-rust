@@ -53,6 +53,12 @@ const UPLOAD_RETRY_CAP: u32 = 60;
 const MAX_RECOVERY_ATTEMPTS: u32 = 3;
 /// Default in-flight capture-entry cap (drop-newest beyond this).
 const DEFAULT_MAX_QUEUED: usize = 8192;
+/// Default in-flight *report* cap. Reports are far heavier than capture entries
+/// (each carries a `ReportMeta` + `crash_json`, and processing does snapshot +
+/// ZIP + enqueue), so a report storm — e.g. `capture_error` on a hot path during
+/// an outage — must not grow the channel without bound. Over this cap, new
+/// NON-crash reports are dropped-newest; crash reports are never dropped.
+const DEFAULT_MAX_REPORT_QUEUED: usize = 256;
 
 /// A callback run on every report before delivery. Mutate the metadata in place;
 /// return `false` to drop the report entirely.
@@ -148,6 +154,10 @@ struct Shared {
     /// In-flight capture entries queued to the worker (back-pressure counter).
     queued: AtomicUsize,
     max_queued: usize,
+    /// In-flight report messages queued to the worker (heavier than captures, so
+    /// bounded separately; drop-newest non-crash reports over the cap).
+    report_queued: AtomicUsize,
+    max_report_queued: usize,
     /// Whether telemetry sampling is paused (mirrors the facade's pause state).
     paused: AtomicBool,
 }
@@ -213,6 +223,8 @@ impl Recorder {
             sample_rate: config.sample_rate,
             queued: AtomicUsize::new(0),
             max_queued: config.max_queued_entries.max(1),
+            report_queued: AtomicUsize::new(0),
+            max_report_queued: DEFAULT_MAX_REPORT_QUEUED,
             paused: AtomicBool::new(false),
         });
 
@@ -324,11 +336,7 @@ impl Recorder {
 
     /// Like [`Recorder::report`] but with an explicit window-end timestamp.
     pub fn report_at(&self, meta: ReportMeta, window_end: i64, crash_json: Option<Vec<u8>>) {
-        let _ = self.tx.send(Msg::Report {
-            meta,
-            window_end,
-            crash_json,
-        });
+        report_into(&self.shared, &self.tx, meta, window_end, crash_json);
     }
 
     /// Snapshot the window now (hard-links on disk), returning a handle to
@@ -435,11 +443,7 @@ impl RecorderHandle {
 
     /// Trigger a report with an explicit window-end timestamp.
     pub fn report_at(&self, meta: ReportMeta, window_end: i64, crash_json: Option<Vec<u8>>) {
-        let _ = self.tx.send(Msg::Report {
-            meta,
-            window_end,
-            crash_json,
-        });
+        report_into(&self.shared, &self.tx, meta, window_end, crash_json);
     }
 
     /// Mutate the ambient scope.
@@ -516,6 +520,37 @@ fn capture_into(shared: &Arc<Shared>, tx: &Sender<Msg>, entry: CaptureEntry) {
     }
     if tx.send(Msg::Capture(entry)).is_err() {
         shared.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Bounded report enqueue shared by `Recorder` and `RecorderHandle`. Non-crash
+/// reports are dropped-newest once the in-flight report backlog exceeds the cap,
+/// so a report storm can't grow the channel (RSS) without bound (F18); crash
+/// reports are never dropped. The worker decrements `report_queued` as it drains
+/// each `Msg::Report`.
+fn report_into(
+    shared: &Arc<Shared>,
+    tx: &Sender<Msg>,
+    meta: ReportMeta,
+    window_end: i64,
+    crash_json: Option<Vec<u8>>,
+) {
+    // Every enqueued report increments the counter (the worker decrements on
+    // drain), but only NON-crash reports are subject to the drop-newest cap.
+    let prev = shared.report_queued.fetch_add(1, Ordering::Relaxed);
+    if meta.issue_type != IssueType::Crash && prev >= shared.max_report_queued {
+        shared.report_queued.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    if tx
+        .send(Msg::Report {
+            meta,
+            window_end,
+            crash_json,
+        })
+        .is_err()
+    {
+        shared.report_queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -635,6 +670,7 @@ fn worker_loop(
                 window_end,
                 crash_json,
             }) => {
+                shared.report_queued.fetch_sub(1, Ordering::Relaxed);
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     process_report(
                         &mut store, &shared, &data_dir, caps, meta, window_end, crash_json,

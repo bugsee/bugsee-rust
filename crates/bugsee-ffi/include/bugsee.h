@@ -24,7 +24,8 @@ typedef enum {
     BUGSEE_INVALID_ARGUMENT = 1,
     BUGSEE_INTERNAL_ERROR = 2,
     BUGSEE_PANIC = 3,
-    BUGSEE_NOT_LAUNCHED = 4
+    BUGSEE_NOT_LAUNCHED = 4,
+    BUGSEE_TIMEOUT = 5
 } BugseeStatus;
 
 /* Log levels (match bugsee_log's `level` argument). */

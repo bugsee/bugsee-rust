@@ -31,6 +31,8 @@ pub enum BugseeStatus {
     /// A Rust panic was contained at the boundary.
     Panic = 3,
     NotLaunched = 4,
+    /// The SDK is launched but a `flush` did not drain before its timeout.
+    Timeout = 5,
 }
 
 /// Copy a C string into an owned `String` (UTF-8), or `None` if null / not valid
@@ -282,14 +284,19 @@ pub extern "C" fn bugsee_upload() -> BugseeStatus {
     })
 }
 
-/// Block until pending work drains, or `timeout_ms` elapses.
+/// Block until pending work drains, or `timeout_ms` elapses. Returns `Ok` on a
+/// full drain, `Timeout` if the SDK is launched but the queue did not drain in
+/// time, or `NotLaunched` if the SDK was never launched (F1).
 #[no_mangle]
 pub extern "C" fn bugsee_flush(timeout_ms: u32) -> BugseeStatus {
     guarded(|| {
+        if !Bugsee::is_launched() {
+            return BugseeStatus::NotLaunched;
+        }
         if Bugsee::flush(Duration::from_millis(timeout_ms as u64)) {
             BugseeStatus::Ok
         } else {
-            BugseeStatus::NotLaunched
+            BugseeStatus::Timeout
         }
     })
 }

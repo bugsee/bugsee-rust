@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-07-26 · `main` @ `dbdc7c5` + uncommitted review-fix pass · 101 tests green · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps this pass)._
+_Snapshot: 2026-07-26 · `main` @ `68823c8` + uncommitted contested/F1 fixes · 104 tests green · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps)._
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
@@ -74,6 +74,23 @@ verified by inspection against `crash-handler` 0.6.3 + `libc`, not executed).
 Two tests were passing *because of* bugs and were corrected: the FFI lifecycle
 flush (the old offline flush "succeeded" by deleting the queued report) and the
 `events.user`/`traces.user` manifest-type assertions.
+
+**Follow-up — the 5 contested findings + F1 (all adjudicated real, now fixed):**
+- **F5** — cap the `capture_error` `source()` walk at 32 links: a cyclic chain no
+  longer hangs the caller and a pathologically deep chain no longer overflows the
+  recursive `crash.json` serialization.
+- **F18** — bound the report backlog (separate in-flight counter, drop-newest
+  NON-crash reports over the cap, never crashes), restoring the module's stated
+  RSS invariant under a report storm (`report_at` bypassed the capture counter).
+- **F23** — the form/fragment redactor also splits pairs on `;` (some stacks use
+  it as a separator), so `mode=full;session_token=…` redacts the token.
+- **F24** — add `passphrase` and `pwd` to the sensitive stem list.
+- **F28** — an empty liveness marker (pid write failed on a full disk / died in
+  the O_EXCL-create→pid-write window) is recovered once it is older than a 30 s
+  grace window, instead of being skipped and its generation leaked forever.
+- **F1** — the FFI `bugsee_flush` returns a distinct `Timeout` (`BUGSEE_TIMEOUT`
+  in `bugsee.h`) when the SDK is launched but the queue didn't drain, vs
+  `NotLaunched` only when it was never launched (added `Bugsee::is_launched()`).
 
 ## Recent work — three adversarial-review passes + native dedup (`524198f`)
 

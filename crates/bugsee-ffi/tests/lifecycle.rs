@@ -74,15 +74,13 @@ fn full_c_abi_lifecycle() {
     assert_eq!(bugsee_resume(), BugseeStatus::Ok);
 
     // The captured exception is queued for an unreachable endpoint, so this flush
-    // legitimately cannot confirm a full drain. Assert only that the C ABI call is
-    // panic-safe and returns a defined status: an offline flush no longer silently
-    // deletes the still-deliverable queued report to "succeed" (F13). The current
-    // launched-but-not-drained status is NotLaunched; F1 tracks giving that case a
-    // distinct Timeout code.
-    let flush_status = bugsee_flush(2000);
-    assert!(
-        matches!(flush_status, BugseeStatus::Ok | BugseeStatus::NotLaunched),
-        "flush is callable and returns a defined status: {flush_status:?}"
+    // is launched but cannot drain — it reports Timeout, distinct from
+    // NotLaunched (F1), and no longer silently deletes the still-deliverable
+    // queued report to "succeed" (F13).
+    assert_eq!(
+        bugsee_flush(2000),
+        BugseeStatus::Timeout,
+        "a launched-but-undrained flush reports Timeout, not NotLaunched/Ok"
     );
     assert_eq!(bugsee_stop(), BugseeStatus::Ok);
     assert_eq!(bugsee_is_active(), 0, "stopped is not active");

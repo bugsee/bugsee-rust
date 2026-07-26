@@ -86,12 +86,17 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         if owner.is_empty() {
             // Present but not yet populated: `Session::begin` creates the marker
             // (O_EXCL) and writes the pid a moment later, so a peer launching
-            // concurrently can observe this empty window. Skip this launch rather
-            // than misclassify a live peer's fresh session as a crash — recovering
-            // it would upload a phantom report AND delete the peer's live marker.
-            continue;
-        }
-        if let Ok(pid) = owner.parse::<u32>() {
+            // concurrently can observe this empty window. Skip only while the
+            // marker is FRESH — a peer writes its pid within microseconds. An empty
+            // marker older than the grace window is a session that died in the
+            // create→write gap (or whose pid write silently failed on a full
+            // disk); recover it so its crash is surfaced and its generation
+            // reclaimed instead of being re-scanned and leaked on every future
+            // launch (F28). No pid ⇒ no liveness check; fall through to recover.
+            if marker_is_fresh(&marker) {
+                continue;
+            }
+        } else if let Ok(pid) = owner.parse::<u32>() {
             // Skip a marker still owned by a live *other* process. Our own pid is
             // never skipped (a live process cannot share our pid, so a marker
             // bearing it is a dead prior incarnation — recover it).
@@ -117,6 +122,27 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
 
 fn exists_opt(p: PathBuf) -> Option<PathBuf> {
     p.exists().then_some(p)
+}
+
+/// Grace window for an empty (pid-not-yet-written) liveness marker: a launching
+/// peer writes its pid within microseconds of the O_EXCL create, so a marker
+/// still empty after this is a dead session, not a live peer mid-launch.
+const EMPTY_MARKER_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether `marker` was last modified within [`EMPTY_MARKER_GRACE`] of now (so it
+/// could still be a peer that just created it). An unreadable/absent or
+/// future-dated mtime is treated as fresh — the conservative choice never
+/// disturbs a possibly-live peer.
+fn marker_is_fresh(marker: &Path) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .map(|modified| {
+            modified
+                .elapsed()
+                .map(|age| age < EMPTY_MARKER_GRACE)
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
 }
 
 /// Whether a process with `pid` currently exists.

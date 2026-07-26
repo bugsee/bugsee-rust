@@ -198,6 +198,8 @@ fn is_sensitive_param(name: &str) -> bool {
     const STEMS: &[&str] = &[
         "password",
         "passwd",
+        "passphrase",
+        "pwd",
         "secret",
         "token",
         "apikey",
@@ -312,10 +314,14 @@ fn redact_urls_in_text(text: &str) -> String {
     out
 }
 
-/// Redact the values of sensitive keys in an `&`-joined `key=value` string
-/// (form-urlencoded body or a query-like URL fragment), preserving the rest.
+/// Redact the values of sensitive keys in a `key=value` string whose pairs are
+/// separated by `&` OR `;` (form-urlencoded body or a query-like URL fragment),
+/// preserving the rest. Both separators are recognized because some stacks (PHP
+/// `arg_separator`, legacy/W3C-style URLs) use `;`; a raw `;` in a proper
+/// form-urlencoded value is percent-encoded, so treating it as a separator can't
+/// corrupt a valid body (F23).
 fn redact_form_encoded(body: &str) -> String {
-    body.split('&')
+    body.split(['&', ';'])
         .map(|pair| match pair.split_once('=') {
             Some((k, _)) if is_sensitive_param(k) => format!("{k}={FILTERED}"),
             _ => pair.to_string(),
@@ -396,15 +402,7 @@ fn sanitize_body(content_type: &str, body: &str) -> (Option<String>, Option<Stri
         .to_ascii_lowercase();
 
     if mime == "application/x-www-form-urlencoded" {
-        let redacted = body
-            .split('&')
-            .map(|pair| match pair.split_once('=') {
-                Some((k, _)) if is_sensitive_param(k) => format!("{k}={FILTERED}"),
-                _ => pair.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        (Some(redacted), None)
+        (Some(redact_form_encoded(body)), None)
     } else if mime == "application/json" || mime.ends_with("+json") {
         match serde_json::from_str::<Value>(body) {
             Ok(mut value) => {
@@ -629,6 +627,9 @@ mod tests {
             "clientSecret",
             "x-api-key",
             "csrfToken",
+            "passphrase",
+            "pwd",
+            "userPwd",
         ] {
             assert!(is_sensitive_param(k), "{k} must be treated as sensitive");
         }
@@ -683,5 +684,41 @@ mod tests {
             "secret redacted: {body}"
         );
         assert!(!body.contains("hunter2"), "secret value scrubbed: {body}");
+    }
+
+    #[test]
+    fn semicolon_separated_pairs_are_redacted() {
+        // Some stacks use ';' as the pair separator; a sensitive value after a ';'
+        // must still be redacted, not preserved verbatim (F23).
+        let (body, reason) = capture_request_body(
+            Some(b"mode=full;session_token=abc123;page=2"),
+            Some("application/x-www-form-urlencoded"),
+        );
+        assert_eq!(reason, None);
+        let body = body.unwrap();
+        assert!(!body.contains("abc123"), "token after ';' leaked: {body}");
+        assert!(body.contains("mode=full"), "non-sensitive kept: {body}");
+
+        // Fragment redaction (redact_form_encoded) also splits on ';'.
+        let url = reqwest::Url::parse("https://app/#a=1;access_token=SECRET;b=2").unwrap();
+        let sanitized = sanitize_url(&url);
+        assert!(
+            !sanitized.contains("SECRET"),
+            "fragment token leaked: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn passphrase_and_pwd_bodies_are_redacted() {
+        let (body, _) = capture_request_body(
+            Some(br#"{"user":"alice","pwd":"hunter2","passphrase":"correct horse"}"#),
+            Some("application/json"),
+        );
+        let body = body.unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["pwd"], FILTERED, "pwd redacted");
+        assert_eq!(v["passphrase"], FILTERED, "passphrase redacted");
+        assert_eq!(v["user"], "alice", "non-sensitive kept");
+        assert!(!body.contains("hunter2") && !body.contains("correct horse"));
     }
 }

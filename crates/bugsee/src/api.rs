@@ -158,6 +158,13 @@ impl Bugsee {
             && !PAUSED.load(Ordering::SeqCst)
     }
 
+    /// Whether the SDK is launched, regardless of pause state. Lets callers (e.g.
+    /// the FFI `bugsee_flush`) distinguish "not launched" from "launched but the
+    /// flush timed out".
+    pub fn is_launched() -> bool {
+        RECORDER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     /// Pause capture (events are dropped until [`Bugsee::resume`]). Also gates
     /// the recorder's telemetry sampler so nothing is written while paused.
     pub fn pause() {
@@ -274,9 +281,18 @@ impl Bugsee {
     pub fn capture_error<E: std::error::Error + ?Sized>(err: &E) {
         let name = short_type_name(std::any::type_name::<E>());
         let reason = err.to_string();
+        // Cap the source() walk: a cyclic chain (constructible with Arc/Rc-based
+        // error types) would otherwise loop forever, and a pathologically deep
+        // chain would overflow the stack when serde serializes the recursively
+        // nested `cause` boxes in crash.json. 32 links is far beyond any real
+        // error chain and keeps the SDK from crashing the app it observes (F5).
+        const MAX_CAUSES: usize = 32;
         let mut causes = Vec::new();
         let mut source = err.source();
         while let Some(s) = source {
+            if causes.len() >= MAX_CAUSES {
+                break;
+            }
             causes.push(Cause {
                 name: "Error".to_string(),
                 reason: s.to_string(),
