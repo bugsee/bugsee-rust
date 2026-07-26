@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-07-26 · `main` @ `68823c8` + uncommitted contested/F1 fixes · 104 tests green · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps)._
+_Snapshot: 2026-07-26 · `main` @ `82a1fed` (pushed, CI green) · 104 tests · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps). Working tree clean._
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
@@ -32,14 +32,17 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
 
-## Recent work — 4th adversarial pass (Opus-verified) + 14 fixes (working tree)
+## Recent work — 4th adversarial pass (Opus-verified), fully resolved (`68823c8`, `82a1fed`)
 
 A fourth review: **Fable** finders across 8 risk dimensions → **Opus** skeptics
 adversarially verifying each finding (2 lenses, default-to-refute). 34 unique
-findings → 25 confirmed, 5 contested, 4 refuted. The confirmed **5 high + 9
-medium** are fixed and validated (fmt · clippy `-D warnings` · 101 tests · MSRV
-`--locked`; the Linux-only native paths are cfg'd out on the macOS host and were
-verified by inspection against `crash-handler` 0.6.3 + `libc`, not executed).
+findings → 25 confirmed, 5 contested, 4 refuted. **Outcome: all 25 confirmed +
+all 5 contested + the deferred F1 are fixed and pushed (CI green); the 4 refuted
+are non-bugs, left alone.** Fixes shipped in two commits — the confirmed 5 high +
+9 medium (`68823c8`), then the 5 contested + F1 (`82a1fed`) — all validated
+(fmt · clippy `-D warnings` · 104 tests · MSRV `--locked`; the Linux-only native
+paths, cfg'd out on the macOS dev host, are exercised by the ubuntu CI runner and
+were pre-verified by inspection against `crash-handler` 0.6.3 + `libc`).
 
 - **Durable queue (high):** a forced `flush()` no longer burns the durable
   60-retry cap while offline — forced attempts are decoupled from the counter, so
