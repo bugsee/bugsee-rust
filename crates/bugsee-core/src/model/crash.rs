@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::environment::{source_arch, source_platform};
+
 /// Structured frame metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameData {
@@ -137,6 +139,15 @@ pub struct CrashReport {
     /// `environment.sdk.type` when absent, so documents from SDKs that do not
     /// yet emit it keep working unchanged.
     pub source_sdk: String,
+    /// Platform the crash originated on — `linux` / `windows` / `macos` /
+    /// `android` / `ios`. Mirrors `environment.platform.type` (same source of
+    /// truth) but travels *with* the crash document, so a processor can be
+    /// chosen without the separately-fetched environment.
+    pub source_platform: String,
+    /// CPU architecture the crash originated on (`arm64`, `x86_64`, …), in the
+    /// same vocabulary the symbol pipeline uses — so a crash's arch matches the
+    /// arch recorded on its own symbols. Mirrors `environment.hardware.arch`.
+    pub source_arch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
     pub timestamp: i64,
@@ -169,6 +180,8 @@ impl CrashReport {
     ) -> Self {
         CrashReport {
             source_sdk: SOURCE_SDK.to_string(),
+            source_platform: source_platform().to_string(),
+            source_arch: source_arch().to_string(),
             uuid: None,
             timestamp,
             handled: true,

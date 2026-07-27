@@ -306,7 +306,15 @@ worker's Apple/Mach-O branch and a handled Rust error into the managed generic p
    `isSupportedSdkVersion` reads a **flat** floor from `cfg.core.sdk.rust` (one
    crate family across every OS — unlike the JS per-runtime floor).
 2. **Rust `crash.json` shape** — *done*. Every `crash.json` this SDK writes carries
-   **`source_sdk: "rust"`**, making the document **self-describing**: the backend
+   three **provenance** fields, making the document **self-describing**:
+   **`source_sdk`** (`"rust"`), **`source_platform`** (`linux`/`windows`/`macos`/
+   `android`/`ios`) and **`source_arch`** (`arm64`, `x86_64`, …). All three mirror
+   the corresponding `environment` values from a single source of truth
+   (`model/environment.rs`), so the two documents cannot disagree — and
+   `source_arch` deliberately uses the **symbol-pipeline spelling** (`arm64`, not
+   Rust's `aarch64`), otherwise a crash's arch would never string-match the arch
+   recorded on its own symbols (`normalize_arch` strips ISA suffixes; it does not
+   translate vocabularies). The backend
    picks its processor from the crash document itself rather than from a second
    file. This matters because the two do not travel together — on the worker's
    resymbolication path `crash.json` is read from S3 while `environment` comes

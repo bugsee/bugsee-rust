@@ -363,10 +363,7 @@ fn every_crash_json_variant_identifies_its_source_sdk() {
 
         let report = build_report(&find_pending(&dir.path, 2)[0], 1_720_531_200_000);
         let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
-        assert_eq!(
-            crash["source_sdk"], "rust",
-            "{label} variant must identify its source SDK"
-        );
+        assert_source_provenance(&crash, label);
     }
 
     // The live (non-recovery) paths too.
@@ -389,11 +386,42 @@ fn every_crash_json_variant_identifies_its_source_sdk() {
         ),
     ] {
         let crash: Value = serde_json::from_slice(&built.crash_json).unwrap();
-        assert_eq!(
-            crash["source_sdk"], "rust",
-            "{label} must identify its source SDK"
-        );
+        assert_source_provenance(&crash, label);
     }
+}
+
+/// The three self-describing provenance fields every `crash.json` must carry.
+fn assert_source_provenance(crash: &Value, label: &str) {
+    assert_eq!(
+        crash["source_sdk"], "rust",
+        "{label} must identify its source SDK"
+    );
+
+    let platform = crash["source_platform"].as_str().unwrap_or_default();
+    assert!(
+        ["linux", "windows", "macos", "android", "ios"].contains(&platform),
+        "{label} must identify its source platform, got {platform:?}"
+    );
+    // Same source of truth as the environment, so the two cannot disagree.
+    assert_eq!(
+        platform,
+        bugsee_core::model::environment::source_platform(),
+        "{label} source_platform must match environment.platform.type"
+    );
+
+    let arch = crash["source_arch"].as_str().unwrap_or_default();
+    assert!(!arch.is_empty(), "{label} must identify its source arch");
+    assert_eq!(
+        arch,
+        bugsee_core::model::environment::source_arch(),
+        "{label} source_arch must match environment.hardware.arch"
+    );
+    // The symbol pipeline (via `symbolic`) spells 64-bit ARM `arm64`; reporting
+    // Rust's `aarch64` would mean a crash never string-matched its own symbols.
+    assert_ne!(
+        arch, "aarch64",
+        "{label} must use the symbol-pipeline spelling"
+    );
 }
 
 #[test]

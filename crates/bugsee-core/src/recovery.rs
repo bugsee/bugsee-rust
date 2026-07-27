@@ -16,6 +16,7 @@ use serde_json::Map;
 
 use crate::model::crash::{CrashReport, ExceptionInfo, SOURCE_SDK};
 use crate::model::enums::{IssueType, Severity, TriggerType};
+use crate::model::environment::{source_arch, source_platform};
 use crate::model::report::Source;
 use crate::panic_info::{PanicInfo, PANIC_INFO_NAME};
 use crate::reporting::{ExtraFile, ReportMeta};
@@ -221,6 +222,8 @@ fn build_fatal_panic(info: PanicInfo, timestamp: i64) -> RecoveredReport {
     let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
     let crash = CrashReport {
         source_sdk: SOURCE_SDK.to_string(),
+        source_platform: source_platform().to_string(),
+        source_arch: source_arch().to_string(),
         uuid: None,
         timestamp,
         handled: false,
@@ -265,6 +268,8 @@ fn build_correlated(pending: &PendingSession, info: PanicInfo, timestamp: i64) -
     let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
     let crash = CrashReport {
         source_sdk: SOURCE_SDK.to_string(),
+        source_platform: source_platform().to_string(),
+        source_arch: source_arch().to_string(),
         uuid: None,
         timestamp,
         handled: false,
@@ -386,6 +391,8 @@ fn build_abnormal_exit(timestamp: i64) -> RecoveredReport {
     );
     let crash = CrashReport {
         source_sdk: SOURCE_SDK.to_string(),
+        source_platform: source_platform().to_string(),
+        source_arch: source_arch().to_string(),
         uuid: None,
         timestamp,
         handled: true,
@@ -423,6 +430,8 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
         // is hand-built rather than serialized from `CrashReport`, so it must be
         // set explicitly here too.
         "source_sdk": SOURCE_SDK,
+        "source_platform": source_platform(),
+        "source_arch": source_arch(),
         "uuid": serde_json::Value::Null,
         "timestamp": timestamp,
         "handled": false,

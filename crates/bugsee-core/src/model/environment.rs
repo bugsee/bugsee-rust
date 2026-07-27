@@ -98,6 +98,35 @@ pub struct Hardware {
 /// routing and the appserver's `rust` application type.
 pub const SDK_TYPE: &str = "rust";
 
+/// The platform this build targets, as the backend names platforms:
+/// `linux` / `windows` / `macos` / `android` / `ios`.
+///
+/// Single source of truth for both `environment.platform.type` and
+/// `crash.json`'s `source_platform`, so the two can never disagree.
+pub fn source_platform() -> &'static str {
+    // `std::env::consts::OS` already uses the names the backend expects for
+    // every target we ship (including `android` and `ios` via the FFI), so it
+    // passes through; anything else is reported verbatim rather than guessed at.
+    std::env::consts::OS
+}
+
+/// The CPU architecture, normalized to the naming the rest of Bugsee uses.
+///
+/// Rust spells 64-bit ARM `aarch64`, but every symbol file in the pipeline is
+/// parsed by `symbolic`, which (like Apple and the Android NDK) spells it
+/// `arm64`. Reporting the Rust spelling would mean a crash's arch never
+/// string-matched the arch recorded on its own symbols — the worker's
+/// `normalize_arch` only strips ISA suffixes, it does not translate between the
+/// two vocabularies. Everything else already agrees, so it passes through.
+///
+/// Used for both `environment.hardware.arch` and `crash.json`'s `source_arch`.
+pub fn source_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
 /// SDK identity and effective configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sdk {
@@ -138,13 +167,7 @@ impl Environment {
     /// Build a baseline environment from `std`-available facts. Fuller telemetry
     /// (disk/mem free, boot time, GPU) is layered in by the Phase 4 sampler.
     pub fn detect(sdk_version: &str) -> Self {
-        let os_type = match std::env::consts::OS {
-            "macos" => "macos",
-            "windows" => "windows",
-            "linux" => "linux",
-            other => other,
-        }
-        .to_string();
+        let os_type = source_platform().to_string();
 
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
@@ -165,7 +188,7 @@ impl Environment {
                 ..Default::default()
             },
             hardware: Hardware {
-                arch: Some(std::env::consts::ARCH.to_string()),
+                arch: Some(source_arch().to_string()),
                 cpu_count,
                 ..Default::default()
             },
