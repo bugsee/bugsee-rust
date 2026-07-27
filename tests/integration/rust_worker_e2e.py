@@ -340,6 +340,47 @@ def check_code_id_matches_binary(modules: list, exe: Path) -> None:
 # The worker half.
 # ---------------------------------------------------------------------------
 
+_REEXEC_GUARD = "BUGSEE_E2E_REEXECED"
+
+
+def reexec_in_worker_venv(worker_root: Path) -> None:
+    """Re-exec under the worker's virtualenv when this interpreter lacks its deps.
+
+    The worker half imports `crash.rust`, which pulls in `typing_extensions` and
+    `symbolic`; neither is present in a stock system Python, and the worker keeps
+    both in `.venv`. Without this, running the harness the way its README
+    documents dies at `load_worker` — and, worse, the `symbolic` cross-check (the
+    single most load-bearing assertion here, that the SDK's runtime `code_id`
+    equals the binary's identity) degrades to a silent skip. Re-exec instead of
+    asking the caller to remember the right interpreter.
+
+    A no-op when the current interpreter is already equipped, or when no venv
+    exists — `load_worker` then reports precisely what is missing.
+    """
+    if os.environ.get(_REEXEC_GUARD):
+        return  # already re-executed once; never loop
+    try:
+        import symbolic  # noqa: F401
+        import typing_extensions  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    for name in (".venv", "venv"):
+        for rel in ("bin/python", "Scripts/python.exe"):
+            py = worker_root / name / rel
+            if py.exists():
+                print(f"• re-executing under the worker venv: {py}")
+                # execv does NOT flush Python's stdio buffers, and stdout is
+                # block-buffered whenever it is a pipe — so without this the
+                # line above is lost in exactly the case it matters most, a CI
+                # log, leaving an unexplained interpreter switch.
+                sys.stdout.flush()
+                os.environ[_REEXEC_GUARD] = "1"
+                os.execv(str(py), [str(py), os.path.abspath(__file__), *sys.argv[1:]])
+    print("• worker venv not found; the worker half may not import")
+
+
 def load_worker(worker_root: Path):
     """Import the worker's crash.rust, shimming what a non-3.14 env lacks."""
 
@@ -419,6 +460,10 @@ def main() -> int:
     ap.add_argument("--skip-worker", action="store_true",
                     help="only produce the bundles; skip the worker half")
     args = ap.parse_args()
+
+    # Before any expensive work: if this interpreter can't import the worker's
+    # deps, hand off to the one that can. Does not return when it re-execs.
+    reexec_in_worker_venv(args.worker.resolve())
 
     workdir = Path(tempfile.mkdtemp(prefix="bugsee-e2e-"))
     print(f"workdir: {workdir}")

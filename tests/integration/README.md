@@ -46,10 +46,13 @@ Options:
 
 - a Rust toolchain (`cargo`)
 - Python 3 for the harness itself
-- **for the worker half:** the worker's deps. The harness reuses the worker's
-  `.venv` when present and shims the two things a non-3.14 environment lacks
-  (`zipfile.ZIP_ZSTANDARD`, `bugsee_demangle`). The `symbolic` cross-check is
-  skipped with a clear message when `symbolic` isn't importable, rather than
-  failing the run.
+- **for the worker half:** the worker's deps. You do not need to activate
+  anything — if the interpreter you launch with cannot import `symbolic` /
+  `typing_extensions`, the harness **re-executes itself** under the worker's
+  `.venv` (announcing which interpreter it switched to) and shims the two things
+  a non-3.14 environment lacks (`zipfile.ZIP_ZSTANDARD`, `bugsee_demangle`).
+  When no venv exists it carries on and reports precisely what is missing; the
+  `symbolic` cross-check then degrades to a clear skip rather than a failure —
+  worth noticing, since that check is the load-bearing one.
 
 Exit code is non-zero on any assertion failure, so it can gate CI.
