@@ -7,9 +7,14 @@
 
 //! The `environment` object of `request.json`: four sub-objects
 //! (`platform`, `app`, `hardware`, `sdk`). The shape is shared across SDKs; the
-//! key inventory inside each sub-object is platform-reported. Rust reports an
-//! OS-typed `platform.type` (`linux`/`windows`/`macos`) — a backend
-//! coordination item (DESIGN.md §15).
+//! key inventory inside each sub-object is platform-reported.
+//!
+//! Two fields carry the Rust-specific backend contract (DESIGN.md §15):
+//! - `sdk.type` = `"rust"` — the authoritative routing discriminator; the worker
+//!   dispatches on it before `platform.type` (see [`SDK_TYPE`]).
+//! - `platform.type` — OS-typed (`linux`/`windows`/`macos`), unlike the mobile
+//!   SDKs' `ios`/`android`. The appserver treats `rust` as an umbrella app type
+//!   with the per-session OS riding here, exactly like the `javascript` type.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -85,9 +90,20 @@ pub struct Hardware {
     pub gpu: Option<Gpu>,
 }
 
+/// The SDK family this recording came from — the **authoritative backend routing
+/// discriminator**, stamped on every recording (mirrors the JS SDK's
+/// `environment.sdk.type == "javascript"`). The worker routes on this *before*
+/// looking at `platform.type`, so a `macos` Rust report is never mistaken for an
+/// Apple/iOS native crash. Must stay in sync with the worker's `crash/rust.py`
+/// routing and the appserver's `rust` application type.
+pub const SDK_TYPE: &str = "rust";
+
 /// SDK identity and effective configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sdk {
+    /// Always [`SDK_TYPE`]. Never skipped — the backend requires it to route.
+    #[serde(rename = "type")]
+    pub sdk_type: String,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
@@ -95,6 +111,18 @@ pub struct Sdk {
     pub options: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapper: Option<Value>,
+}
+
+impl Default for Sdk {
+    fn default() -> Self {
+        Sdk {
+            sdk_type: SDK_TYPE.to_string(),
+            version: String::new(),
+            build: None,
+            options: Map::new(),
+            wrapper: None,
+        }
+    }
 }
 
 /// The full `environment` object.
@@ -142,9 +170,47 @@ impl Environment {
                 ..Default::default()
             },
             sdk: Sdk {
+                sdk_type: SDK_TYPE.to_string(),
                 version: sdk_version.to_string(),
                 ..Default::default()
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdk_type_is_always_emitted_for_backend_routing() {
+        let env = Environment::detect("1.2.3");
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(
+            v["sdk"]["type"], "rust",
+            "the worker routes on environment.sdk.type; it must always be present"
+        );
+        assert_eq!(v["sdk"]["version"], "1.2.3");
+        // A default-constructed Sdk must also carry the discriminator.
+        assert_eq!(
+            serde_json::to_value(Sdk::default()).unwrap()["type"],
+            "rust"
+        );
+    }
+
+    #[test]
+    fn platform_type_is_os_typed() {
+        let env = Environment::detect("1.0.0");
+        let os = env.platform.os_type;
+        // Assert membership only on the platforms we actually target/CI, rather
+        // than `contains(..) || !is_empty()` — that disjunct is always satisfied
+        // by the second clause, so it would pass for "ios" or any garbage.
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        assert!(
+            ["linux", "windows", "macos"].contains(&os.as_str()),
+            "platform.type must be OS-typed (linux/windows/macos), got {os}"
+        );
+        // Everywhere else we only require a non-empty identifier.
+        assert!(!os.is_empty(), "platform.type must never be empty");
     }
 }

@@ -32,6 +32,36 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
 
+## Recent work — backend ingestion wired end-to-end (`appserver` + `worker`)
+
+Cross-repo change landing the Rust ingestion contract (DESIGN §15, now closed).
+Routing keys off **`environment.sdk.type == "rust"`**, mirroring the JS SDK —
+required because Rust reports an OS-typed `platform.type`, so a `macos` report
+would otherwise land in the worker's Apple/Mach-O branch.
+
+- **`rust` (this repo):** `Environment.sdk` now carries `type: "rust"`
+  (`model/environment.rs::SDK_TYPE`) — it previously had **no** `type` field at
+  all, so the backend had nothing to route on.
+- **`worker`:** new `crash/rust.py` handling the managed variant (panic /
+  handled error, `cause` chain) and the thin native variant (`signal{…}`,
+  minidump when present); routed from `jobs/bundle.py`; `utils/platform.py`
+  documents that the bare OS names must not be folded into `web`; per-OS entries
+  added to `static/sdk_versions.json` (their absence logged an *error* on every
+  Rust bundle). **24 tests** in `test/test_crash_rust.py` — including 7 that
+  exercise the real `jobs/bundle.py` dispatch (mutation-checked: breaking the
+  discriminator fails 5 of them).
+- **`appserver`:** `rust` umbrella application type (per-session OS rides
+  `platform.type`, modelled on `javascript`), `cfg.core.sdk.rust` flat version
+  floor, `isSupportedSdkVersion` rust branch, MCP `application.list` enum, and
+  `rust` added to the **symbol-storage routing** (`symbols/` + `symbols.*` jobs,
+  and the reprocess switch) so Rust minidumps can actually be symbolicated.
+- **Signature contract settled:** client signatures unprefixed, server appends
+  `"s."`-prefixed; grouping `$in` over the flat array. Found + fixed a real
+  integration defect while testing: the shared managed signature builder takes
+  its location from the *deepest* `cause`, but Rust cause links carry no
+  backtrace, so every handled error with a source chain produced no server
+  signature and an "Unknown location" summary.
+
 ## Recent work — 4th adversarial pass (Opus-verified), fully resolved (`68823c8`, `82a1fed`)
 
 A fourth review: **Fable** finders across 8 risk dimensions → **Opus** skeptics
@@ -125,10 +155,10 @@ and build/MSRV. Fixed (all validated):
 
 ### Deferred review findings — need a decision before building
 
-1. **Native `signatures` wire placement (confirm).** Native `crash.json`/`request.json`
-   `signatures` now goes `[]` → `[<client sig>]`, matching what iOS/Android send. If the
-   backend expects native signatures to stay server-computed only, switch to a local-only
-   dedup key instead (frame-capture work is unchanged either way).
+1. ~~**Native `signatures` wire placement (confirm).**~~ **RESOLVED** — the backend keeps
+   client signatures and *appends* its own `"s."`-prefixed ones; grouping is an `$in` over
+   the flat array, so both are live keys. Sending `[<client sig>]` unprefixed is correct
+   (same convention as the Android NDK path). See DESIGN §15.
 2. **Cross-thread panic↔crash tid match** (DESIGN §195). Correlation is time-window only;
    no thread-id check. Practically mitigated (reliable snapshot cleanup + strict window),
    but a full fix needs a kernel tid on Linux — and Apple's mach-port vs pthread-id

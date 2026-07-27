@@ -103,6 +103,23 @@ fn full_public_api_flow() {
         req["environment"]["sdk"]["version"],
         env!("CARGO_PKG_VERSION")
     );
+    // The backend ROUTING contract, asserted end-to-end (not just on the struct):
+    // worker/jobs/bundle.py dispatches on environment.sdk.type, so if this field
+    // ever stops reaching the wire every Rust report silently falls through to the
+    // Apple/Mach-O branch. See DESIGN.md §15.
+    assert_eq!(
+        req["environment"]["sdk"]["type"], "rust",
+        "sdk.type is the backend's routing discriminator and must reach request.json"
+    );
+    // Rust reports an OS-typed platform (not ios/android); the appserver treats
+    // `rust` as an umbrella app type with the OS riding here.
+    let platform_type = req["environment"]["platform"]["type"]
+        .as_str()
+        .expect("platform.type present");
+    assert!(
+        ["linux", "windows", "macos"].contains(&platform_type),
+        "platform.type must be OS-typed, got {platform_type}"
+    );
 
     let mut mbytes = Vec::new();
     zip.by_name("manifest.json")

@@ -269,12 +269,53 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 
 **Gate:** a phase ships only when its E2E flows are green **and** unit + property tests pass under the CI job (build/test/clippy/fmt + MSRV). Fuzz/loom/miri are aspirational gates, tracked as planned follow-ups rather than currently enforced.
 
-## 15. Open backend-coordination items
+## 15. Backend-coordination items — **resolved** (implemented in `appserver` + `worker`)
 
-1. Ingest/viewer must accept **`x-client-type: rust`** and OS-typed **`platform.type`** (`linux`/`windows`/`macos`).
-2. A **Rust `crash.json` shape** must be defined and taught to the worker's `__detect_platform` (which fingerprints platform by fields present).
-3. **Rust signature representation** is a third form (not byte-identical to iOS/Android) — confirm grouping expectations server-side.
+The ingestion contract is now implemented end-to-end. The keystone is that routing
+keys off **`environment.sdk.type == "rust"`**, not `platform.type` — the same
+discriminator the JS SDK uses. This is required, not cosmetic: Rust reports an
+OS-typed platform, so a `macos` report would otherwise fall through to the
+worker's Apple/Mach-O branch and a handled Rust error into the managed generic path.
+
+1. **`x-client-type: rust` + OS-typed `platform.type`** — *done*. `appserver`
+   gained a `rust` **umbrella application type** (`applicationTypes.APPLICATION_TYPE_RUST`),
+   modelled on `javascript`: one app per project, with the per-session OS
+   (`linux`/`windows`/`macos`) riding `environment.platform.type`.
+   `utils.isValidForClient` accepts `x-client-type: rust` only for a `rust` app.
+   `isSupportedSdkVersion` reads a **flat** floor from `cfg.core.sdk.rust` (one
+   crate family across every OS — unlike the JS per-runtime floor).
+2. **Rust `crash.json` shape** — *done*. The SDK now stamps `environment.sdk.type
+   = "rust"` (`model/environment.rs::SDK_TYPE`) and `worker/jobs/bundle.py` routes
+   on it to the new **`worker/crash/rust.py`**, which handles both variants:
+   the *managed* one (panic / handled error: `exception` + `frames` + `cause`
+   chain) and the thin *native* one (`exception_type: "native"`, `signal{…}`,
+   plus the generic minidump processor when a dump was harvested).
+   `__detect_platform` is bypassed entirely for Rust, so its
+   iOS-fields-else-Android fingerprinting can no longer misclassify us.
+3. **Signature representation** — *resolved, and the client feed is kept.* The
+   contract is: **client signatures ride `signatures[]` unprefixed; the server
+   APPENDS its own `"s."`-prefixed ones**, and grouping is a Mongo `$in` over that
+   flat array — so both are live grouping keys and neither clobbers the other.
+   (Precedent: the Android NDK path already emits an unprefixed "imitation of the
+   client's signature".) This closes the open question about the native
+   `signatures[]` placement: sending `[<client sig>]` is correct.
+   Rust-specific wrinkle handled in `crash/rust.py`: the shared managed signature
+   builder takes its location from the *deepest* `cause`, but a Rust `source()`
+   chain carries a backtrace only on the **outermost** error, so without a
+   fallback every handled error with a cause produced *no* server signature and an
+   "Unknown location" summary. The digest still covers the whole chain, so distinct
+   root causes at one call site keep grouping apart.
 4. Zstd **method-93** is already backend-validated (worker Python 3.14) — no change needed, noted for reference.
+
+**Symbols.** A `rust` app rides the per-app **`symbols/`** store + `symbols.*`
+worker jobs (alongside `ios`/`javascript`), not Android's `mappings/` + ProGuard
+`mapping.*` path — the worker resolves a Rust minidump against that unified
+store, so the two halves must agree or every Rust minidump stays unsymbolicated.
+
+**Still open (not required for ingestion):** the `viewer` dashboard has no
+Rust-specific rendering yet (reports display through the generic managed path),
+no Rust entry exists in the app-create wizard, and there is still no cross-repo
+E2E feeding a real `*.bundle.zip` to the worker's ingest (DESIGN §13).
 
 ## 16. References
 
