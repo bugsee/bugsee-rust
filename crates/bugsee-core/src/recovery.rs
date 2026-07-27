@@ -171,9 +171,9 @@ fn process_is_alive(_pid: u32) -> bool {
 
 /// Build the crash report for a pending session. Precedence: a *fresh* aborting
 /// panic (`SIGABRT` + a recent panic snapshot) correlates into one managed event;
-/// any other native signal yields the thin native variant; and a session with no
-/// native signal at all (including one carrying only a stale/contained panic
-/// snapshot) is reported as an abnormal termination.
+/// any other native signal yields the thin native variant; a lone panic snapshot
+/// is a fatal **unwinding** panic; and a session with neither is an abnormal
+/// termination.
 pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
     let has_native = pending.minidump.is_some() || pending.crash_info.is_some();
     let signal = read_signal_info(pending);
@@ -193,10 +193,52 @@ pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport
             build_correlated(pending, info, timestamp)
         }
         (true, _) => build_native(pending, timestamp),
-        // A lone panic snapshot with NO native signal means the panic was
-        // contained (the process did not die from it) — report the abnormal exit,
-        // not a fabricated fatal panic.
-        (false, _) => build_abnormal_exit(timestamp),
+        // A lone panic snapshot with NO native signal is an uncaught UNWINDING
+        // panic — the Rust default, and the case that previously went entirely
+        // unreported. Two invariants make this unambiguous:
+        //   1. `report_caught` DELETES the snapshot for a contained panic, so a
+        //      surviving snapshot means nothing caught it;
+        //   2. the session's liveness marker is only kept across a clean
+        //      shutdown when `Recorder::drop` sees `thread::panicking()`, i.e.
+        //      the process was unwinding out of `main` because of this panic.
+        // So we report the panic itself rather than a generic abnormal exit.
+        (false, Some(info)) => build_fatal_panic(info, timestamp),
+        (false, None) => build_abnormal_exit(timestamp),
+    }
+}
+
+/// A fatal uncaught **unwinding** panic, recovered on the next launch. Same
+/// managed shape as the aborting-panic path ([`build_correlated`]) — the two
+/// differ only in how the process died, which the contract does not encode for
+/// a managed variant.
+fn build_fatal_panic(info: PanicInfo, timestamp: i64) -> RecoveredReport {
+    let frame_sigs: Vec<String> = info
+        .frames
+        .iter()
+        .filter(|f| !f.hidden)
+        .map(|f| f.trace.clone())
+        .collect();
+    let signature = panic_signature("panic", &info.reason, &frame_sigs, false, None);
+    let crash = CrashReport {
+        uuid: None,
+        timestamp,
+        handled: false,
+        obfuscated: false,
+        ndk_crash: false,
+        exception_type: "exception".into(),
+        signatures: vec![signature.clone()],
+        exception: ExceptionInfo {
+            name: "panic".into(),
+            reason: reason_with_location(&info),
+            domain: None,
+            frames: info.frames,
+            cause: None,
+        },
+    };
+    RecoveredReport {
+        meta: crash_meta(vec![signature], TriggerType::Crash),
+        crash_json: crash.to_bytes().unwrap_or_default(),
+        extra_files: Vec::new(),
     }
 }
 
@@ -382,6 +424,54 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
         "exception_type": "native",
         "signatures": signatures,
     });
+
+    // The loaded-module map + the crashing thread's module-relative frames. This
+    // is what lets the backend symbolicate: it looks each module up in the
+    // symbol store by `code_id` (Mach-O LC_UUID / GNU build-id) and resolves
+    // `reladdr` within it. Modules without a code id are still reported (they
+    // give the crash address context) but can never resolve — an ELF needs
+    // `-Wl,--build-id` to be symbolicatable.
+    let modules = read_modules(&pending.parts_dir.join(MODULES_NAME));
+    if !modules.is_empty() {
+        crash["modules"] = serde_json::Value::Array(
+            modules
+                .iter()
+                .map(|m| {
+                    let mut entry = serde_json::json!({
+                        "base_addr": format!("0x{:x}", m.base),
+                        "filename": m.name,
+                    });
+                    if m.size != usize::MAX {
+                        entry["end_addr"] = serde_json::Value::from(format!(
+                            "0x{:x}",
+                            m.base.saturating_add(m.size)
+                        ));
+                    }
+                    if !m.code_id.is_empty() {
+                        entry["code_id"] = serde_json::Value::from(m.code_id.clone());
+                    }
+                    entry
+                })
+                .collect(),
+        );
+    }
+    if let Some(info) = signal.as_ref() {
+        if !info.frames.is_empty() {
+            crash["frames"] = serde_json::Value::Array(
+                info.frames
+                    .iter()
+                    .map(|&pc| {
+                        let mut frame = serde_json::json!({ "addr": format!("0x{pc:x}") });
+                        if let Some((name, offset)) = resolve_module_offset(pc, &modules) {
+                            frame["module"] = serde_json::Value::from(name);
+                            frame["reladdr"] = serde_json::Value::from(offset);
+                        }
+                        frame
+                    })
+                    .collect(),
+            );
+        }
+    }
     // The native variant always carries a `signal` object (part of its thin
     // shape). If no crash-info marker was written (e.g. a minidump-only session),
     // emit it with unknown/nulled fields rather than omitting it entirely.
@@ -433,38 +523,66 @@ fn native_frame_signature(pending: &PendingSession, signal: Option<&SignalInfo>)
     ))
 }
 
+/// A module from the install-time map.
+#[derive(Clone)]
+pub struct ModuleEntry {
+    pub base: usize,
+    /// Loaded address extent; `usize::MAX` when unknown (legacy map).
+    pub size: usize,
+    /// Mach-O `LC_UUID` / GNU build-id, lowercase hex. Empty when the module
+    /// carries none — the backend symbol store is keyed on this, so such a
+    /// module can never be symbolicated.
+    pub code_id: String,
+    pub name: String,
+}
+
 /// The module whose loaded range `[base, base + size)` contains `pc` (the one
 /// with the largest such base), and the offset within it. A PC outside every
 /// module's range yields `None` — it is SKIPPED rather than misattributed to the
 /// nearest-below module with a bogus, ASLR-unstable offset that would defeat the
 /// crash-loop blacklist (F25).
-fn resolve_module_offset(pc: usize, modules: &[(usize, usize, String)]) -> Option<(String, u64)> {
+fn resolve_module_offset(pc: usize, modules: &[ModuleEntry]) -> Option<(String, u64)> {
     modules
         .iter()
-        .filter(|(base, size, _)| *base <= pc && pc - *base < *size)
-        .max_by_key(|(base, _, _)| *base)
-        .map(|(base, _, name)| (name.clone(), (pc - base) as u64))
+        .filter(|m| m.base <= pc && pc - m.base < m.size)
+        .max_by_key(|m| m.base)
+        .map(|m| (m.name.clone(), (pc - m.base) as u64))
 }
 
-/// Read the module map (`<base_hex>\t<size_hex>\t<name>` per line) written at
-/// install time. A legacy 2-field line (`<base_hex>\t<name>`, from a marker that
-/// survived an SDK upgrade) is read with an unbounded size, preserving the old
-/// nearest-module behavior for that entry only.
-fn read_modules(path: &Path) -> Vec<(usize, usize, String)> {
+/// Read the install-time module map. Current format is
+/// `<base_hex>\t<size_hex>\t<code_id>\t<name>`; two older shapes are still
+/// accepted so a marker written by a previous SDK build (and recovered after an
+/// upgrade) still yields a report:
+/// - `base \t size \t name` — no code id (pre-symbolication builds)
+/// - `base \t name`         — no size either; treated as unbounded, preserving
+///   the old nearest-module behavior for that entry only.
+fn read_modules(path: &Path) -> Vec<ModuleEntry> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
-            let base = usize::from_str_radix(parts.next()?.trim(), 16).ok()?;
-            let second = parts.next()?;
-            match parts.next() {
-                // New format: base \t size \t name.
-                Some(name) => {
-                    let size = usize::from_str_radix(second.trim(), 16).unwrap_or(usize::MAX);
-                    Some((base, size, name.to_string()))
-                }
-                // Legacy format: base \t name (size unknown → unbounded).
-                None => Some((base, usize::MAX, second.to_string())),
+            let parts: Vec<&str> = line.splitn(4, '\t').collect();
+            let base = usize::from_str_radix(parts.first()?.trim(), 16).ok()?;
+            let size_of = |s: &str| usize::from_str_radix(s.trim(), 16).unwrap_or(usize::MAX);
+            match parts.len() {
+                4 => Some(ModuleEntry {
+                    base,
+                    size: size_of(parts[1]),
+                    code_id: parts[2].trim().to_string(),
+                    name: parts[3].to_string(),
+                }),
+                3 => Some(ModuleEntry {
+                    base,
+                    size: size_of(parts[1]),
+                    code_id: String::new(),
+                    name: parts[2].to_string(),
+                }),
+                2 => Some(ModuleEntry {
+                    base,
+                    size: usize::MAX,
+                    code_id: String::new(),
+                    name: parts[1].to_string(),
+                }),
+                _ => None,
             }
         })
         .collect()

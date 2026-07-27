@@ -8,7 +8,7 @@
 
 ## 1. Understanding Summary
 
-- **What:** *Bugsee for Rust* — core deliverable is a crash/native-fatal/panic/handled-error reporter, built the Bugsee way (not a Sentry clone), emitting the same report-bundle wire format the mobile SDKs upload.
+- **What:** *Bugsee for Rust* — core deliverable is a crash/native-fatal/panic/handled-error reporter, built the Bugsee way, emitting the same report-bundle wire format the mobile SDKs upload.
 - **Targets:** Linux, Windows, macOS, Android + iOS (via FFI). Tier-1 = desktop/server; mobile reuses the same core.
 - **Capture channels:** logs / events / custom-data, network, system/process telemetry, breadcrumbs + contexts + scopes. **No UI/video.**
 - **Error channel (full):** explicit `capture_error`/`capture_message`; `std::error::Error`/`anyhow`/`eyre`/`thiserror` source-chain + backtrace; `tracing`/`log` integration; `Result` ergonomics.
@@ -97,7 +97,8 @@ let _guard = Bugsee::launch_with(LaunchOptions::new("APP_TOKEN")
     .before_breadcrumb(|c| Some(c)))?;
 // Real builder set (see `crates/bugsee/src/options.rs`): data_dir, max_window,
 // max_bytes, max_events, endpoint, with_transport, before_send,
-// before_breadcrumb, sample_rate, native_crash_capture, system_telemetry.
+// before_breadcrumb, sample_rate, native_crash_capture, system_telemetry,
+// report_panics_from_hook (opt-in immediate panic reporting — see §9).
 // (`capture_logs` / `network_default_sanitizer` / a dedicated `on_report` are
 // not part of the current surface — capture toggles and a network sanitizer
 // hook are future work; report mutation goes through `before_send`.)
@@ -189,6 +190,26 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 **Boundary guards (`bugsee-panic`):** every exported FFI fn / SDK thread root / task root runs inside `catch_unwind` + a TLS scope guard (`sdk_scope_depth`, `foreign_callback_depth`, `operation_id`). A panic never unwinds across `extern "C"`. Caught panic → quarantine (Class A–D) → non-fatal event (`type:"error"`, `handled:true`).
 
 **Panic observer:** one chained global hook (`Once` + `take_hook`), installed once, never naively uninstalled; minimal pre-unwind work — write message/file/line/tid/panic_id/raw-PCs into a fixed-size preallocated `PanicSnapshot` (`EMPTY→WRITING→READY`), then call the previous hook. Attribution: SDK when `sdk_scope_depth>0 && foreign_callback_depth==0`.
+
+**Uncaught-panic reporting (mark-and-recover, default).** The hook only *captures*; it never reports. Which path a panic takes is then decided by what actually happens to the process:
+- **caught** at a `guard`/`catch_unwind` boundary → reported there as `handled`, and `report_caught` **deletes** the snapshot so nothing later misreads it as fatal;
+- **aborting** (`panic = "abort"`) → SIGABRT → the native handler records it → next-launch recovery *correlates* signal + snapshot into one managed crash;
+- **uncaught + unwinding** (the Rust **default**) → no signal at all. The panic unwinds out of `main`, and `Recorder::drop` observes `std::thread::panicking()` and therefore **keeps** the liveness marker; next-launch recovery finds the lone surviving snapshot and reports it as a fatal panic.
+
+That last case previously produced **no report whatsoever** — the SDK shut down "cleanly", dropped the marker, and recovery had nothing to find. The two invariants that make a lone surviving snapshot unambiguous are the `report_caught` deletion above and the `thread::panicking()`-gated marker retention.
+
+**Worker-thread panics (reported inline, default).** A panic on a non-main thread kills only that thread — the process survives — so there is *no process death for recovery to observe*, and it would otherwise be invisible. It is therefore reported **inline from the hook**. Crucially, the crash-time isolation objection does not apply here: the process is healthy and this is an ordinary report on an ordinary thread. It is recorded as a **non-fatal error, not a crash** (counting it as a crash would corrupt crash-free-session rates), annotated with the thread name to keep it distinguishable from a panic the app deliberately caught.
+
+**Never double-reported.** The hook cannot know whether a panic will be caught, but it *can* know whether one of our `catch_unwind` boundaries is on the stack: `guard` maintains a thread-local depth, and inline reporting is gated on it being zero. Without that gate a caught panic on a worker thread is emitted twice — once from the hook as uncaught, once from `report_caught` as handled.
+
+**Opt-in immediate reporting (`report_panics_from_hook`).** Extends inline reporting to **main-thread** panics too, so delivery does not wait for a next launch (a short-lived process may never restart). Still gated on the guard depth. The cost is that reporting runs allocation/disk/network on a thread that is about to die, which is why it is not the default.
+
+| panic | default behaviour | reported as |
+|---|---|---|
+| caught at a `guard` boundary | reported there | non-fatal error, `handled` |
+| uncaught on a **worker** thread | reported inline from the hook | non-fatal error + thread name |
+| uncaught on **main**, unwinding | marker retained → next-launch recovery | crash |
+| uncaught on **main**, aborting | SIGABRT → next-launch correlation | crash |
 
 **Native fatal (`bugsee-native`):** thin wrapper over `crash-handler` + `minidump-writer` (in-process, next-launch upload — mobile parity; optional out-of-process `minidumper` monitor on desktop). Crash-time handler does the minimum: write minidump, read `PanicSnapshot`, set marker, re-raise/terminate. **No allocation/JSON/network in-handler.** Alt-signal-stack for stack overflow.
 

@@ -130,8 +130,12 @@ impl Bugsee {
         {
             bugsee_panic::install(std::sync::Arc::new(PanicSink));
             // Persist panic snapshots so an aborting panic correlates with its
-            // SIGABRT on the next launch.
+            // SIGABRT on the next launch — and so an uncaught UNWINDING panic is
+            // recovered as a fatal panic (the marker is kept because
+            // `Recorder::drop` sees `thread::panicking()`).
             bugsee_panic::set_snapshot_path(panic_info_path);
+            // Opt-in: report immediately from the hook instead of via recovery.
+            bugsee_panic::set_report_from_hook(options.report_panics_from_hook);
         }
 
         Ok(LaunchGuard { _private: () })
@@ -395,20 +399,29 @@ pub(crate) fn submit_transaction(transaction: bugsee_core::model::perf::Transact
 }
 
 /// Bridges the panic observer to the recorder: a caught panic becomes a
-/// handled `error` report, an escaped panic a `crash` report.
+/// handled `error` report, an escaped panic a `crash` report, and an uncaught
+/// panic that killed only a **worker thread** becomes a non-fatal `error`
+/// annotated with the thread name (the process survived it, so counting it as a
+/// crash would corrupt crash-free-session rates).
 #[cfg(feature = "panic")]
 struct PanicSink;
 
 #[cfg(feature = "panic")]
 impl bugsee_panic::PanicReporter for PanicSink {
     fn report_panic(&self, report: bugsee_panic::PanicReport) {
-        let reason = match &report.file {
+        let mut reason = match &report.file {
             Some(file) => format!(
                 "{} ({}:{}:{})",
                 report.reason, file, report.line, report.column
             ),
             None => report.reason.clone(),
         };
+        // Keep an uncaught worker-thread panic distinguishable from one the app
+        // deliberately caught — both are non-fatal, but only one is a bug the
+        // developer did not handle at all.
+        if let Some(thread) = &report.thread {
+            reason = format!("{reason} [uncaught on thread '{thread}']");
+        }
         let built = errors::build_panic(&reason, report.frames, report.handled, epoch_ms());
         Bugsee::with_recorder(|r| r.report(built.meta, Some(built.crash_json)));
     }

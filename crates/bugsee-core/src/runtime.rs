@@ -418,7 +418,18 @@ impl Drop for Recorder {
         // Leaving the marker costs at worst a false-positive abnormal-exit report
         // (or a clean re-skip by gc once the detached flush finishes) — far safer
         // than silently losing a crash.
-        if worker_acked && uploader_acked {
+        //
+        // `thread::panicking()` is the precise "we are dying FROM a panic"
+        // signal: an uncaught panic unwinds out of `main`, drops the launch
+        // guard and lands here on the still-unwinding thread. Keeping the
+        // liveness marker in that case is what lets next-launch recovery report
+        // the fatal panic — without it we would shut down "cleanly", drop the
+        // marker, and the panic that killed the process would go unreported
+        // (the Rust default is `panic = "unwind"`, so this is the common case).
+        // A panic that was merely *contained* never reaches here while
+        // unwinding, and its snapshot is deleted by `report_caught`, so this
+        // cannot turn a handled panic into a phantom crash.
+        if worker_acked && uploader_acked && !std::thread::panicking() {
             self.session.end();
         }
     }

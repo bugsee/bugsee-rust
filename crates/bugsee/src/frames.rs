@@ -8,7 +8,7 @@
 //! Backtrace capture → `crash.json` frames. Leading SDK-internal frames are
 //! marked `hidden` so they don't pollute grouping.
 
-use bugsee_core::model::crash::{Frame, FrameData};
+use bugsee_core::model::crash::{is_internal_frame, Frame, FrameData};
 
 /// Capture the current call stack as `crash.json` frames, resolving symbols.
 pub fn capture() -> Vec<Frame> {
@@ -23,7 +23,7 @@ pub fn capture() -> Vec<Frame> {
             let file = symbol.filename().map(|p| p.to_string_lossy().into_owned());
             let line = symbol.lineno().map(|l| l as i64).unwrap_or(-1);
 
-            let hidden = is_sdk_frame(&name);
+            let hidden = is_internal_frame(&name);
             let (member_class, member) = split_symbol(&name);
             let trace = match (&file, line) {
                 (Some(f), l) if l >= 0 => format!("{name} ({f}:{l})"),
@@ -43,13 +43,6 @@ pub fn capture() -> Vec<Frame> {
         }
     }
     frames
-}
-
-/// SDK-internal frames (our own crates + the backtrace machinery) are hidden.
-fn is_sdk_frame(name: &str) -> bool {
-    name.starts_with("bugsee")
-        || name.starts_with("backtrace::")
-        || name.starts_with("std::backtrace")
 }
 
 /// Split a symbol path into `(module_path, function)`.

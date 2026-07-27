@@ -361,20 +361,39 @@ unsafe fn append_frames(_path_cbytes: &[u8], _frames: &[usize]) {
 // Module map (captured at install) + crash-time frame capture.
 // ---------------------------------------------------------------------------
 
-/// Write the loaded-module map (`<base_hex>\t<size_hex>\t<name>` per line) so
-/// recovery can turn crash-time frame PCs into ASLR-invariant `pc - base` module
-/// offsets — and, using `size`, reject a PC that falls OUTSIDE the module's
-/// loaded range instead of misattributing it to the nearest-below module (F25).
+/// Write the loaded-module map, one `<base_hex>\t<size_hex>\t<code_id>\t<name>`
+/// line per module, so recovery can:
+/// - turn crash-time frame PCs into ASLR-invariant `pc - base` module offsets,
+/// - using `size`, reject a PC that falls OUTSIDE the module's loaded range
+///   instead of misattributing it to the nearest-below module (F25), and
+/// - report each module's **code id** — the Mach-O `LC_UUID` on Apple, the GNU
+///   build-id (`.note.gnu.build-id`) on Linux/Android.
+///
+/// The code id is what the backend's symbol store is keyed on (the worker
+/// extracts the same value from uploaded symbols via `symbolic`), so without it
+/// a native crash can never be symbolicated no matter what the user uploads.
+/// `code_id` is empty when the module carries none (e.g. an ELF linked without
+/// `-Wl,--build-id`); recovery then simply omits it.
 fn write_modules_file(path: &std::path::Path) {
     let modules = snapshot_modules();
     if modules.is_empty() {
         return;
     }
-    let mut body = String::with_capacity(modules.len() * 40);
-    for (base, size, name) in modules {
-        body.push_str(&format!("{base:x}\t{size:x}\t{name}\n"));
+    let mut body = String::with_capacity(modules.len() * 64);
+    for (base, size, code_id, name) in modules {
+        body.push_str(&format!("{base:x}\t{size:x}\t{code_id}\t{name}\n"));
     }
     let _ = std::fs::write(path, body);
+}
+
+/// Lowercase hex of raw id bytes (the form the symbol service stores).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    s
 }
 
 /// The trailing path component (module file name).
@@ -383,12 +402,12 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// Enumerate loaded modules as `(load_base, vm_size, name)`. NOT
+/// Enumerate loaded modules as `(load_base, vm_size, code_id, name)`. NOT
 /// async-signal-safe — call only from `install` (normal context). `vm_size` is
 /// the module's loaded address extent, used by recovery to reject an
-/// out-of-module PC (F25).
+/// out-of-module PC (F25); `code_id` is the Mach-O `LC_UUID` (empty if absent).
 #[cfg(target_vendor = "apple")]
-fn snapshot_modules() -> Vec<(usize, usize, String)> {
+fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
     use mach2::dyld::{_dyld_get_image_header, _dyld_get_image_name, _dyld_image_count};
     let mut modules = Vec::new();
     let count = unsafe { _dyld_image_count() };
@@ -399,15 +418,19 @@ fn snapshot_modules() -> Vec<(usize, usize, String)> {
             continue;
         }
         let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
-        modules.push((header, image_vmsize(header), basename(&name)));
+        let (size, code_id) = image_info(header);
+        modules.push((header, size, code_id, basename(&name)));
     }
     modules
 }
 
-// Minimal Mach-O structures needed to compute a loaded image's vm extent (mach2
-// only exposes the 32-bit `mach_header`). Layout matches `<mach-o/loader.h>`.
+// Minimal Mach-O structures needed to compute a loaded image's vm extent and read
+// its LC_UUID (mach2 only exposes the 32-bit `mach_header`). Layout matches
+// `<mach-o/loader.h>`.
 #[cfg(target_vendor = "apple")]
 const LC_SEGMENT_64: u32 = 0x19;
+#[cfg(target_vendor = "apple")]
+const LC_UUID: u32 = 0x1b;
 
 #[cfg(target_vendor = "apple")]
 #[repr(C)]
@@ -445,13 +468,26 @@ struct SegmentCommand64 {
     flags: u32,
 }
 
-/// The loaded vm extent of the Mach-O image at `header`: the span from the lowest
-/// to the highest `LC_SEGMENT_64` vm address. `base + extent` bounds the module,
-/// so recovery can tell whether a crash PC actually belongs to it.
 #[cfg(target_vendor = "apple")]
-fn image_vmsize(header: usize) -> usize {
+#[repr(C)]
+struct UuidCommand {
+    cmd: u32,
+    cmdsize: u32,
+    uuid: [u8; 16],
+}
+
+/// One walk of the Mach-O load commands at `header`, returning
+/// `(vm_extent, code_id)`:
+/// - **vm_extent** — the span from the lowest to the highest `LC_SEGMENT_64` vm
+///   address. `base + extent` bounds the module, so recovery can tell whether a
+///   crash PC actually belongs to it.
+/// - **code_id** — the `LC_UUID` as lowercase hex (empty when the image has no
+///   `LC_UUID`). This is the identity the symbol store is keyed on; `symbolic`
+///   reads the same value out of an uploaded dSYM/Mach-O.
+#[cfg(target_vendor = "apple")]
+fn image_info(header: usize) -> (usize, String) {
     if header == 0 {
-        return 0;
+        return (0, String::new());
     }
     // SAFETY: `header` is a valid loaded mach_header from dyld; we only read the
     // header and walk `ncmds` load commands, each bounded by its own `cmdsize`.
@@ -460,6 +496,7 @@ fn image_vmsize(header: usize) -> usize {
         let mut lc = header + core::mem::size_of::<MachHeader64>();
         let mut min_vmaddr = u64::MAX;
         let mut max_vmend: u64 = 0;
+        let mut code_id = String::new();
         for _ in 0..mh.ncmds {
             let cmd = &*(lc as *const LoadCommand);
             if cmd.cmdsize == 0 {
@@ -469,19 +506,68 @@ fn image_vmsize(header: usize) -> usize {
                 let seg = &*(lc as *const SegmentCommand64);
                 min_vmaddr = min_vmaddr.min(seg.vmaddr);
                 max_vmend = max_vmend.max(seg.vmaddr.saturating_add(seg.vmsize));
+            } else if cmd.cmd == LC_UUID
+                && cmd.cmdsize as usize >= core::mem::size_of::<UuidCommand>()
+            {
+                let uc = &*(lc as *const UuidCommand);
+                code_id = hex_lower(&uc.uuid);
             }
             lc += cmd.cmdsize as usize;
         }
-        if max_vmend > min_vmaddr {
+        let extent = if max_vmend > min_vmaddr {
             (max_vmend - min_vmaddr) as usize
         } else {
             0
-        }
+        };
+        (extent, code_id)
     }
 }
 
+/// ELF note type for the GNU build-id (`NT_GNU_BUILD_ID`), in a `PT_NOTE`
+/// segment whose note name is `"GNU\0"`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn snapshot_modules() -> Vec<(usize, usize, String)> {
+const NT_GNU_BUILD_ID: u32 = 3;
+
+/// Scan a loaded `PT_NOTE` segment for the GNU build-id, returning it as
+/// lowercase hex.
+///
+/// Note layout (`Elf_Nhdr` + payloads, each 4-byte aligned):
+/// `n_namesz | n_descsz | n_type | name[n_namesz] | desc[n_descsz]`.
+///
+/// # Safety
+/// `start` must point at `len` readable bytes of a loaded PT_NOTE segment.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn gnu_build_id_from_notes(start: *const u8, len: usize) -> Option<String> {
+    let align4 = |n: usize| n.div_ceil(4) * 4;
+    let mut off = 0usize;
+    // Each iteration consumes a full note; the header alone is 12 bytes.
+    while off + 12 <= len {
+        let hdr = unsafe { start.add(off) } as *const u32;
+        let namesz = unsafe { *hdr } as usize;
+        let descsz = unsafe { *hdr.add(1) } as usize;
+        let ntype = unsafe { *hdr.add(2) };
+
+        let name_off = off + 12;
+        let desc_off = name_off + align4(namesz);
+        let next = desc_off + align4(descsz);
+        if next > len || desc_off > len {
+            break; // malformed/truncated — stop rather than read out of bounds
+        }
+
+        if ntype == NT_GNU_BUILD_ID && namesz == 4 {
+            let name = unsafe { std::slice::from_raw_parts(start.add(name_off), 4) };
+            if name == b"GNU\0" && descsz > 0 {
+                let desc = unsafe { std::slice::from_raw_parts(start.add(desc_off), descsz) };
+                return Some(hex_lower(desc));
+            }
+        }
+        off = next;
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
     // Widths of `p_vaddr`/`p_memsz` differ between Elf32/Elf64 phdrs, so the
     // `as u64` casts are needed for portability even where they are no-ops.
     #[allow(clippy::unnecessary_cast)]
@@ -491,18 +577,31 @@ fn snapshot_modules() -> Vec<(usize, usize, String)> {
         data: *mut libc::c_void,
     ) -> libc::c_int {
         unsafe {
-            let modules = &mut *(data as *mut Vec<(usize, usize, String)>);
+            let modules = &mut *(data as *mut Vec<(usize, usize, String, String)>);
             let info = &*info;
             let base = info.dlpi_addr as usize;
-            // Module extent = the highest `p_vaddr + p_memsz` over PT_LOAD
-            // segments (relative to the load base), so recovery can bound offsets.
+            // One phdr walk yields both the module extent (highest
+            // `p_vaddr + p_memsz` over PT_LOAD, so recovery can bound offsets)
+            // and the GNU build-id from PT_NOTE — the identity the symbol store
+            // is keyed on.
             let mut extent: u64 = 0;
+            let mut code_id = String::new();
             if !info.dlpi_phdr.is_null() && info.dlpi_phnum > 0 {
                 let phdrs = std::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize);
                 for ph in phdrs {
                     if ph.p_type == libc::PT_LOAD {
                         let end = (ph.p_vaddr as u64).saturating_add(ph.p_memsz as u64);
                         extent = extent.max(end);
+                    } else if ph.p_type == libc::PT_NOTE && code_id.is_empty() {
+                        // PT_NOTE p_vaddr is link-time; add the load bias.
+                        let addr = base.wrapping_add(ph.p_vaddr as usize);
+                        if addr != 0 {
+                            if let Some(id) =
+                                gnu_build_id_from_notes(addr as *const u8, ph.p_memsz as usize)
+                            {
+                                code_id = id;
+                            }
+                        }
                     }
                 }
             }
@@ -519,11 +618,11 @@ fn snapshot_modules() -> Vec<(usize, usize, String)> {
             } else {
                 basename(&name)
             };
-            modules.push((base, extent as usize, name));
+            modules.push((base, extent as usize, code_id, name));
         }
         0
     }
-    let mut modules: Vec<(usize, usize, String)> = Vec::new();
+    let mut modules: Vec<(usize, usize, String, String)> = Vec::new();
     unsafe {
         libc::dl_iterate_phdr(Some(collect), &mut modules as *mut _ as *mut libc::c_void);
     }
@@ -531,7 +630,7 @@ fn snapshot_modules() -> Vec<(usize, usize, String)> {
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-fn snapshot_modules() -> Vec<(usize, usize, String)> {
+fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
     Vec::new()
 }
 

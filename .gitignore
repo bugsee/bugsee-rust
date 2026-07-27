@@ -30,3 +30,7 @@ target
 # Bugsee test/scratch artifacts
 *.bundle.zip
 /scratch
+
+# Python bytecode from the integration harness
+__pycache__/
+*.pyc

@@ -283,6 +283,176 @@ fn native_crash_signature_from_module_offsets() {
     );
 }
 
+/// Persist a panic snapshot the way the observer's hook does, with one hidden
+/// SDK frame ahead of the application frame.
+fn seed_panic_info(gen_dir: &Path, reason: &str) {
+    use bugsee_core::model::crash::{Frame, FrameData};
+    use bugsee_core::panic_info::{PanicInfo, PANIC_INFO_NAME};
+
+    let frame = |trace: &str, hidden: bool| Frame {
+        trace: trace.into(),
+        hidden,
+        data: FrameData {
+            source: Some("src/main.rs".into()),
+            member_class: None,
+            member: None,
+            line: 25,
+        },
+    };
+    let info = PanicInfo {
+        reason: reason.to_string(),
+        file: Some("src/main.rs".into()),
+        line: 25,
+        column: 13,
+        timestamp: 1_720_531_200_000,
+        frames: vec![
+            frame("bugsee_panic::capture_frames", true),
+            frame("app::checkout::pay", false),
+        ],
+    };
+    info.write_to(&gen_dir.join(PANIC_INFO_NAME)).unwrap();
+}
+
+#[test]
+fn lone_panic_snapshot_is_recovered_as_a_fatal_panic() {
+    // An uncaught UNWINDING panic (the Rust default): the hook persisted a
+    // snapshot, nothing caught it (a contained panic's snapshot is deleted by
+    // `report_caught`), and the liveness marker survived because Recorder::drop
+    // saw `thread::panicking()`. That must surface as the panic itself, NOT as a
+    // generic abnormal exit — previously this case went entirely unreported.
+    let dir = TempDir::new();
+    seed_alive_marker(&dir.path, 1);
+    let gen_dir = dir.path.join("parts").join("1");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    seed_panic_info(&gen_dir, "checkout exploded");
+
+    let report = build_report(&find_pending(&dir.path, 2)[0], 1_720_531_200_000);
+    let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
+
+    assert_eq!(
+        crash["exception_type"],
+        json!("exception"),
+        "managed variant"
+    );
+    assert_eq!(crash["handled"], json!(false), "a fatal panic is unhandled");
+    assert_eq!(crash["ndkCrash"], json!(false));
+    assert_eq!(crash["exception"]["name"], json!("panic"));
+    assert!(
+        crash["exception"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("checkout exploded"),
+        "the panic message is preserved: {:?}",
+        crash["exception"]["reason"]
+    );
+    assert_ne!(
+        crash["exception"]["name"], "AppExit",
+        "must not degrade to the generic abnormal-exit report"
+    );
+    assert_eq!(
+        crash["signatures"].as_array().map(|s| s.len()),
+        Some(1),
+        "carries a client dedup signature"
+    );
+}
+
+#[test]
+fn no_panic_snapshot_still_reports_an_abnormal_exit() {
+    // Regression guard for the other half of the branch: a session that died
+    // with neither a native signal nor a panic snapshot (OOM kill, SIGKILL) is
+    // still the generic abnormal-exit report.
+    let dir = TempDir::new();
+    seed_alive_marker(&dir.path, 1);
+    std::fs::create_dir_all(dir.path.join("parts").join("1")).unwrap();
+
+    let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+    let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
+    assert_eq!(crash["exception"]["name"], json!("AppExit"));
+}
+
+#[test]
+fn native_crash_json_carries_modules_with_code_id_and_relative_frames() {
+    // The symbolication contract: the backend keys its symbol store on a module's
+    // code id (Mach-O LC_UUID / GNU build-id) and resolves `reladdr` within it.
+    // Without these fields a native crash can never be symbolicated, no matter
+    // what symbols the user uploads.
+    let dir = TempDir::new();
+    seed_alive_marker(&dir.path, 1);
+    let gen_dir = dir.path.join("parts").join("1");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    std::fs::write(
+        gen_dir.join("crash.info"),
+        "signal=11\ncode=1\naddress=0x0\ntime=0\nframe=0x1100\nframe=0x2200\n",
+    )
+    .unwrap();
+    // base <TAB> size <TAB> code_id <TAB> name
+    std::fs::write(
+        gen_dir.join("crash.modules"),
+        "1000\t1000\tabcdef0123456789abcdef0123456789\tMyApp\n\
+         2000\t1000\t\tlibnoid.so\n",
+    )
+    .unwrap();
+
+    let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+    let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
+
+    let modules = crash["modules"].as_array().expect("modules array");
+    assert_eq!(modules.len(), 2);
+    assert_eq!(modules[0]["filename"], "MyApp");
+    assert_eq!(modules[0]["base_addr"], "0x1000");
+    assert_eq!(modules[0]["end_addr"], "0x2000");
+    assert_eq!(
+        modules[0]["code_id"], "abcdef0123456789abcdef0123456789",
+        "the symbol-store lookup key must reach the wire"
+    );
+    // A module with no build-id is still reported (address context) but carries
+    // no code_id — it simply cannot resolve.
+    assert!(
+        modules[1].get("code_id").is_none(),
+        "an empty code id must be omitted, not sent as \"\": {:?}",
+        modules[1]
+    );
+
+    let frames = crash["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0]["addr"], "0x1100");
+    assert_eq!(frames[0]["module"], "MyApp");
+    assert_eq!(frames[0]["reladdr"], 0x100, "module-relative offset");
+    assert_eq!(frames[1]["module"], "libnoid.so");
+    assert_eq!(frames[1]["reladdr"], 0x200);
+}
+
+#[test]
+fn legacy_module_map_formats_still_recover() {
+    // A marker written by an older SDK build and recovered after an upgrade must
+    // still produce a report (no code_id, and for the 2-field form no bounds).
+    for map in [
+        "1000\t1000\tMyApp\n", // base, size, name
+        "1000\tMyApp\n",       // base, name
+    ] {
+        let dir = TempDir::new();
+        seed_alive_marker(&dir.path, 1);
+        let gen_dir = dir.path.join("parts").join("1");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(
+            gen_dir.join("crash.info"),
+            "signal=11\ncode=1\naddress=0x0\ntime=0\nframe=0x1100\n",
+        )
+        .unwrap();
+        std::fs::write(gen_dir.join("crash.modules"), map).unwrap();
+
+        let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+        let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
+        let modules = crash["modules"].as_array().expect("modules array");
+        assert_eq!(modules[0]["filename"], "MyApp", "map: {map:?}");
+        assert!(modules[0].get("code_id").is_none(), "map: {map:?}");
+        // Still signs, so the crash-loop blacklist keeps working.
+        assert!(crash["signatures"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()));
+    }
+}
+
 #[test]
 fn native_signature_skips_pc_outside_every_module_range() {
     // A PC that falls outside every module's [base, base+size) range (e.g. a

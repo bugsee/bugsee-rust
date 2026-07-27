@@ -29,6 +29,7 @@ pub struct LaunchOptions {
     pub(crate) endpoint: Option<String>,
     pub(crate) transport: Option<Arc<dyn Transport>>,
     pub(crate) native_crash_capture: bool,
+    pub(crate) report_panics_from_hook: bool,
     pub(crate) system_telemetry: bool,
     pub(crate) before_send: Option<BeforeSend>,
     pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
@@ -48,6 +49,7 @@ impl LaunchOptions {
             endpoint: None,
             transport: None,
             native_crash_capture: true,
+            report_panics_from_hook: false,
             system_telemetry: true,
             before_send: None,
             before_breadcrumb: None,
@@ -77,6 +79,31 @@ impl LaunchOptions {
     /// Disable when the host already owns native crash handling.
     pub fn native_crash_capture(mut self, enabled: bool) -> Self {
         self.native_crash_capture = enabled;
+        self
+    }
+
+    /// Report panics **immediately from the panic hook** instead of the default
+    /// mark-and-recover behaviour (default `false`).
+    ///
+    /// By default the hook only captures: a panic caught at an SDK boundary is
+    /// reported there as `handled`, and an uncaught panic that terminates the
+    /// process is reported on the **next launch** by recovery. That keeps the
+    /// fault path minimal — no allocation, disk or network work on the panicking
+    /// thread.
+    ///
+    /// Enable this to deliver the report during the panic instead. Two reasons
+    /// to want it:
+    /// - **immediacy** — the report does not wait for a next launch, which
+    ///   matters for short-lived processes that may never restart;
+    /// - **thread panics** — a panic that kills a non-main thread never unwinds
+    ///   out of `main`, so there is no process death for recovery to observe and
+    ///   the default mode will not report it.
+    ///
+    /// The cost is that reporting runs on the panicking thread. Pair it with a
+    /// `flush` in your own hook/shutdown path if you need delivery guaranteed
+    /// before the process dies.
+    pub fn report_panics_from_hook(mut self, enabled: bool) -> Self {
+        self.report_panics_from_hook = enabled;
         self
     }
 
