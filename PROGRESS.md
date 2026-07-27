@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-07-26 · `main` @ `82a1fed` (pushed, CI green) · 104 tests · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps). Working tree clean._
+_Snapshot: 2026-07-27 · `main` @ `51f4dc7` (pushed, CI green) · 116 tests · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps). Working tree clean._
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
@@ -27,17 +27,91 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 0 — Harness | ✅ | Workspace, mock 3-step API server, bundle validator, subprocess crash runner, CI (build/test/clippy/fmt + pinned-MSRV job). |
 | 1 — Ingestible bundle (core) | ✅ | Sliding-window capture (time/byte/event caps), length-prefixed part streams, envelope/manifest, Zstd method-93 ZIP, signatures. |
 | 2 — Handled errors + caught panics | ✅ | `catch_unwind` guards, panic snapshot, error/cause chains. Follow-ups: `tracing` Layer + `log` adapter done. Subsystem quarantine still open. |
-| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation. **New:** client-side native dedup signature from frame offsets. Open: best-effort in-flight flush, full out-of-process minidump. |
+| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** code-id-bearing module maps (natives are now symbolicatable) and uncaught-unwinding-panic reporting. Open: best-effort in-flight flush, full out-of-process minidump. |
 | 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. Open: sessions / release-health. |
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
 
-## Recent work — backend ingestion wired end-to-end (`appserver` + `worker`)
+## Recent work — the symbol pipeline, end to end (`f224188`, `3e2f9bf`, `51f4dc7`)
+
+Closing the last gap between "a Rust crash arrives" and "a Rust crash is
+readable". Landed as three steps across four repos, each validated by a
+cross-repo harness that builds a real binary and feeds its real crash documents
+to the real worker code.
+
+- **Native crashes are symbolicatable (was a hard blocker).** The backend symbol
+  store is keyed on a module's **code id** — Mach-O `LC_UUID` / GNU build-id, the
+  same identity `symbolic` extracts from an uploaded symbol file — but the SDK
+  reported only base/size/name, so **no upload could ever match, whatever the user
+  did**. `bugsee-native` now captures the code id inside the walks it already
+  performed (`LC_UUID` from the Mach-O load commands; the GNU build-id from
+  `PT_NOTE` during the `dl_iterate_phdr` pass, with bounds-checked note
+  iteration), and recovery emits `modules[]`
+  (`base_addr`/`end_addr`/`code_id`/`filename`) + `frames[]`
+  (`addr`/`module`/`reladdr`) in the worker's existing shape. Both older
+  module-map formats still parse, so a marker written by a previous build still
+  recovers after an upgrade.
+- **Uncaught panics are reported.** The global hook only *captured*; reporting
+  happened at a `catch_unwind` boundary — so an uncaught **unwinding** panic (the
+  Rust default) unwound out of `main`, dropped the guard, shut the SDK down
+  "cleanly", removed the liveness marker, and **was never reported**.
+  `Recorder::drop` now keeps the marker when it observes `thread::panicking()`
+  (the process is dying *from* this panic) so next-launch recovery reports it via
+  `build_fatal_panic`. A panic on a **non-main** thread is reported inline from
+  the hook instead — it kills only that thread, so there is no process death for
+  recovery to observe, and no crash-time isolation concern either. It is recorded
+  as a **non-fatal error** (counting it as a crash would corrupt crash-free-session
+  rates), annotated with the thread name. Inline reporting is gated on a
+  thread-local guard depth so a panic one of our boundaries will catch is never
+  reported twice. Opt-in `report_panics_from_hook` extends inline reporting to
+  main-thread panics for short-lived processes that may never restart.
+- **Frame attribution fix.** The reported crash site was a panic-runtime frame,
+  not user code — every panic unwinds through the same shims, so distinct bugs
+  collapsed into one group. Two causes: the `__rustc[<hash>]::` shim namespace
+  matched nothing, and `starts_with("bugsee")` hid the **user's** frames whenever
+  their crate name began with `bugsee`. Both near-duplicate predicates replaced by
+  one `is_internal_frame` in `bugsee-core` matching on the full first path segment.
+
+  ```text
+  before: panic at <alloc::boxed::Box<F,A> as ...>::call (boxed.rs:2220)
+  after:  panic at bugsee_e2e_app::main (src/main.rs:25)
+  ```
+- **Self-describing crash documents — the `source_*` triple.** Every `crash.json`
+  now carries `source_sdk` (`"rust"`), `source_platform` and `source_arch`.
+  Routing previously depended solely on `request.json`'s `environment.sdk.type`,
+  but the two documents **do not travel together**: on the worker's
+  resymbolication path `crash.json` is fetched from S3 while `environment` comes
+  from a separate `api.get_recording` call, so a missing environment left the
+  crash unroutable and it fell through to the platform-guessing branches.
+  `environment.sdk.type` remains the fallback. All three values come from one
+  source of truth shared with the `environment` builder, so a document cannot
+  contradict its own environment. `source_arch` deliberately reports the
+  **symbol-pipeline** spelling (`aarch64` → `arm64`): the worker's
+  `normalize_arch` only strips ISA suffixes, it does not translate between
+  vocabularies, so the Rust spelling would never match its own symbols.
+- **Supporting work in the other repos:** `worker` gained Windows **PDB** support
+  (`symbolfiles/pdb.py`, MSF magic sniffing, `symbolic`-based debug-id
+  identification) and Rust native frame symbolication against the symbol store;
+  `bugsee-cli` gained PDB discovery + upload; the wire contract in
+  `report-bundle-structure` documents the triple (`bundle/crash.md`,
+  `platforms/rust.md`) including the load-bearing arch-normalization rule.
+- **Cross-repo integration harness** (`tests/integration/rust_worker_e2e.py`):
+  generates a Cargo project, builds it **twice** (`panic = "abort"` and
+  `"unwind"`) with `debug = 1` + `-Wl,--build-id`, crashes it three ways, recovers,
+  and feeds the real `crash.json` to the real `crash/rust.py`. Load-bearing
+  assertion: the runtime `code_id` matches the one read back off the built binary,
+  proving three-way identity agreement (SDK runtime ↔ CLI upload ↔ worker
+  normalization).
+
+## Recent work — backend ingestion wired end-to-end (`appserver` + `worker`, merged)
 
 Cross-repo change landing the Rust ingestion contract (DESIGN §15, now closed).
-Routing keys off **`environment.sdk.type == "rust"`**, mirroring the JS SDK —
-required because Rust reports an OS-typed `platform.type`, so a `macos` report
-would otherwise land in the worker's Apple/Mach-O branch.
+**All six changes are merged to `origin/master` in both repos** — the ingestion
+path is live, not just code-complete. Routing keys off **`crash.json`'s
+`source_sdk`**, with `environment.sdk.type == "rust"` as the fallback for
+documents that predate the field — required because Rust reports an OS-typed
+`platform.type`, so a `macos` report would otherwise land in the worker's
+Apple/Mach-O branch.
 
 - **`rust` (this repo):** `Environment.sdk` now carries `type: "rust"`
   (`model/environment.rs::SDK_TYPE`) — it previously had **no** `type` field at
@@ -152,6 +226,23 @@ and build/MSRV. Fixed (all validated):
 - **Build:** MSRV → 1.86 (icu/idna floor), `Cargo.lock` committed, CI msrv `--locked`.
 
 ## Open items
+
+### Next up — actionable now
+
+1. **Rust symbol-upload ergonomics in `bugsee-cli`.** Uploading works; *discoverability*
+   doesn't. Needs (a) preflight checks warning when the host project lacks
+   `[profile.release] debug = 1`, `split-debuginfo = "packed"` (macOS) or
+   `-Wl,--build-id` (Linux) — without these the upload silently produces symbols that
+   resolve nothing; (b) Rust-aware discovery so `bugsee upload ./target/release` infers
+   `--type` per host (dSYM / ELF-with-build-id / PDB) instead of demanding the flag;
+   (c) docs + a CI recipe for build → collect → upload.
+2. **Verify ingestion against the merged backend.** The harness has only ever run against
+   local worker branches; worth one pass on a dev deployment now that everything is on
+   `master`, confirming a real bundle routes, symbolicates and groups.
+3. **Cross-SDK adoption of the `source_*` triple.** It is documented as Rust-only
+   (`— — ✓` in `bundle/crash.md`). iOS/Android/JS adoption would let the worker drop its
+   environment-fallback routing entirely. Their work, not ours — but the contract is
+   written and merged, so it can be raised now.
 
 ### Deferred review findings — need a decision before building
 
