@@ -106,30 +106,51 @@ fn capture_error_message_and_result_ext() {
     let bundles = mock.uploaded_bundles.lock().unwrap();
     assert_eq!(bundles.len(), 3, "three error reports delivered");
 
-    // The first is the capture_error report: error issue + crash.json chain.
-    let req = request_json_in(&bundles[0]);
-    assert_eq!(req["type"], "error");
-    assert_eq!(req["source"]["type"], "error");
-    assert_eq!(req["signatures"].as_array().unwrap().len(), 1);
+    // Match reports by CONTENT, never by index. Delivery drains a queue
+    // directory, and readdir order is filesystem-dependent — stable on APFS but
+    // hash-ordered on ext4, which made indexing pass locally on macOS and fail
+    // intermittently on the Linux CI runner.
+    let reports: Vec<(Value, Value)> = bundles
+        .iter()
+        .map(|b| (request_json_in(b), crash_json_in(b)))
+        .collect();
+    let by_name = |name: &str| -> Vec<&(Value, Value)> {
+        reports
+            .iter()
+            .filter(|(_, c)| c["exception"]["name"] == name)
+            .collect()
+    };
 
-    let crash = crash_json_in(&bundles[0]);
-    assert_eq!(crash["handled"], true);
-    assert_eq!(crash["ndkCrash"], false);
-    assert_eq!(crash["exception_type"], "error");
+    // `name` is the SHORT type name, not the fully-qualified path — asserted
+    // here by the fact that these two lookups find anything at all.
+    let messages = by_name("Message");
+    let errors = by_name("CheckoutError");
+    assert_eq!(messages.len(), 1, "exactly one capture_message report");
     assert_eq!(
-        crash["exception"]["name"], "CheckoutError",
-        "short type name"
+        errors.len(),
+        2,
+        "capture_error AND ResultExt::capture each report"
     );
-    assert_eq!(crash["exception"]["reason"], "checkout failed");
-    assert_eq!(
-        crash["exception"]["cause"]["reason"], "inner boom",
-        "source() chain captured"
-    );
-    // Signature is shared between request.json and crash.json.
-    assert_eq!(req["signatures"][0], crash["signatures"][0]);
 
-    // The message report.
-    let msg_crash = crash_json_in(&bundles[1]);
-    assert_eq!(msg_crash["exception"]["name"], "Message");
+    // Both error reports must carry the same shape, so this covers the
+    // ResultExt path too — previously only the first bundle was inspected.
+    for (req, crash) in errors {
+        assert_eq!(req["type"], "error");
+        assert_eq!(req["source"]["type"], "error");
+        assert_eq!(req["signatures"].as_array().unwrap().len(), 1);
+
+        assert_eq!(crash["handled"], true);
+        assert_eq!(crash["ndkCrash"], false);
+        assert_eq!(crash["exception_type"], "error");
+        assert_eq!(crash["exception"]["reason"], "checkout failed");
+        assert_eq!(
+            crash["exception"]["cause"]["reason"], "inner boom",
+            "source() chain captured"
+        );
+        // Signature is shared between request.json and crash.json.
+        assert_eq!(req["signatures"][0], crash["signatures"][0]);
+    }
+
+    let (_, msg_crash) = messages[0];
     assert_eq!(msg_crash["exception"]["reason"], "something looked off");
 }
