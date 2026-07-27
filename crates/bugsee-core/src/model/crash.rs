@@ -123,6 +123,20 @@ pub struct ExceptionInfo {
 /// The `crash.json` document (managed variant).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashReport {
+    /// Which SDK produced this crash document — always [`SOURCE_SDK`].
+    ///
+    /// Makes `crash.json` **self-describing** so the backend can pick its
+    /// processor from the document itself. Routing previously depended solely on
+    /// `request.json`'s `environment.sdk.type`, but the two do not travel
+    /// together: on the worker's resymbolication path `crash.json` is fetched
+    /// from S3 while `environment` comes from a separate API/DB read, so a
+    /// missing or partial environment leaves the crash unroutable (or
+    /// mis-routed to a platform-guessing fallback).
+    ///
+    /// Consumers treat this as authoritative and fall back to
+    /// `environment.sdk.type` when absent, so documents from SDKs that do not
+    /// yet emit it keep working unchanged.
+    pub source_sdk: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
     pub timestamp: i64,
@@ -139,6 +153,11 @@ pub struct CrashReport {
     pub exception: ExceptionInfo,
 }
 
+/// The value every `crash.json` this SDK writes carries in `source_sdk`.
+/// Deliberately the same identifier as `environment.sdk.type` (see
+/// [`crate::model::environment::SDK_TYPE`]) so the two can never disagree.
+pub const SOURCE_SDK: &str = crate::model::environment::SDK_TYPE;
+
 impl CrashReport {
     /// Build a handled-error crash payload (`handled=true`, managed variant).
     pub fn handled_error(
@@ -149,6 +168,7 @@ impl CrashReport {
         timestamp: i64,
     ) -> Self {
         CrashReport {
+            source_sdk: SOURCE_SDK.to_string(),
             uuid: None,
             timestamp,
             handled: true,

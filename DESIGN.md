@@ -305,9 +305,18 @@ worker's Apple/Mach-O branch and a handled Rust error into the managed generic p
    `utils.isValidForClient` accepts `x-client-type: rust` only for a `rust` app.
    `isSupportedSdkVersion` reads a **flat** floor from `cfg.core.sdk.rust` (one
    crate family across every OS — unlike the JS per-runtime floor).
-2. **Rust `crash.json` shape** — *done*. The SDK now stamps `environment.sdk.type
-   = "rust"` (`model/environment.rs::SDK_TYPE`) and `worker/jobs/bundle.py` routes
-   on it to the new **`worker/crash/rust.py`**, which handles both variants:
+2. **Rust `crash.json` shape** — *done*. Every `crash.json` this SDK writes carries
+   **`source_sdk: "rust"`**, making the document **self-describing**: the backend
+   picks its processor from the crash document itself rather than from a second
+   file. This matters because the two do not travel together — on the worker's
+   resymbolication path `crash.json` is read from S3 while `environment` comes
+   from a separate `api.get_recording` call, so a missing or partial environment
+   previously left the crash unroutable (and, before the accompanying guard fix,
+   raised before routing even ran). `environment.sdk.type = "rust"`
+   (`model/environment.rs::SDK_TYPE`) remains as the **fallback**, so SDKs that do
+   not emit `source_sdk` yet route exactly as before. `worker/jobs/bundle.py`
+   resolves the two with `_crash_source_sdk()` and dispatches to the new
+   **`worker/crash/rust.py`**, which handles both variants:
    the *managed* one (panic / handled error: `exception` + `frames` + `cause`
    chain) and the thin *native* one (`exception_type: "native"`, `signal{…}`,
    plus the generic minidump processor when a dump was harvested).

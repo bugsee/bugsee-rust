@@ -314,6 +314,89 @@ fn seed_panic_info(gen_dir: &Path, reason: &str) {
 }
 
 #[test]
+fn every_crash_json_variant_identifies_its_source_sdk() {
+    // `source_sdk` makes crash.json self-describing so the backend can pick a
+    // processor from the document itself. This matters because the two documents
+    // do NOT travel together: on the worker's resymbolication path crash.json is
+    // fetched from S3 while `environment` (the previous sole routing key) comes
+    // from a separate API read, and an absent/partial environment leaves the
+    // crash unroutable. Every variant must carry it — a single one that doesn't
+    // is a report the backend can silently mis-route.
+    /// Seeds one generation's on-disk state to produce a given crash variant.
+    type SeedFn = Box<dyn Fn(&Path)>;
+
+    let variants: Vec<(&str, SeedFn)> = vec![
+        (
+            "native",
+            Box::new(|gen_dir: &Path| {
+                std::fs::write(
+                    gen_dir.join("crash.info"),
+                    "signal=11\ncode=1\naddress=0x0\ntime=0\n",
+                )
+                .unwrap();
+            }),
+        ),
+        (
+            "correlated aborting panic",
+            Box::new(|gen_dir: &Path| {
+                std::fs::write(
+                    gen_dir.join("crash.info"),
+                    "signal=6\ncode=0\naddress=0x0\ntime=1720531200000\n",
+                )
+                .unwrap();
+                seed_panic_info(gen_dir, "aborted");
+            }),
+        ),
+        (
+            "fatal unwinding panic",
+            Box::new(|gen_dir: &Path| seed_panic_info(gen_dir, "unwound")),
+        ),
+        ("abnormal exit", Box::new(|_gen_dir: &Path| {})),
+    ];
+
+    for (label, seed) in variants {
+        let dir = TempDir::new();
+        seed_alive_marker(&dir.path, 1);
+        let gen_dir = dir.path.join("parts").join("1");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        seed(&gen_dir);
+
+        let report = build_report(&find_pending(&dir.path, 2)[0], 1_720_531_200_000);
+        let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
+        assert_eq!(
+            crash["source_sdk"], "rust",
+            "{label} variant must identify its source SDK"
+        );
+    }
+
+    // The live (non-recovery) paths too.
+    for (label, built) in [
+        (
+            "handled error",
+            bugsee_core::errors::build_handled_error("E", "boom", &[], vec![], 1),
+        ),
+        (
+            "caught panic",
+            bugsee_core::errors::build_panic("boom", vec![], true, 1),
+        ),
+        (
+            "uncaught panic",
+            bugsee_core::errors::build_panic("boom", vec![], false, 1),
+        ),
+        (
+            "message",
+            bugsee_core::errors::build_message("looked off", vec![], 1),
+        ),
+    ] {
+        let crash: Value = serde_json::from_slice(&built.crash_json).unwrap();
+        assert_eq!(
+            crash["source_sdk"], "rust",
+            "{label} must identify its source SDK"
+        );
+    }
+}
+
+#[test]
 fn lone_panic_snapshot_is_recovered_as_a_fatal_panic() {
     // An uncaught UNWINDING panic (the Rust default): the hook persisted a
     // snapshot, nothing caught it (a contained panic's snapshot is deleted by

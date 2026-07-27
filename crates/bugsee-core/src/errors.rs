@@ -12,7 +12,7 @@
 
 use serde_json::Map;
 
-use crate::model::crash::{CrashReport, ExceptionInfo, Frame};
+use crate::model::crash::{CrashReport, ExceptionInfo, Frame, SOURCE_SDK};
 use crate::model::enums::{IssueType, Severity, TriggerType};
 use crate::model::report::Source;
 use crate::reporting::ReportMeta;
@@ -59,6 +59,7 @@ pub fn build_handled_error(
     }
 
     let crash = CrashReport {
+        source_sdk: SOURCE_SDK.to_string(),
         uuid: None,
         timestamp,
         handled: true,
@@ -98,6 +99,7 @@ pub fn build_panic(reason: &str, frames: Vec<Frame>, handled: bool, timestamp: i
     let signature = panic_signature("panic", reason, &frame_sigs, handled, None);
 
     let crash = CrashReport {
+        source_sdk: SOURCE_SDK.to_string(),
         uuid: None,
         timestamp,
         handled,
