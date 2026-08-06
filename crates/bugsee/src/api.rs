@@ -83,6 +83,11 @@ impl Bugsee {
         config.before_send = options.before_send;
         config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
+        config.app_identity = bugsee_core::model::environment::AppIdentity {
+            package_id: options.app_package_id.clone(),
+            version: options.app_version.clone(),
+            build: options.app_build.clone(),
+        };
 
         // Environment facts are gathered regardless of `system_telemetry`: that
         // flag governs periodic SAMPLING (traces.system), whereas these are

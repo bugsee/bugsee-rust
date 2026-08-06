@@ -93,6 +93,8 @@ use bugsee::{Bugsee, LaunchOptions};
 fn launch(data_dir: &str) -> bugsee::LaunchGuard {
     Bugsee::launch_with(
         LaunchOptions::new(env!("BUGSEE_APP_TOKEN"))
+            .app_version(bugsee::app_version!())
+            .app_build("1")
             .data_dir(data_dir)
             .endpoint(env!("BUGSEE_ENDPOINT").to_string())
             .native_crash_capture(true),
@@ -370,14 +372,9 @@ def main() -> int:
 
     print(f"\nendpoint : {cfg['base']}  (SDK uses {cfg['sdk_endpoint']})")
     print(f"cli      : {cfg['cli']}")
-    # NOTE: this version reaches the SYMBOL document only. The SDK does not
-    # report an app version at all — `Environment::detect` leaves
-    # `environment.app.version`/`.build` unset and `LaunchOptions` has no
-    # setter — so the issue will carry no version and cannot be found by one.
-    # Symbol resolution is unaffected: the worker looks symbols up by `uuid`
-    # scoped to the app (`crash/rust.py`, `api.get_symbol_files`), and version
-    # is not part of that key.
-    print(f"version  : {version}   (symbol document only — see the note below)")
+    # The generated app passes this through `LaunchOptions::app_version`, so it
+    # rides BOTH the symbol document and the crash report and the two agree.
+    print(f"version  : {version}   (app + symbol document)")
     print(f"workdir  : {workdir}\n")
 
     try:
@@ -438,10 +435,8 @@ Module identity of the build:
 Delivered. What to verify — none of it is assertable from here, since
 it all lives in the deployment's database:
 
-  1. A new crash issue exists, most recent first. It will carry NO app
-     version — the SDK never sets `environment.app.version` — so find
-     it by recency, not by {version}, which reached the symbol
-     document only.
+  1. A new crash issue exists, carrying app version {version} —
+     the same value the symbols were uploaded under.
   2. It routed as a Rust crash (source_sdk == "rust"), not through a
      platform-guessing branch.
   3. Frames RESOLVED to bugsee_deploy_e2e::main and friends rather

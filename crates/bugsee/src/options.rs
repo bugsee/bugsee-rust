@@ -21,6 +21,9 @@ use bugsee_core::transport::Transport;
 /// Configuration passed to [`crate::Bugsee::launch_with`].
 pub struct LaunchOptions {
     pub(crate) app_token: String,
+    pub(crate) app_version: Option<String>,
+    pub(crate) app_build: Option<String>,
+    pub(crate) app_package_id: Option<String>,
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) max_window: Duration,
     pub(crate) max_bytes: u64,
@@ -41,6 +44,9 @@ impl LaunchOptions {
     pub fn new(app_token: impl Into<String>) -> Self {
         LaunchOptions {
             app_token: app_token.into(),
+            app_version: None,
+            app_build: None,
+            app_package_id: None,
             data_dir: None,
             max_window: Duration::from_secs(60),
             max_bytes: 8 << 20,
@@ -148,6 +154,31 @@ impl LaunchOptions {
     }
 
     /// Override the API base URL (defaults to `https://api.bugsee.com/v2`).
+    /// The application's version, e.g. `"1.4.2"`.
+    ///
+    /// Without it an issue carries no version at all: it cannot be filtered by
+    /// release, and regressions cannot be tracked across builds. The SDK cannot
+    /// infer it — `env!("CARGO_PKG_VERSION")` inside this crate is the SDK's own
+    /// version — so pass [`crate::app_version!`], which expands in YOUR crate.
+    pub fn app_version(mut self, version: impl Into<String>) -> Self {
+        self.app_version = Some(version.into());
+        self
+    }
+
+    /// The application's build number, if it has one distinct from the version.
+    pub fn app_build(mut self, build: impl Into<String>) -> Self {
+        self.app_build = Some(build.into());
+        self
+    }
+
+    /// Overrides the application identifier, which otherwise defaults to the
+    /// executable's file name. Use a bundle-id-style string
+    /// (`"com.example.app"`) to match how the mobile SDKs report it.
+    pub fn app_package_id(mut self, package_id: impl Into<String>) -> Self {
+        self.app_package_id = Some(package_id.into());
+        self
+    }
+
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
         self

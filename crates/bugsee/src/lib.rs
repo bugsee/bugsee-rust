@@ -35,6 +35,37 @@ mod telemetry;
 #[cfg(feature = "net")]
 pub mod transport;
 
+/// Your application's version, read from `CARGO_PKG_VERSION` at the call site.
+///
+/// The SDK cannot read it itself: `env!("CARGO_PKG_VERSION")` compiled inside
+/// this crate yields the SDK's version, not yours. A `macro_rules!` macro
+/// expands in the CALLING crate, so `env!` here sees your `Cargo.toml`.
+///
+/// ```no_run
+/// use bugsee::{Bugsee, LaunchOptions};
+/// let _guard = Bugsee::launch_with(
+///     LaunchOptions::new("APP_TOKEN").app_version(bugsee::app_version!()),
+/// );
+/// ```
+#[macro_export]
+macro_rules! app_version {
+    () => {
+        env!("CARGO_PKG_VERSION")
+    };
+}
+
+/// Your crate's name, for use as the application identifier.
+///
+/// Same call-site expansion as [`app_version!`]. Without it the identifier
+/// falls back to the executable's file name, which is usually the same thing
+/// but is whatever the binary was renamed to.
+#[macro_export]
+macro_rules! app_package_id {
+    () => {
+        env!("CARGO_PKG_NAME")
+    };
+}
+
 pub use api::{Bugsee, LaunchGuard, ResultExt};
 pub use options::LaunchOptions;
 pub use perf::{Span, Transaction};

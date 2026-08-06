@@ -93,6 +93,9 @@ pub struct RecorderConfig {
     /// Facts core cannot see from `std` alone (OS version, memory). Supplied by
     /// the host layer; absent fields are simply omitted from the environment.
     pub host_facts: crate::model::environment::HostFacts,
+    /// Application identity (package id / version / build). Core cannot infer a
+    /// host's version, so it must be supplied; unset fields are omitted.
+    pub app_identity: crate::model::environment::AppIdentity,
     /// Base delay for upload retry backoff (doubles per attempt, capped at 300 s).
     pub upload_backoff_base: Duration,
     /// Optional callback to mutate or drop reports before delivery.
@@ -117,6 +120,7 @@ impl RecorderConfig {
             rotate_interval: Duration::from_secs(1),
             sampler: None,
             host_facts: Default::default(),
+            app_identity: Default::default(),
             upload_backoff_base: Duration::from_secs(30),
             before_send: None,
             before_breadcrumb: None,
@@ -213,7 +217,11 @@ impl Recorder {
     /// Start the workers and begin capturing. Recovers any prior session that
     /// ended abnormally, queueing it for delivery.
     pub fn launch(config: RecorderConfig, transport: Arc<dyn Transport>) -> std::io::Result<Self> {
-        let env = Environment::detect_with(&config.sdk_version, &config.host_facts);
+        let env = Environment::detect_with(
+            &config.sdk_version,
+            &config.host_facts,
+            &config.app_identity,
+        );
         let environment_json = serde_json::to_vec(&env).unwrap_or_default();
         let shared = Arc::new(Shared {
             scope: Mutex::new(Scope::default()),

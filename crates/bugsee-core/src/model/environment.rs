@@ -61,16 +61,22 @@ pub struct Platform {
 }
 
 /// Application identity and build.
+///
+/// `package_id` / `version` / `build` are the keys every other Bugsee SDK
+/// sends and the only ones the backend stores. This crate previously reported
+/// `name` and `path` instead — neither exists in the shared schema, so both
+/// were silently discarded on ingest and an issue's app block arrived empty.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct App {
+    /// Bundle/package identifier on the mobile SDKs. A Rust binary has no such
+    /// concept, so it defaults to the executable's file name and can be
+    /// overridden by the host.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub package_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
 }
 
 /// Best-effort GPU info (`hardware.gpu`), Android-compatible placement.
@@ -179,6 +185,25 @@ pub struct Environment {
     pub sdk: Sdk,
 }
 
+/// Application identity the host must supply — core cannot infer it.
+///
+/// A library cannot see its host's version: `env!("CARGO_PKG_VERSION")` inside
+/// this crate yields the SDK's own version, not the application's. The host
+/// passes it in, and `bugsee::app_version!()` makes that a one-liner by
+/// expanding `env!` at the CALL SITE, where `CARGO_PKG_*` describes the host
+/// crate.
+///
+/// Unset fields are omitted rather than guessed. Without a version an issue
+/// cannot be filtered or tracked across releases at all, so this is worth the
+/// one line of host configuration.
+#[derive(Debug, Clone, Default)]
+pub struct AppIdentity {
+    /// Defaults to the executable's file name when the host sets nothing.
+    pub package_id: Option<String>,
+    pub version: Option<String>,
+    pub build: Option<String>,
+}
+
 /// Facts the host layer can obtain but pure-`std` core cannot.
 ///
 /// `bugsee-core` deliberately has no host-integration dependencies, and `std`
@@ -217,12 +242,17 @@ impl Environment {
     /// nothing about memory. Prefer [`Environment::detect_with`], which layers
     /// in what the host can see.
     pub fn detect(sdk_version: &str) -> Self {
-        Self::detect_with(sdk_version, &HostFacts::default())
+        Self::detect_with(sdk_version, &HostFacts::default(), &AppIdentity::default())
     }
 
     /// Build the environment, enriched with host-supplied [`HostFacts`].
-    pub fn detect_with(sdk_version: &str, facts: &HostFacts) -> Self {
+    pub fn detect_with(sdk_version: &str, facts: &HostFacts, app: &AppIdentity) -> Self {
         let mut env = Self::detect_baseline(sdk_version);
+        if let Some(id) = &app.package_id {
+            env.app.package_id = Some(id.clone());
+        }
+        env.app.version = app.version.clone();
+        env.app.build = app.build.clone();
         env.platform.version = facts.os_version.clone();
         env.platform.kernel_version = facts.kernel_version.clone();
         env.platform.memory_total = facts.memory_total;
@@ -253,12 +283,11 @@ impl Environment {
                 ..Default::default()
             },
             app: App {
-                name: std::env::current_exe()
+                // The nearest thing a Rust binary has to a bundle id. The host
+                // can override it; nothing else can be inferred.
+                package_id: std::env::current_exe()
                     .ok()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
-                path: std::env::current_exe()
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned()),
                 ..Default::default()
             },
             hardware: Hardware {
@@ -346,7 +375,12 @@ mod tests {
             disk_free: Some(120000),
             locale: Some("en_US".into()),
         };
-        let v = serde_json::to_value(Environment::detect_with("1.0.0", &facts)).unwrap();
+        let v = serde_json::to_value(Environment::detect_with(
+            "1.0.0",
+            &facts,
+            &AppIdentity::default(),
+        ))
+        .unwrap();
 
         assert_eq!(v["platform"]["version"], "15.3.1");
         assert_eq!(v["platform"]["kernel_version"], "24.3.0");
@@ -384,8 +418,60 @@ mod tests {
     #[test]
     fn detect_is_detect_with_no_facts() {
         let a = serde_json::to_value(Environment::detect("9.9.9")).unwrap();
-        let b =
-            serde_json::to_value(Environment::detect_with("9.9.9", &HostFacts::default())).unwrap();
+        let b = serde_json::to_value(Environment::detect_with(
+            "9.9.9",
+            &HostFacts::default(),
+            &AppIdentity::default(),
+        ))
+        .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn app_identity_uses_the_keys_the_backend_actually_stores() {
+        // package_id / version / build are what iOS and Android send and what
+        // the schema keeps. `name` and `path` — which this SDK used to send —
+        // exist in neither, so they were discarded on ingest.
+        let app = AppIdentity {
+            package_id: Some("com.example.app".into()),
+            version: Some("1.4.2".into()),
+            build: Some("42".into()),
+        };
+        let v = serde_json::to_value(Environment::detect_with(
+            "1.0.0",
+            &HostFacts::default(),
+            &app,
+        ))
+        .unwrap();
+
+        assert_eq!(v["app"]["package_id"], "com.example.app");
+        assert_eq!(v["app"]["version"], "1.4.2");
+        assert_eq!(v["app"]["build"], "42");
+        let app_obj = v["app"].as_object().unwrap();
+        assert!(
+            !app_obj.contains_key("name"),
+            "`name` is not in the shared schema"
+        );
+        assert!(
+            !app_obj.contains_key("path"),
+            "`path` is not in the shared schema"
+        );
+    }
+
+    #[test]
+    fn package_id_falls_back_to_the_executable_name() {
+        // The nearest thing a Rust binary has to a bundle id, so an app that
+        // configures nothing is still identifiable.
+        let v = serde_json::to_value(Environment::detect("1.0.0")).unwrap();
+        let package_id = v["app"]["package_id"].as_str().unwrap_or("");
+        assert!(!package_id.is_empty(), "expected the executable name");
+    }
+
+    #[test]
+    fn an_unset_app_version_is_omitted_not_invented() {
+        let v = serde_json::to_value(Environment::detect("1.0.0")).unwrap();
+        let app = v["app"].as_object().unwrap();
+        assert!(!app.contains_key("version"));
+        assert!(!app.contains_key("build"));
     }
 }
