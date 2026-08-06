@@ -276,3 +276,132 @@ fn http_503_maps_to_transient() {
     );
     assert!(matches!(err, TransportError::Transient(_)), "got {err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Application errors on HTTP 200.
+//
+// Every test above uses a 4xx/5xx status, which encodes an assumption the real
+// API does not hold: it signals APPLICATION errors with an `ok:false` body and
+// HTTP **200**. `ureq` only produces `Error::Status` for 4xx/5xx, so the
+// envelope was never consulted on the status the server actually uses — the
+// miss degraded to "no endpoint in response", the report was abandoned, and the
+// server's explanation was discarded.
+//
+// The bodies below are the ones apidev.bugsee.com really returned.
+// ---------------------------------------------------------------------------
+
+/// Drive `create_issue` against a canned response and return the mapped error.
+fn issue_error_from(status: &str, body: &'static [u8]) -> TransportError {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let status = status.to_string();
+    let handle = serve(listener, 1, move |_req| http_response(&status, body));
+
+    let transport = HttpTransport::new(Some(base));
+    let err = transport
+        .create_issue("APP_TOKEN", Some("ACCESS"), br#"{}"#)
+        .unwrap_err();
+    handle.join().unwrap();
+    err
+}
+
+#[test]
+fn validation_error_on_http_200_surfaces_the_server_message() {
+    // Verbatim from apidev: a Rust report whose environment omits
+    // `platform.jailbreak`, which the appserver aggregates into NaN.
+    let err = issue_error_from(
+        "200 OK",
+        br#"{"ok":false,"error":{"type":"DataValidationError","message":"Cast to Number failed for value \"NaN\" (type number) at path \"statistics.jailbreak\"\n","code":99006}}"#,
+    );
+    match err {
+        TransportError::Permanent(detail) => {
+            assert!(detail.contains("99006"), "keeps the code: {detail}");
+            assert!(
+                detail.contains("statistics.jailbreak"),
+                "keeps the server's own words — the only account of why the \
+                 report was dropped: {detail}"
+            );
+            assert!(
+                !detail.contains("no endpoint"),
+                "must not degrade to the opaque shape-miss message: {detail}"
+            );
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+}
+
+#[test]
+fn app_error_12003_on_http_200_still_maps_to_duplicate_dropped() {
+    // Previously reachable only on a 4xx. On a 200 this fell through to
+    // Permanent, so the duplicate was never recognised as one.
+    let err = issue_error_from("200 OK", br#"{"ok":false,"error":{"code":12003}}"#);
+    assert!(
+        matches!(err, TransportError::DuplicateDropped),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn app_error_12004_on_http_200_still_blacklists() {
+    // Same reachability bug, but this one skipped the signature blacklist, so
+    // identical crashes would be re-uploaded forever.
+    let err = issue_error_from("200 OK", br#"{"ok":false,"error":{"code":12004}}"#);
+    assert!(
+        matches!(err, TransportError::TooManySimilar { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn ok_false_without_any_detail_is_rejected_as_an_envelope_error() {
+    // Both the old and the new code call this Permanent, so asserting only the
+    // variant would pass either way. What must hold is that it was rejected
+    // *because the envelope said so* — not because the response happened to
+    // lack the field we then went looking for.
+    let err = issue_error_from("200 OK", br#"{"ok":false}"#);
+    match err {
+        TransportError::Permanent(detail) => assert!(
+            !detail.contains("no endpoint"),
+            "must be diagnosed as a server rejection, not a shape miss: {detail}"
+        ),
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+}
+
+#[test]
+fn register_session_also_honours_ok_false_on_200() {
+    let err = error_from(
+        "200 OK",
+        br#"{"ok":false,"error":{"code":99006,"message":"bad environment"}}"#,
+    );
+    match err {
+        TransportError::Permanent(detail) => {
+            assert!(detail.contains("bad environment"), "got {detail}");
+            assert!(!detail.contains("no access_token"), "got {detail}");
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_successful_envelope_is_untouched() {
+    // `ok:true` (and a body with no `ok` at all, e.g. the presigned PUT target)
+    // must not be diverted into the error path.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let handle = serve(listener, 1, move |_req| {
+        http_response(
+            "200 OK",
+            br#"{"ok":true,"result":{"endpoint":"http://example.invalid/put"}}"#,
+        )
+    });
+
+    let transport = HttpTransport::new(Some(base));
+    let ep = transport
+        .create_issue("APP_TOKEN", Some("ACCESS"), br#"{}"#)
+        .expect("ok:true must pass through");
+    handle.join().unwrap();
+    assert_eq!(ep, "http://example.invalid/put");
+}

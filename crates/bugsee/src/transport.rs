@@ -42,21 +42,68 @@ impl HttpTransport {
     }
 }
 
+/// Pull `(code, message)` out of a `{"error":{"code":…,"message":…}}` envelope.
+fn app_error_parts(v: &Value) -> (Option<i64>, Option<String>) {
+    let err = v.get("error");
+    let code = err
+        .and_then(|e| e.get("code"))
+        .and_then(serde_json::Value::as_i64);
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    (code, message)
+}
+
+/// Map an `ok:false` envelope onto a [`TransportError`].
+///
+/// The API signals APPLICATION errors with an `ok:false` body and — this is the
+/// part that matters — an HTTP **200**. `ureq` only yields `Error::Status` for
+/// 4xx/5xx, so an envelope consulted solely from [`map_ureq_error`] is invisible
+/// on the status the server actually uses for them. Both paths funnel here.
+///
+/// The message is carried into the error rather than dropped: a rejected report
+/// is deleted from the queue (`runtime.rs`, "Duplicate / permanent — abandon the
+/// report"), so whatever the server said here is the only account of why.
+fn map_app_error(v: &Value) -> TransportError {
+    let (code, message) = app_error_parts(v);
+    match code {
+        Some(12003) => TransportError::DuplicateDropped,
+        Some(12004) => TransportError::TooManySimilar { signatures: vec![] },
+        _ => TransportError::Permanent(match (code, message) {
+            (Some(c), Some(m)) => format!("server error {c}: {m}"),
+            (Some(c), None) => format!("server error {c}"),
+            (None, Some(m)) => format!("server error: {m}"),
+            (None, None) => "server rejected the request (no code or message)".to_string(),
+        }),
+    }
+}
+
+/// `Err` when the body carries `ok:false`, whatever the HTTP status was.
+fn check_envelope(v: &Value) -> Result<(), TransportError> {
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err(map_app_error(v));
+    }
+    Ok(())
+}
+
 fn map_ureq_error(err: ureq::Error) -> TransportError {
     match err {
         ureq::Error::Status(code, resp) => {
             // Inspect the response envelope for Bugsee app error codes.
-            let app_code = resp.into_json::<Value>().ok().and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("code"))
-                    .and_then(|c| c.as_i64())
-            });
+            let body: Option<Value> = resp.into_json().ok();
+            let (app_code, message) = body.as_ref().map(app_error_parts).unwrap_or((None, None));
             match (code, app_code) {
                 (401, _) => TransportError::SessionExpired,
                 (_, Some(12003)) => TransportError::DuplicateDropped,
                 (_, Some(12004)) => TransportError::TooManySimilar { signatures: vec![] },
                 (429, _) | (500..=599, _) => TransportError::Transient(format!("http {code}")),
-                _ => TransportError::Permanent(format!("http {code}")),
+                _ => TransportError::Permanent(match message {
+                    Some(m) => format!("http {code}: {m}"),
+                    None => format!("http {code}"),
+                }),
             }
         }
         // Transport/IO errors are retryable.
@@ -82,6 +129,9 @@ impl Transport for HttpTransport {
         let v: Value = resp
             .into_json()
             .map_err(|e| TransportError::Transient(e.to_string()))?;
+        // An application error arrives as HTTP 200 + `ok:false`; without this
+        // the miss falls through to the opaque "no access_token" below.
+        check_envelope(&v)?;
         v.get("result")
             .and_then(|r| r.get("access_token"))
             .and_then(|t| t.as_str())
@@ -113,6 +163,11 @@ impl Transport for HttpTransport {
         let v: Value = resp
             .into_json()
             .map_err(|e| TransportError::Transient(e.to_string()))?;
+        // The load-bearing one. A rejected issue (e.g. a validation failure on
+        // some environment field) comes back 200 + `ok:false`, and without this
+        // it degraded to "no endpoint in response" — the report was then dropped
+        // with the server's explanation discarded.
+        check_envelope(&v)?;
         v.get("result")
             .and_then(|r| r.get("endpoint"))
             .and_then(|e| e.as_str())
