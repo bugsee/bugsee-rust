@@ -338,15 +338,32 @@ right and the schema was missing it.
 
 - **Expanding inline frames on the Apple path.** The chain plumbing is shared and
   in place (`worker@daf9e0b`), but Apple deliberately keeps selecting
-  `chain[0]`. Measured value is near zero — 0.05% of addresses in a real iOS
-  dSYM, and on the one real iOS crash fixture *none* of the 3 app frames carries
-  a chain (22 of its 25 frames are system libraries). The cost is not: the
-  signature takes its location from one frame chosen by index-sensitive steps —
-  a `frames[0:-2]` truncation and, worse, `skipFrames` from **per-app merging
-  rules**. Inserting frames would silently redefine a customer's configured
-  `skipFrames`, a config change they never made and that no test we own would
-  catch. The reasoning is recorded at the call site in `crash/symbolicator.py`;
-  revisit only if a real iOS case shows a hidden user frame.
+  `chain[0]`; the reasoning is recorded at that call site. **The decision is
+  about value, not risk** — the risk has a known fix, below.
+
+  *Value:* 0.05% of addresses in a real iOS dSYM carry a chain, and on the one
+  real iOS crash fixture **none** of the 3 app frames does (22 of its 25 frames
+  are system libraries, whose `.symcache` files we have no sample of).
+
+  *Risk, and its fix:* the signature takes its location from one frame chosen by
+  two index-sensitive steps — a `frames[0:-2]` truncation and `skipFrames` from
+  per-app merging rules. Both are fixed by counting **physical** call frames:
+  an inline entry consumes no skip budget and is skipped with the parent it
+  belongs to (expanded entries already carry `inlined: true`), with a sibling
+  `countInlinedFrames` option for anyone who wants the opposite. Both sites
+  should go through one shared `physical_frames()` accessor — otherwise the rule
+  is an implicit invariant that nothing enforces and a future positional
+  heuristic would silently break.
+
+  *Why it is not a small change:* `mergingRules` is **client-supplied**, not a
+  backend setting — the appserver has none, it rides the crash document from the
+  SDK (`BugseeMergingRulesSkipFramesKey` on iOS, `ExceptionSignature.java` on
+  Android). A new option is therefore public API in three SDKs, each needing a
+  release, and inert until expansion ships. `skipFrames` is also applied
+  **client-side** for Android's own signature, so skip semantics must stay
+  consistent across both sides or the two signatures diverge for one crash.
+
+  Revisit only if a real iOS case shows a hidden user frame.
 
 ### Deferred review findings — need a decision before building
 
