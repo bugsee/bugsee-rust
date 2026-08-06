@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-07-27 · `main` @ `51f4dc7` (pushed, CI green) · 116 tests · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps). Working tree clean._
+_Snapshot: 2026-08-06 · `main` @ `aba192b` (pushed, nothing unpushed) · 116 tests, 0 failed · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps). Working tree clean._
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
@@ -227,22 +227,45 @@ and build/MSRV. Fixed (all validated):
 
 ## Open items
 
+### Done since the last snapshot
+
+- **CLI ergonomics** — `bugsee-cli` gained `--type rust` with per-host discovery
+  (dSYM / ELF-with-build-id / PDB), preflight advice when the host project lacks
+  `debug = 1` / `split-debuginfo = "packed"` / `-Wl,--build-id`, and a
+  `nothing-found` diagnostic. Smoke-testing a real `cargo build --release` caught
+  the case that mattered: a correctly-configured macOS build puts a **symlinked**
+  `.dSYM` at the profile root, and the first implementation told the user to fix
+  settings that were already correct.
+- **Cross-SDK `source_*` adoption** — Android merged (`33a3d6d94`, in
+  `origin/master`); iOS on `origin/nextgen` (`c0d4bfbd7`, not yet in
+  `master`/`release`); the contract in `report-bundle-structure` documents the
+  **mirror rule** — each `source_*` key is a *copy* of an environment value from
+  the same source of truth, never an independent probe, and a producer omits any
+  key it has no counterpart for. That is why only Rust emits `source_arch`.
+  JavaScript is deferred (parallel work in flight).
+- **Symbol UUID canonicalization (backend)** — the appserver now canonicalizes
+  `symbols.images[].uuid` at the DAO boundary plus a migration for stored
+  records, and it is live on staging. That field is a plain String with a plain
+  index and no collation, so comparisons are byte-exact; three producers wrote
+  three spellings of one identity and lookups silently found nothing.
+  **The Rust SDK needs no change** — `bugsee-native` already emits `LC_UUID` as
+  lowercase dashless hex (`hex_lower`), which *is* the canonical form. The
+  worker's Python port landed in `worker@cec8390`, driven byte-for-byte from the
+  appserver's shared vector table.
+
 ### Next up — actionable now
 
-1. **Rust symbol-upload ergonomics in `bugsee-cli`.** Uploading works; *discoverability*
-   doesn't. Needs (a) preflight checks warning when the host project lacks
-   `[profile.release] debug = 1`, `split-debuginfo = "packed"` (macOS) or
-   `-Wl,--build-id` (Linux) — without these the upload silently produces symbols that
-   resolve nothing; (b) Rust-aware discovery so `bugsee upload ./target/release` infers
-   `--type` per host (dSYM / ELF-with-build-id / PDB) instead of demanding the flag;
-   (c) docs + a CI recipe for build → collect → upload.
-2. **Verify ingestion against the merged backend.** The harness has only ever run against
-   local worker branches; worth one pass on a dev deployment now that everything is on
-   `master`, confirming a real bundle routes, symbolicates and groups.
-3. **Cross-SDK adoption of the `source_*` triple.** It is documented as Rust-only
-   (`— — ✓` in `bundle/crash.md`). iOS/Android/JS adoption would let the worker drop its
-   environment-fallback routing entirely. Their work, not ours — but the contract is
-   written and merged, so it can be raised now.
+1. **Verify ingestion against a real deployment (`apidev.bugsee.com`).** The one
+   remaining unknown. Note the existing harness **cannot do this job**: it feeds
+   crash documents to worker code running locally and its endpoint is
+   `http://127.0.0.1:1/v2`, a deliberately dead address, so it has never
+   exercised transport, auth, the symbol-upload API, the store lookup, or
+   grouping. A genuine pass means: build a release binary → crash it against
+   apidev → `bugsee upload --type rust` to the same app → confirm the frames
+   resolve and two runs group. Needs a staging app token. Now unblocked by the
+   canonicalization work above, which is what gates step 3.
+2. **JavaScript `source_*` adoption** — deferred, not dropped. Findings are held
+   in the task notes for whoever owns the in-flight adapter work.
 
 ### Deferred review findings — need a decision before building
 
