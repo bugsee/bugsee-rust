@@ -1,6 +1,11 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-08-06 · `main` @ `aba192b` (pushed, nothing unpushed) · 116 tests, 0 failed · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new deps). Working tree clean._
+_Snapshot: 2026-08-06 · `main` @ `1b2a456` (pushed, nothing unpushed) · 137 tests, 0 failed · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; still no new deps). Working tree clean._
+
+> **Ingestion is verified end to end against a live deployment.** A real crash
+> from a real binary routes, symbolicates against uploaded symbols, and groups
+> across runs on `apidev.bugsee.com`. Getting there surfaced six defects across
+> four repos — see [Verified against a live deployment](#recent-work--verified-against-a-live-deployment-and-the-six-defects-it-found).
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
@@ -28,8 +33,8 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 1 — Ingestible bundle (core) | ✅ | Sliding-window capture (time/byte/event caps), length-prefixed part streams, envelope/manifest, Zstd method-93 ZIP, signatures. |
 | 2 — Handled errors + caught panics | ✅ | `catch_unwind` guards, panic snapshot, error/cause chains. Follow-ups: `tracing` Layer + `log` adapter done. Subsystem quarantine still open. |
 | 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** code-id-bearing module maps (natives are now symbolicatable) and uncaught-unwinding-panic reporting. Open: best-effort in-flight flush, full out-of-process minidump. |
-| 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. Open: sessions / release-health. |
-| 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. Open: general PII scrubber, rate limits. |
+| 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. **New:** the environment is actually populated — OS version, kernel, memory, disk, locale, and app identity (`package_id`/`version`/`build`) via `LaunchOptions::app_version`. Open: sessions / release-health. |
+| 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. **New:** `on_report_dropped` — delivery failure is observable at last; `flush()` alone never could distinguish delivered from discarded. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
 
 ## Recent work — the symbol pipeline, end to end (`f224188`, `3e2f9bf`, `51f4dc7`)
@@ -225,9 +230,69 @@ and build/MSRV. Fixed (all validated):
   suppress a native crash-on-launch loop. Proven by a real macOS SIGSEGV subprocess test.
 - **Build:** MSRV → 1.86 (icu/idna floor), `Cargo.lock` committed, CI msrv `--locked`.
 
+## Recent work — verified against a live deployment, and the six defects it found
+
+The first end-to-end run against `apidev.bugsee.com` (build → upload symbols →
+crash → recover → deliver → read the issue back). It passed, but only after six
+defects came out — every one of them invisible to the existing tests, because
+each sat in a seam between two repos.
+
+**What the run proves.** Issue `6a747da3…`: routed as a Rust native crash
+(SIGSEGV), frames resolved, and both runs grouped onto one issue
+(`events_count: 2`). The resolution is not circumstantial — the SDK emits
+addresses only (`{addr, module, reladdr}`, no name/file/line key exists in the
+payload), yet the summary reads `core::ptr::write_volatile (mod.rs:2171)`, so
+the symbol and line can only have come from server-side symbolication against
+the dSYM we uploaded. The canonicalization chain held on real artifacts:
+`bugsee-cli` declared `ab98e80b-042c-…` (lower-dashed), the worker stores dSYM
+ids upper-dashed, the SDK reports dashless — three spellings reconciled on a
+byte-exact Mongo index.
+
+The defects, in the order they blocked things:
+
+1. **Every Rust report was silently discarded** (`appserver`, merged). The issue
+   service summed `(env.platform.jailbreak && 1)`; in JS `undefined && 1` is
+   `undefined` and `0 + undefined` is `NaN`, which fails document validation and
+   throws the report away. iOS/Android never tripped it because they always send
+   the key. **Not Rust-specific** — the browser SDK omits it too. Fixed on both
+   sides: the appserver tolerates absence, and the SDK now emits
+   `platform.jailbreak: false` (`984c14e`).
+2. **The SDK could not see the rejection** (`66f0135`). The API answers
+   application errors with `ok:false` and **HTTP 200**, but the transport only
+   inspected the envelope for 4xx/5xx. The error degraded to "no endpoint in
+   response", the report was dropped, and the server's explanation was thrown
+   away. The known codes `12003`/`12004` were reachable only on a 4xx too — so
+   `12004` skipped the signature blacklist entirely.
+3. **Nothing could observe a dropped report** (`1b2a456`). `flush()` returns
+   "the queue is empty", and the queue drains on success *and* on permanent
+   failure alike — so it returned `true` while the server accepted nothing.
+   `LaunchOptions::on_report_dropped` now reports `DropReason`, and the e2e
+   harness fails on a drop instead of reporting a clean run.
+4. **A fully symbolicated stack rendered empty** (`worker@daf9e0b`,
+   `viewer@16490`). The SDK sends the crashing thread as a bare top-level
+   `frames[]` — a symbolication input, not a display shape — and no consumer
+   reads that. The worker now reconstructs `threads: [{crashed: true, …}]`.
+5. **Frame data was an opaque string** (`worker@daf9e0b`). Structured parsing was
+   skipped for *demangled* symbols, which is every Rust frame. Real document:
+   1 of 6 frames had structured data, now 5 of 6.
+6. **The user's own code was missing from the stack** (`worker@daf9e0b`).
+   `symcache.lookup` returns the whole inline chain and the symbolicator kept
+   only `results[0]` — the innermost inlined callee — so
+   `bugsee_deploy_e2e::main (main.rs:25)`, inlined at the crash address, appeared
+   nowhere. **73%** of addresses in a Rust binary carry a chain (0.05% in a real
+   iOS dSYM). The shared contract now returns chains; Rust expands them, Apple
+   deliberately does not (see below).
+
+**The environment was also near-empty** and is now populated: OS version, kernel,
+memory, disk and locale (`f69a041`, `89e28fe`), plus app identity via
+`package_id`/`version`/`build` and `LaunchOptions::app_version` (`205aa72`). Three
+fields the SDK sent were being dropped on ingest — `app.name`/`app.path` were
+Rust-only inventions (the other SDKs use `package_id`), while `hardware.arch` was
+right and the schema was missing it.
+
 ## Open items
 
-### Done since the last snapshot
+### Earlier — CLI ergonomics, cross-SDK adoption, canonicalization
 
 - **CLI ergonomics** — `bugsee-cli` gained `--type rust` with per-host discovery
   (dSYM / ELF-with-build-id / PDB), preflight advice when the host project lacks
@@ -255,17 +320,33 @@ and build/MSRV. Fixed (all validated):
 
 ### Next up — actionable now
 
-1. **Verify ingestion against a real deployment (`apidev.bugsee.com`).** The one
-   remaining unknown. Note the existing harness **cannot do this job**: it feeds
-   crash documents to worker code running locally and its endpoint is
-   `http://127.0.0.1:1/v2`, a deliberately dead address, so it has never
-   exercised transport, auth, the symbol-upload API, the store lookup, or
-   grouping. A genuine pass means: build a release binary → crash it against
-   apidev → `bugsee upload --type rust` to the same app → confirm the frames
-   resolve and two runs group. Needs a staging app token. Now unblocked by the
-   canonicalization work above, which is what gates step 3.
-2. **JavaScript `source_*` adoption** — deferred, not dropped. Findings are held
-   in the task notes for whoever owns the in-flight adapter work.
+1. **JavaScript `source_*` adoption** — deferred, not dropped: there is parallel
+   work in flight on that SDK. Findings are held for whoever owns it. Note the
+   browser SDK is also the remaining producer exposed to the
+   `platform.jailbreak` class of bug — the appserver fix protects it now, but its
+   `EnvironmentPlatform` is still `{type, os, locale}`.
+2. **Two environment fields remain unpopulated**, both needing a decision rather
+   than effort. `utc_offset`: the `time` crate refuses a local offset in a
+   multithreaded process (an SDK always is one), so it needs `localtime_r`/Win32
+   and a small `unsafe` — which belongs in the host crate, not core.
+   `hardware.model`: no `sysinfo` API, per-platform work, and on desktop it
+   yields a mainboard string worth little until Phase 6 puts this SDK on mobile.
+   Windows `locale` is likewise unset — `GetUserDefaultLocaleName` needs a
+   binding or a crate, and this SDK still takes no new dependencies.
+
+### Decided against
+
+- **Expanding inline frames on the Apple path.** The chain plumbing is shared and
+  in place (`worker@daf9e0b`), but Apple deliberately keeps selecting
+  `chain[0]`. Measured value is near zero — 0.05% of addresses in a real iOS
+  dSYM, and on the one real iOS crash fixture *none* of the 3 app frames carries
+  a chain (22 of its 25 frames are system libraries). The cost is not: the
+  signature takes its location from one frame chosen by index-sensitive steps —
+  a `frames[0:-2]` truncation and, worse, `skipFrames` from **per-app merging
+  rules**. Inserting frames would silently redefine a customer's configured
+  `skipFrames`, a config change they never made and that no test we own would
+  catch. The reasoning is recorded at the call site in `crash/symbolicator.py`;
+  revisit only if a real iOS case shows a hidden user frame.
 
 ### Deferred review findings — need a decision before building
 
