@@ -90,7 +90,7 @@ impl Bugsee {
         // telemetry should not cost you the OS version on your crash.
         #[cfg(feature = "telemetry")]
         {
-            config.host_facts = crate::telemetry::host_facts();
+            config.host_facts = crate::telemetry::host_facts(&config.data_dir);
         }
 
         #[cfg(feature = "telemetry")]

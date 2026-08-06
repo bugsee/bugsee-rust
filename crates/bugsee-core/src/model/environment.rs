@@ -200,6 +200,14 @@ pub struct HostFacts {
     pub memory_total: Option<u64>,
     /// `platform.memory_free`, MB.
     pub memory_free: Option<u64>,
+    /// `platform.disk_total`, MB — the volume holding the SDK's data directory,
+    /// not the root volume. That is the one whose exhaustion actually loses
+    /// reports.
+    pub disk_total: Option<u64>,
+    /// `platform.disk_free`, MB, same volume.
+    pub disk_free: Option<u64>,
+    /// `platform.locale`, in the `en_US` form the other SDKs report.
+    pub locale: Option<String>,
 }
 
 impl Environment {
@@ -219,6 +227,9 @@ impl Environment {
         env.platform.kernel_version = facts.kernel_version.clone();
         env.platform.memory_total = facts.memory_total;
         env.platform.memory_free = facts.memory_free;
+        env.platform.disk_total = facts.disk_total;
+        env.platform.disk_free = facts.disk_free;
+        env.platform.locale = facts.locale.clone();
         env
     }
 
@@ -331,6 +342,9 @@ mod tests {
             kernel_version: Some("24.3.0".into()),
             memory_total: Some(32768),
             memory_free: Some(4096),
+            disk_total: Some(500000),
+            disk_free: Some(120000),
+            locale: Some("en_US".into()),
         };
         let v = serde_json::to_value(Environment::detect_with("1.0.0", &facts)).unwrap();
 
@@ -338,6 +352,9 @@ mod tests {
         assert_eq!(v["platform"]["kernel_version"], "24.3.0");
         assert_eq!(v["platform"]["memory_total"], 32768);
         assert_eq!(v["platform"]["memory_free"], 4096);
+        assert_eq!(v["platform"]["disk_total"], 500000);
+        assert_eq!(v["platform"]["disk_free"], 120000);
+        assert_eq!(v["platform"]["locale"], "en_US");
     }
 
     #[test]
@@ -348,7 +365,15 @@ mod tests {
         let v = serde_json::to_value(Environment::detect("1.0.0")).unwrap();
         let platform = v["platform"].as_object().unwrap();
 
-        for key in ["version", "kernel_version", "memory_total", "memory_free"] {
+        for key in [
+            "version",
+            "kernel_version",
+            "memory_total",
+            "memory_free",
+            "disk_total",
+            "disk_free",
+            "locale",
+        ] {
             assert!(
                 !platform.contains_key(key),
                 "{key} should be omitted, not null"
