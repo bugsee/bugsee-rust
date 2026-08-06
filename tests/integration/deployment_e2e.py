@@ -370,7 +370,14 @@ def main() -> int:
 
     print(f"\nendpoint : {cfg['base']}  (SDK uses {cfg['sdk_endpoint']})")
     print(f"cli      : {cfg['cli']}")
-    print(f"version  : {version}   (unique per run, so the issue is findable)")
+    # NOTE: this version reaches the SYMBOL document only. The SDK does not
+    # report an app version at all — `Environment::detect` leaves
+    # `environment.app.version`/`.build` unset and `LaunchOptions` has no
+    # setter — so the issue will carry no version and cannot be found by one.
+    # Symbol resolution is unaffected: the worker looks symbols up by `uuid`
+    # scoped to the app (`crash/rust.py`, `api.get_symbol_files`), and version
+    # is not part of that key.
+    print(f"version  : {version}   (symbol document only — see the note below)")
     print(f"workdir  : {workdir}\n")
 
     try:
@@ -431,7 +438,10 @@ Module identity of the build:
 Delivered. What to verify — none of it is assertable from here, since
 it all lives in the deployment's database:
 
-  1. An issue exists for version {version}.
+  1. A new crash issue exists, most recent first. It will carry NO app
+     version — the SDK never sets `environment.app.version` — so find
+     it by recency, not by {version}, which reached the symbol
+     document only.
   2. It routed as a Rust crash (source_sdk == "rust"), not through a
      platform-guessing branch.
   3. Frames RESOLVED to bugsee_deploy_e2e::main and friends rather
