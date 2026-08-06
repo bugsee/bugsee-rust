@@ -84,6 +84,15 @@ impl Bugsee {
         config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
 
+        // Environment facts are gathered regardless of `system_telemetry`: that
+        // flag governs periodic SAMPLING (traces.system), whereas these are
+        // one-shot identity fields every report needs. Opting out of ongoing
+        // telemetry should not cost you the OS version on your crash.
+        #[cfg(feature = "telemetry")]
+        {
+            config.host_facts = crate::telemetry::host_facts();
+        }
+
         #[cfg(feature = "telemetry")]
         if options.system_telemetry {
             config.sampler = Some(Box::new(crate::telemetry::SysinfoSampler::new()));

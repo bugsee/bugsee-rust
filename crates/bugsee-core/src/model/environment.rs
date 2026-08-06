@@ -179,10 +179,50 @@ pub struct Environment {
     pub sdk: Sdk,
 }
 
+/// Facts the host layer can obtain but pure-`std` core cannot.
+///
+/// `bugsee-core` deliberately has no host-integration dependencies, and `std`
+/// exposes no OS version, kernel version or memory totals. Rather than pull a
+/// platform crate into core — or reach for `libc`/Win32 and spread `unsafe`
+/// across it — the host crate gathers these (via `sysinfo`) and passes them in,
+/// mirroring how [`crate::runtime::TelemetrySampler`] is supplied.
+///
+/// Every field is optional and simply omitted when the host cannot supply it,
+/// so an embedder that builds without the telemetry feature still gets a valid
+/// environment — just a thinner one.
+#[derive(Debug, Clone, Default)]
+pub struct HostFacts {
+    /// `platform.version` — the OS release (e.g. `"15.3.1"`, `"22.04"`).
+    pub os_version: Option<String>,
+    /// `platform.kernel_version`.
+    pub kernel_version: Option<String>,
+    /// `platform.memory_total`, MB (the contract's unit, not bytes).
+    pub memory_total: Option<u64>,
+    /// `platform.memory_free`, MB.
+    pub memory_free: Option<u64>,
+}
+
 impl Environment {
-    /// Build a baseline environment from `std`-available facts. Fuller telemetry
-    /// (disk/mem free, boot time, GPU) is layered in by the Phase 4 sampler.
+    /// Build a baseline environment from `std`-available facts alone.
+    ///
+    /// Thin on purpose: `std` knows the OS *name* but not its version, and
+    /// nothing about memory. Prefer [`Environment::detect_with`], which layers
+    /// in what the host can see.
     pub fn detect(sdk_version: &str) -> Self {
+        Self::detect_with(sdk_version, &HostFacts::default())
+    }
+
+    /// Build the environment, enriched with host-supplied [`HostFacts`].
+    pub fn detect_with(sdk_version: &str, facts: &HostFacts) -> Self {
+        let mut env = Self::detect_baseline(sdk_version);
+        env.platform.version = facts.os_version.clone();
+        env.platform.kernel_version = facts.kernel_version.clone();
+        env.platform.memory_total = facts.memory_total;
+        env.platform.memory_free = facts.memory_free;
+        env
+    }
+
+    fn detect_baseline(sdk_version: &str) -> Self {
         let os_type = source_platform().to_string();
 
         let cpu_count = std::thread::available_parallelism()
@@ -282,5 +322,45 @@ mod tests {
             v["platform"]["jailbreak"], false,
             "desktop targets have no jailbreak/root notion, so false is a fact"
         );
+    }
+
+    #[test]
+    fn host_facts_populate_the_platform_block() {
+        let facts = HostFacts {
+            os_version: Some("15.3.1".into()),
+            kernel_version: Some("24.3.0".into()),
+            memory_total: Some(32768),
+            memory_free: Some(4096),
+        };
+        let v = serde_json::to_value(Environment::detect_with("1.0.0", &facts)).unwrap();
+
+        assert_eq!(v["platform"]["version"], "15.3.1");
+        assert_eq!(v["platform"]["kernel_version"], "24.3.0");
+        assert_eq!(v["platform"]["memory_total"], 32768);
+        assert_eq!(v["platform"]["memory_free"], 4096);
+    }
+
+    #[test]
+    fn absent_host_facts_are_omitted_rather_than_nulled() {
+        // An embedder building without the telemetry feature still gets a valid
+        // environment; the keys simply are not there. Emitting nulls would make
+        // consumers distinguish "unknown" from "absent" for no gain.
+        let v = serde_json::to_value(Environment::detect("1.0.0")).unwrap();
+        let platform = v["platform"].as_object().unwrap();
+
+        for key in ["version", "kernel_version", "memory_total", "memory_free"] {
+            assert!(
+                !platform.contains_key(key),
+                "{key} should be omitted, not null"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_is_detect_with_no_facts() {
+        let a = serde_json::to_value(Environment::detect("9.9.9")).unwrap();
+        let b =
+            serde_json::to_value(Environment::detect_with("9.9.9", &HostFacts::default())).unwrap();
+        assert_eq!(a, b);
     }
 }

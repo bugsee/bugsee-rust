@@ -90,6 +90,9 @@ pub struct RecorderConfig {
     pub rotate_interval: Duration,
     /// Optional telemetry sampler run each rotation tick.
     pub sampler: Option<Box<dyn TelemetrySampler>>,
+    /// Facts core cannot see from `std` alone (OS version, memory). Supplied by
+    /// the host layer; absent fields are simply omitted from the environment.
+    pub host_facts: crate::model::environment::HostFacts,
     /// Base delay for upload retry backoff (doubles per attempt, capped at 300 s).
     pub upload_backoff_base: Duration,
     /// Optional callback to mutate or drop reports before delivery.
@@ -113,6 +116,7 @@ impl RecorderConfig {
             caps: WindowCaps::default(),
             rotate_interval: Duration::from_secs(1),
             sampler: None,
+            host_facts: Default::default(),
             upload_backoff_base: Duration::from_secs(30),
             before_send: None,
             before_breadcrumb: None,
@@ -209,7 +213,7 @@ impl Recorder {
     /// Start the workers and begin capturing. Recovers any prior session that
     /// ended abnormally, queueing it for delivery.
     pub fn launch(config: RecorderConfig, transport: Arc<dyn Transport>) -> std::io::Result<Self> {
-        let env = Environment::detect(&config.sdk_version);
+        let env = Environment::detect_with(&config.sdk_version, &config.host_facts);
         let environment_json = serde_json::to_vec(&env).unwrap_or_default();
         let shared = Arc::new(Shared {
             scope: Mutex::new(Scope::default()),

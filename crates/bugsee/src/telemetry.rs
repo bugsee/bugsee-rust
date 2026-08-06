@@ -8,6 +8,7 @@
 //! System/process telemetry sampling via `sysinfo`, emitted as `traces.system`
 //! (`cpu_usage`, `process_memory`, `ram`) once per rotation tick.
 
+use bugsee_core::model::environment::HostFacts;
 use bugsee_core::runtime::TelemetrySampler;
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -57,6 +58,31 @@ impl TelemetrySampler for SysinfoSampler {
     }
 }
 
+/// Gather the environment facts `bugsee-core` cannot see from `std` alone.
+///
+/// `std` exposes the OS *name* but not its version, and nothing about memory,
+/// so without this the reported environment is little more than
+/// `platform.type` — no OS version is the one that hurts most, since it is the
+/// first thing anyone looks at on a crash.
+///
+/// Every field is best-effort: `sysinfo` returns `None` on platforms where a
+/// value is unavailable, and it is omitted rather than guessed.
+pub fn host_facts() -> HostFacts {
+    const MB: u64 = 1024 * 1024;
+
+    let mut sys = System::new();
+    sys.refresh_memory();
+
+    HostFacts {
+        os_version: System::os_version(),
+        kernel_version: System::kernel_version(),
+        // MB, matching the wire contract's unit for these fields (the other
+        // SDKs report MB); `sysinfo` hands back bytes.
+        memory_total: Some(sys.total_memory() / MB).filter(|v| *v > 0),
+        memory_free: Some(sys.available_memory() / MB).filter(|v| *v > 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +101,32 @@ mod tests {
         assert!(
             names.contains(&"cpu_usage"),
             "process cpu sampled: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_facts_tests {
+    use super::*;
+
+    #[test]
+    fn reports_a_real_os_version_and_memory_on_this_host() {
+        // Not a tautology: the whole point of the change is that these fields
+        // were absent, so assert they are actually populated on a supported
+        // platform rather than merely well-typed.
+        let facts = host_facts();
+
+        assert!(facts.os_version.is_some(), "os_version must be populated");
+        assert!(
+            facts.memory_total.unwrap_or(0) > 0,
+            "memory_total (MB) must be non-zero, got {:?}",
+            facts.memory_total
+        );
+        assert!(
+            facts.memory_total >= facts.memory_free,
+            "free ({:?}) cannot exceed total ({:?})",
+            facts.memory_free,
+            facts.memory_total
         );
     }
 }
