@@ -21,6 +21,7 @@ use bugsee_core::transport::Transport;
 /// Configuration passed to [`crate::Bugsee::launch_with`].
 pub struct LaunchOptions {
     pub(crate) app_token: String,
+    pub(crate) on_report_dropped: Option<bugsee_core::runtime::OnReportDropped>,
     pub(crate) app_version: Option<String>,
     pub(crate) app_build: Option<String>,
     pub(crate) app_package_id: Option<String>,
@@ -44,6 +45,7 @@ impl LaunchOptions {
     pub fn new(app_token: impl Into<String>) -> Self {
         LaunchOptions {
             app_token: app_token.into(),
+            on_report_dropped: None,
             app_version: None,
             app_build: None,
             app_package_id: None,
@@ -154,6 +156,31 @@ impl LaunchOptions {
     }
 
     /// Override the API base URL (defaults to `https://api.bugsee.com/v2`).
+    /// Called when a report is abandoned instead of delivered.
+    ///
+    /// Delivery is otherwise SILENT. The durable queue is drained on success
+    /// and on permanent failure alike, so [`crate::Bugsee::flush`] returning
+    /// `true` means "the queue is empty", NOT "the server got it" — and this
+    /// SDK does no logging. Without this hook a host cannot tell that every one
+    /// of its crash reports is being rejected.
+    ///
+    /// Runs on the uploader thread; keep it short and non-blocking.
+    ///
+    /// ```no_run
+    /// use bugsee::{Bugsee, LaunchOptions};
+    /// let _guard = Bugsee::launch_with(
+    ///     LaunchOptions::new("APP_TOKEN")
+    ///         .on_report_dropped(|reason| eprintln!("bugsee dropped a report: {reason:?}")),
+    /// );
+    /// ```
+    pub fn on_report_dropped(
+        mut self,
+        hook: impl Fn(bugsee_core::runtime::DropReason) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_report_dropped = Some(Box::new(hook));
+        self
+    }
+
     /// The application's version, e.g. `"1.4.2"`.
     ///
     /// Without it an issue carries no version at all: it cannot be filtered by

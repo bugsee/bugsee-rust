@@ -64,6 +64,38 @@ const DEFAULT_MAX_REPORT_QUEUED: usize = 256;
 /// return `false` to drop the report entirely.
 pub type BeforeSend = Box<dyn Fn(&mut ReportMeta) -> bool + Send + Sync>;
 
+/// Why a report was abandoned instead of delivered.
+///
+/// Every variant means the report is GONE — it has been removed from the
+/// durable queue and will not be retried.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropReason {
+    /// The server rejected it and retrying cannot help — a validation failure,
+    /// an unknown app token, and so on. Carries the server's own message when
+    /// it sent one, which is otherwise the only account of why.
+    Rejected(String),
+    /// The server reported an identical crash already recorded.
+    Duplicate,
+    /// Too many similar crashes; the signatures are now blacklisted locally so
+    /// the same crash-on-launch loop stops re-uploading.
+    TooManySimilar,
+    /// Delivery kept failing transiently until the durable retry cap.
+    RetriesExhausted,
+}
+
+/// Called when a report is abandoned. See [`DropReason`].
+///
+/// Exists because delivery is otherwise SILENT: the queue is drained on success
+/// and on permanent failure alike, so [`Recorder::flush`] returning `true`
+/// cannot distinguish "delivered" from "thrown away", and this crate does no
+/// logging. Without a hook a host has no way to learn that its crash reports
+/// are being rejected.
+///
+/// Runs on the uploader thread. A panic here is contained by the uploader's
+/// `catch_unwind`, like any other host callback.
+pub type OnReportDropped = Box<dyn Fn(DropReason) + Send + Sync>;
+
 /// A callback run on every breadcrumb before it is captured. Return the
 /// (possibly-mutated) breadcrumb to keep it, or `None` to drop it.
 pub type BeforeBreadcrumb = Box<dyn Fn(Breadcrumb) -> Option<Breadcrumb> + Send + Sync>;
@@ -100,6 +132,8 @@ pub struct RecorderConfig {
     pub upload_backoff_base: Duration,
     /// Optional callback to mutate or drop reports before delivery.
     pub before_send: Option<BeforeSend>,
+    /// Notified whenever a report is abandoned rather than delivered.
+    pub on_report_dropped: Option<OnReportDropped>,
     /// Optional callback to mutate or drop breadcrumbs before capture.
     pub before_breadcrumb: Option<BeforeBreadcrumb>,
     /// Fraction of non-fatal (`error`) reports to keep, in `[0, 1]`. Crashes are
@@ -123,6 +157,7 @@ impl RecorderConfig {
             app_identity: Default::default(),
             upload_backoff_base: Duration::from_secs(30),
             before_send: None,
+            on_report_dropped: None,
             before_breadcrumb: None,
             sample_rate: 1.0,
             max_queued_entries: DEFAULT_MAX_QUEUED,
@@ -157,6 +192,7 @@ struct Shared {
     session: Mutex<Option<String>>,
     transport: Arc<dyn Transport>,
     before_send: Option<BeforeSend>,
+    on_report_dropped: Option<OnReportDropped>,
     before_breadcrumb: Option<BeforeBreadcrumb>,
     sample_rate: f64,
     /// In-flight capture entries queued to the worker (back-pressure counter).
@@ -231,6 +267,7 @@ impl Recorder {
             session: Mutex::new(None),
             transport,
             before_send: config.before_send,
+            on_report_dropped: config.on_report_dropped,
             before_breadcrumb: config.before_breadcrumb,
             sample_rate: config.sample_rate,
             queued: AtomicUsize::new(0),
@@ -1019,6 +1056,7 @@ fn deliver_queued(
                 let n = retry + 1;
                 if n >= UPLOAD_RETRY_CAP {
                     queue::remove(report);
+                    notify_dropped(shared, DropReason::RetriesExhausted);
                 } else {
                     queue::set_meta(report, n, now + backoff_delay(n, backoff_base));
                 }
@@ -1036,9 +1074,31 @@ fn deliver_queued(
             };
             queue::blacklist_add(data_dir, &sigs);
             queue::remove(report);
+            notify_dropped(shared, DropReason::TooManySimilar);
         }
         // Duplicate / permanent — abandon the report.
-        Err(_) => queue::remove(report),
+        Err(e) => {
+            queue::remove(report);
+            notify_dropped(shared, drop_reason_for(e));
+        }
+    }
+}
+
+/// Classify a terminal transport error for [`DropReason`].
+fn drop_reason_for(err: TransportError) -> DropReason {
+    match err {
+        TransportError::DuplicateDropped => DropReason::Duplicate,
+        // The server's own words: the report is being deleted, so this text is
+        // the only record of why it never arrived.
+        TransportError::Permanent(detail) => DropReason::Rejected(detail),
+        other => DropReason::Rejected(format!("{other:?}")),
+    }
+}
+
+/// Tell the host a report was abandoned, if it asked to know.
+fn notify_dropped(shared: &Shared, reason: DropReason) {
+    if let Some(hook) = &shared.on_report_dropped {
+        hook(reason);
     }
 }
 

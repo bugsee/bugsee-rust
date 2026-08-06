@@ -84,4 +84,5 @@ pub use bugsee_core::model::enums::{
 };
 pub use bugsee_core::model::perf::Status;
 pub use bugsee_core::reporting::{Attachment, ReportMeta};
+pub use bugsee_core::runtime::DropReason;
 pub use bugsee_core::transport::{Transport, TransportError};

@@ -93,6 +93,11 @@ use bugsee::{Bugsee, LaunchOptions};
 fn launch(data_dir: &str) -> bugsee::LaunchGuard {
     Bugsee::launch_with(
         LaunchOptions::new(env!("BUGSEE_APP_TOKEN"))
+            // Delivery is otherwise silent: the queue drains whether a report
+            // was DELIVERED or THROWN AWAY, so `flush() == true` alone cannot
+            // tell the difference. Without this the harness once reported a
+            // clean run against a server that rejected every single report.
+            .on_report_dropped(|reason| println!("REPORT_DROPPED {reason:?}"))
             .app_version(bugsee::app_version!())
             .app_build("1")
             .data_dir(data_dir)
@@ -326,6 +331,16 @@ def crash_and_deliver(exe: Path, workdir: Path, run_index: int) -> None:
         capture_output=True, text=True, timeout=120,
     )
     out = delivered.stdout or ""
+
+    # A dropped report drains the queue exactly like a delivered one, so this
+    # has to be checked BEFORE trusting the DELIVERED marker.
+    dropped = [ln for ln in out.splitlines() if ln.startswith("REPORT_DROPPED")]
+    if dropped:
+        raise Failure(
+            f"run {run_index}: the server ACCEPTED nothing — the report was "
+            "abandoned, not delivered:\n  "
+            + "\n  ".join(dropped)
+        )
 
     if "QUEUE_NOT_DRAINED" in out:
         raise Failure(

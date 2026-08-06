@@ -81,6 +81,7 @@ impl Bugsee {
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
         config.before_send = options.before_send;
+        config.on_report_dropped = options.on_report_dropped;
         config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
         config.app_identity = bugsee_core::model::environment::AppIdentity {
