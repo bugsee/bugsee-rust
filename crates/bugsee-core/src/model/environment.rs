@@ -42,6 +42,22 @@ pub struct Platform {
     pub memory_free: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_total: Option<u64>,
+    /// Jailbroken (iOS) / rooted (Android) — a privilege-escalated,
+    /// otherwise-locked-down device.
+    ///
+    /// Always `false` on the desktop targets this SDK builds for: those OSes
+    /// have no such notion, so this is a statement of fact rather than the
+    /// result of a probe.
+    ///
+    /// It is emitted rather than skipped because the backend aggregates this
+    /// field arithmetically and an absent value poisons the running total —
+    /// see [`Environment::detect`].
+    ///
+    /// **Phase 6:** the iOS/Android FFI targets must replace this with real
+    /// detection. Reporting `false` from a device we never inspected would be
+    /// a wrong answer, which is worse than a missing one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jailbreak: Option<bool>,
 }
 
 /// Application identity and build.
@@ -176,6 +192,13 @@ impl Environment {
         Environment {
             platform: Platform {
                 os_type,
+                // Not optional in practice. The backend folds this into a
+                // running counter with `(stats.jailbreak || 0) +
+                // (env.platform.jailbreak && 1)`; in JS `undefined && 1` is
+                // `undefined`, so an absent value makes the sum NaN and the
+                // whole issue document fails validation — the report is
+                // rejected outright, not merely recorded without the field.
+                jailbreak: Some(false),
                 ..Default::default()
             },
             app: App {
@@ -235,5 +258,29 @@ mod tests {
         );
         // Everywhere else we only require a non-empty identifier.
         assert!(!os.is_empty(), "platform.type must never be empty");
+    }
+
+    #[test]
+    fn jailbreak_is_emitted_because_the_backend_sums_it() {
+        // Not a nicety. The appserver does
+        //     stats.jailbreak = (stats.jailbreak || 0)
+        //                     + (env.platform.jailbreak && 1);
+        // and in JS `undefined && 1` evaluates to `undefined`, so an absent
+        // value turns the running total into NaN. Mongoose then rejects the
+        // entire issue document ("Cast to Number failed for value \"NaN\" ...
+        // at path \"statistics.jailbreak\"", code 99006) and the crash report
+        // is thrown away. Verified against a live deployment: the same report
+        // is rejected without this field and accepted with it.
+        let env = Environment::detect("1.0.0");
+        let v = serde_json::to_value(&env).unwrap();
+        assert!(
+            v["platform"].get("jailbreak").is_some(),
+            "platform.jailbreak must be PRESENT, not skipped — an absent value \
+             makes the backend's running total NaN and the report is rejected"
+        );
+        assert_eq!(
+            v["platform"]["jailbreak"], false,
+            "desktop targets have no jailbreak/root notion, so false is a fact"
+        );
     }
 }
