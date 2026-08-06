@@ -56,3 +56,55 @@ Options:
   worth noticing, since that check is the load-bearing one.
 
 Exit code is non-zero on any assertion failure, so it can gate CI.
+
+---
+
+# `deployment_e2e.py` — against a real deployment
+
+`rust_worker_e2e.py` deliberately points delivery at `http://127.0.0.1:1/v2`, a
+dead address, and calls the worker **in-process**. That is the right design for
+a CI gate — no network, no credentials, fully deterministic — but it means the
+harness has never exercised **transport, auth, the symbol-upload API, the
+symbol-store lookup, or grouping**. Those only exist on a real server.
+
+`deployment_e2e.py` covers that half. It drives the path an actual user walks:
+
+```
+build (debug info + build id)
+  -> bugsee-cli debug-files upload --type rust
+  -> crash against the deployment
+  -> relaunch; next-launch recovery delivers the bundle
+  -> repeat, so grouping has two events to merge
+```
+
+It asserts everything it *can* locally — the binary died on a real signal, and
+`Bugsee::flush` reported the outbound queue **actually drained** (so a bundle
+left sitting on disk is a failure, not a pass). It deliberately does **not**
+assert on frames or grouping: those facts live in the deployment's database.
+It ends by printing what to check and the `code_id` to match against, which you
+read back with the Bugsee MCP tools or the dashboard.
+
+```sh
+export BUGSEE_APP_TOKEN=...                      # never pass as an argument
+export BUGSEE_ENDPOINT=https://apidev.bugsee.com # BASE url, no /v2
+python3 tests/integration/deployment_e2e.py
+```
+
+Options: `--runs N` (default 2; more than 1 is what makes grouping meaningful),
+`--skip-upload` (to see what an unsymbolicated issue looks like), `--keep`.
+
+Two things that will bite otherwise:
+
+- **The app must be of type `rust`.** The appserver gained that type in
+  `473fa430`; pointing this at an ios/android app ingests through the wrong
+  branch and the result misleads rather than obviously breaking. At the time of
+  writing **no Rust app exists on staging** — one has to be created first.
+- **`BUGSEE_ENDPOINT` is the base url, not the `/v2` one.** `bugsee-cli`
+  appends `/v2/apps/<token>/…` itself while the SDK wants the `/v2` url, and
+  both read this same variable. The script takes the base, passes it through to
+  the CLI, and appends `/v2` for the SDK; it rejects a `/v2` value rather than
+  silently producing `/v2/v2/…`.
+
+Requirements: a Rust toolchain, `bugsee-cli` (on `PATH`, at `BUGSEE_CLI`, or
+built in a sibling checkout), and `symbolic` for the `code_id` readout — that
+last one degrades to a warning rather than a failure.
