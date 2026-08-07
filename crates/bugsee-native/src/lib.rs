@@ -26,7 +26,12 @@ use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 // Gated to the platforms whose handler actually captures frames. Widening
 // this cfg is part of adding Windows native capture — the helper is needed
 // verbatim there, so it is gated rather than `allow(dead_code)`d.
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android"
+))]
 const MAX_FRAMES: usize = 64;
 /// Module-map file (base→name) written next to `crash.info` at install time and
 /// read back by recovery to turn crash-time frame PCs into stable module offsets.
@@ -447,6 +452,58 @@ unsafe fn fault_address(cc: &CrashContext) -> usize {
     record.ExceptionInformation[1]
 }
 
+/// Capture the crashing thread's PCs.
+///
+/// The handler runs ON the faulting thread (SEH delivers it there), so the
+/// live stack IS the crash stack — the same property the Linux path relies on
+/// when it walks its own stack with `backtrace`.
+///
+/// Frame 0 is taken from `ExceptionAddress` rather than from the walk: that is
+/// the instruction that faulted, and it is what the crash site must be. The
+/// walk alone would start inside this handler, which is precisely the
+/// misattribution that made every Rust panic group together before
+/// `is_internal_frame` existed.
+///
+/// KNOWN LIMITATION: the frames after index 0 may still include a few of this
+/// handler's own, because `RtlCaptureStackBackTrace` starts where it is called
+/// and no reliable skip count exists across optimisation levels. They are
+/// deterministic, so grouping is unaffected (the dedup signature is built from
+/// module+offset pairs), but a displayed stack can carry them until a
+/// CONTEXT-based `RtlVirtualUnwind` replaces this.
+#[cfg(windows)]
+unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
+    let mut n = 0;
+
+    // The faulting instruction first, so the crash site is right even if the
+    // walk below yields nothing (a stack overflow leaves almost no stack).
+    if !cc.exception_pointers.is_null() {
+        let record = unsafe { (*cc.exception_pointers).ExceptionRecord };
+        if !record.is_null() {
+            let pc = unsafe { (*record).ExceptionAddress } as usize;
+            if pc != 0 {
+                out[0] = pc;
+                n = 1;
+            }
+        }
+    }
+
+    let mut raw = [core::ptr::null_mut::<core::ffi::c_void>(); MAX_FRAMES];
+    let want = (MAX_FRAMES - n) as u32;
+    let got = unsafe {
+        win32::RtlCaptureStackBackTrace(0, want, raw.as_mut_ptr(), core::ptr::null_mut())
+    } as usize;
+
+    for &pc in raw.iter().take(got.min(MAX_FRAMES - n)) {
+        if pc.is_null() {
+            break;
+        }
+        out[n] = pc as usize;
+        n += 1;
+    }
+
+    n
+}
+
 #[cfg(windows)]
 fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
     let signo = exception_to_signal(cc.exception_code);
@@ -455,11 +512,17 @@ fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
     // vocabulary. The access type IS available in ExceptionInformation[0], but
     // putting it in a field consumers read as an si_code would be a wrong
     // answer in a right-shaped slot.
+    // Header first and independently: it must survive even if the capture
+    // below faults (F29).
     unsafe {
         write_marker(path_cbytes, signo, 0, addr);
     }
-    // Frame capture is added with the stack walk; the header is written first
-    // and independently so it survives regardless (F29).
+
+    let mut frames = [0usize; MAX_FRAMES];
+    let n = unsafe { capture_frames(cc, &mut frames) };
+    if n > 0 {
+        unsafe { append_frames(path_cbytes, &frames[..n]) };
+    }
 }
 
 /// Open the marker for writing, creating/truncating it. Returns the raw handle
@@ -1031,6 +1094,12 @@ mod win32 {
         ) -> i32;
         pub fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
         pub fn GetSystemTimeAsFileTime(ft: *mut FileTime);
+        pub fn RtlCaptureStackBackTrace(
+            skip: u32,
+            capture: u32,
+            frames: *mut *mut core::ffi::c_void,
+            hash: *mut u32,
+        ) -> u16;
         pub fn K32EnumProcessModules(
             process: *mut core::ffi::c_void,
             modules: *mut *mut core::ffi::c_void,

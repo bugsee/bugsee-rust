@@ -8,17 +8,11 @@
 //! dereferences null; the parent asserts the crash-info marker was written and
 //! the child died from the signal.
 //!
-//! **Unix only, and that gate is the point.** On Windows `write_marker` and
-//! `append_frames` are still no-op stubs (`bugsee-native/src/lib.rs`), so an
-//! access violation produces no marker at all — the handler installs, the
-//! process dies, and nothing is recorded. This test would fail there for a real
-//! reason, not an environmental one.
-//!
-//! **Deleting `#![cfg(unix)]` is the acceptance criterion for the Windows
-//! native work.** The assertions below need no changes to be meaningful there:
-//! the marker format is shared, and a Windows `EXCEPTION_ACCESS_VIOLATION` is
-//! expected to map to `signal=11` exactly as `EXC_BAD_ACCESS` does on Apple.
-#![cfg(unix)]
+//! Runs on unix AND Windows. The gate came off when the Windows marker path
+//! landed, which was always the acceptance criterion for that work — and the
+//! assertions below needed no changes to hold there, because the marker format
+//! is shared and `EXCEPTION_ACCESS_VIOLATION` maps to `signal=11` exactly as
+//! `EXC_BAD_ACCESS` does on Apple.
 
 use std::path::PathBuf;
 use std::process::Command;
