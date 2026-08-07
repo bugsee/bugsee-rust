@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-08-07 · `main` @ `d511079` (pushed, nothing unpushed) · 137 tests, 0 failed · clippy `-D warnings` + fmt clean **on Linux, macOS and Windows** · MSRV 1.88 (`Cargo.lock` committed, CI `--locked`). Working tree clean._
+_Snapshot: 2026-08-07 · `main` @ `de0a55e` (pushed, nothing unpushed) · 148 tests, 0 failed · clippy `-D warnings` + fmt clean **on Linux, macOS and Windows** · MSRV 1.88 (`Cargo.lock` committed, CI `--locked`). Working tree clean._
 
 > **Ingestion is verified end to end against a live deployment.** A real crash
 > from a real binary routes, symbolicates against uploaded symbols, and groups
@@ -18,7 +18,7 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 |---|---|
 | `bugsee-core` | Pure-`std` capture/persistence/export engine; recovery; queue; signatures. One contained `unsafe` (`kill(pid,0)` liveness probe, unix). |
 | `bugsee-panic` | Chained global panic observer + `catch_unwind` boundary guards. |
-| `bugsee-native` | Native fatal-crash handler (signal/Mach) → async-signal-safe marker + frame capture + module map for next-launch recovery. |
+| `bugsee-native` | Native fatal-crash handler (POSIX signal / Mach exception / Windows SEH) → allocation-free marker + frame capture + code-id-bearing module map (Mach-O `LC_UUID`, GNU build-id, PE CodeView) for next-launch recovery. |
 | `bugsee` | Public facade + default `ureq` HTTP transport + APM. |
 | `bugsee-reqwest` | `reqwest` network-capture middleware (sanitized). |
 | `bugsee-tracing` | `tracing` `Layer`. |
@@ -29,10 +29,10 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 
 | Phase | Status | Notes |
 |---|---|---|
-| 0 — Harness | ✅ | Workspace, mock 3-step API server, bundle validator, subprocess crash runner, CI (build/test/clippy/fmt + pinned-MSRV job). |
+| 0 — Harness | ✅ | Workspace, mock 3-step API server, bundle validator, subprocess crash runner, CI **matrix across ubuntu/macOS/windows** (build/test/clippy per platform, fmt once) + pinned-MSRV job. |
 | 1 — Ingestible bundle (core) | ✅ | Sliding-window capture (time/byte/event caps), length-prefixed part streams, envelope/manifest, Zstd method-93 ZIP, signatures. |
 | 2 — Handled errors + caught panics | ✅ | `catch_unwind` guards, panic snapshot, error/cause chains. Follow-ups: `tracing` Layer + `log` adapter done. Subsystem quarantine still open. |
-| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** code-id-bearing module maps (natives are now symbolicatable) and uncaught-unwinding-panic reporting. Open: best-effort in-flight flush, full out-of-process minidump. |
+| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** Windows native capture — SEH/VEH handler, PE CodeView module map, marker + frame capture — so all three desktop platforms report fatal crashes. Open: best-effort in-flight flush, full out-of-process minidump. |
 | 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. **New:** the environment is actually populated — OS version, kernel, memory, disk, locale, and app identity (`package_id`/`version`/`build`) via `LaunchOptions::app_version`. Open: sessions / release-health. |
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. **New:** `on_report_dropped` — delivery failure is observable at last; `flush()` alone never could distinguish delivered from discarded. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
@@ -290,6 +290,72 @@ fields the SDK sent were being dropped on ingest — `app.name`/`app.path` were
 Rust-only inventions (the other SDKs use `package_id`), while `hardware.arch` was
 right and the schema was missing it.
 
+## Recent work — Windows native capture, and the CI that made it verifiable
+
+Windows was nominally supported and, for fatal crashes, entirely a stub: the
+handler installed, the process died, and nothing was recorded. Panics and
+handled errors worked (pure Rust), but an access violation produced no report.
+Meanwhile the *backend* half had been finished months earlier — `bugsee-cli`
+discovers and uploads PDBs, the worker has `symbolfiles/pdb.py` with debug-id
+keying, and the canonicalization handles the GUID+age form. A whole symbol
+pipeline sat idle waiting for crashes the client could not capture.
+
+**The CI matrix went in first, deliberately** (`ubuntu` / `macOS` / `windows`,
+`fail-fast: false`). The platform-specific code IS the product here, and a
+single runner compiled and ran barely half of it. It paid for itself before the
+implementation started, catching three things invisible from Linux: a
+`crash-context` transitive MSRV bump that had already broken the pinned-MSRV job
+unnoticed, five dead-code errors, and a `normalize_locale` that was unreachable
+on Windows. During the implementation it caught two more — a duplicate
+`on_crash` from a catch-all `cfg` that still matched Windows, and an
+`append_frames` with no caller. Every one would have merged green before.
+
+Three pieces, each verified where it could be:
+
+- **PE module map.** The parsing is split from the Win32 enumeration and kept
+  pure (`cfg(any(windows, test))`) so the risky half runs in the suite on every
+  host. A CodeView GUID is stored **mixed-endian** — first three fields
+  byte-swapped, last eight verbatim — and the age is appended as lowercase hex
+  but **omitted when zero**. Get either wrong and you get a plausible id that
+  matches no symbol file ever, invisible without an end-to-end upload. Verified
+  against the SHARED canonicalization vectors (`worker/test/fixtures/
+  symbol-uuid-vectors.json`), so the SDK emits the canonical form by
+  construction rather than by coincidence.
+- **Marker writing.** `CreateFileW`/`WriteFile`, producing the same document the
+  unix path writes byte for byte, so recovery needs no platform knowledge. The
+  prepared path had to change type — `PathChar` is `u8` on unix and `u16` on
+  Windows — because the old lossy `to_string_lossy` + ANSI route would resolve
+  to the wrong path under a profile like `C:\Users\Ünal`, losing the marker on
+  exactly the machines least able to report it.
+- **Frame capture.** Frame 0 comes from `ExceptionAddress`, not from the stack
+  walk: the walk begins inside the handler, and using it alone would report our
+  own code as the crash site — the misattribution that once collapsed every Rust
+  panic into one group.
+
+**A new test closes the gap both suites left.** `crash_subprocess.rs` proved a
+real crash writes a marker; `recovery_e2e.rs` proved recovery reads one — but
+from markers it wrote itself. A platform whose handler emitted a marker recovery
+could not use, or whose module map came out empty, passed both.
+`bugsee/tests/native_recovery_e2e.rs` drives the whole client path in-process
+(install → real fault → relaunch → recover → deliver) and asserts the delivered
+`crash.json` is *usable*: modules carrying `code_id`, frames resolved to
+modules, a client dedup signature. No network or credentials, so it runs in the
+ordinary matrix — and it passes on Windows.
+
+**Still unproven, and only a Windows host can prove it:** uploading a real PDB
+with `bugsee-cli` and confirming frames actually symbolicate on a deployment.
+The id format is verified by construction; that last hop is not.
+
+**Two limitations, recorded rather than hidden.** Frames after index 0 may
+include a few handler frames — `RtlCaptureStackBackTrace` starts where it is
+called and no skip count is reliable across optimisation levels; they are
+deterministic so grouping is unaffected, but a displayed stack can carry them
+until a CONTEXT-based `RtlVirtualUnwind` replaces the capture. And stack
+overflow stays unreliable in-process: frame 0 survives because it is seeded from
+the exception record, but the walk may yield nothing with the guard page
+consumed. That is the out-of-process backend's problem, not something in-process
+can fix.
+
 ## Open items
 
 ### Earlier — CLI ergonomics, cross-SDK adoption, canonicalization
@@ -320,12 +386,19 @@ right and the schema was missing it.
 
 ### Next up — actionable now
 
-1. **JavaScript `source_*` adoption** — deferred, not dropped: there is parallel
+1. **Symbolicate a Windows crash against a real PDB.** The one hop nothing has
+   exercised: `bugsee-cli debug-files upload --type rust` from a Windows host,
+   then confirm the frames resolve on a deployment. The `code_id` format is
+   verified against the shared canonicalization vectors by construction, but
+   construction is not the same as a round trip — the equivalent step on macOS
+   is what caught six defects. Needs a Windows machine and an app token;
+   `tests/integration/deployment_e2e.py` already does everything else.
+2. **JavaScript `source_*` adoption** — deferred, not dropped: there is parallel
    work in flight on that SDK. Findings are held for whoever owns it. Note the
    browser SDK is also the remaining producer exposed to the
    `platform.jailbreak` class of bug — the appserver fix protects it now, but its
    `EnvironmentPlatform` is still `{type, os, locale}`.
-2. **Two environment fields remain unpopulated**, both needing a decision rather
+3. **Two environment fields remain unpopulated**, both needing a decision rather
    than effort. `utc_offset`: the `time` crate refuses a local offset in a
    multithreaded process (an SDK always is one), so it needs `localtime_r`/Win32
    and a small `unsafe` — which belongs in the host crate, not core.
