@@ -217,7 +217,12 @@ fn mach_to_signal(kind: u32) -> i32 {
 }
 
 // Other Unixes / Windows: record that a crash occurred; details vary per OS.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+)))]
 fn on_crash(path_cbytes: &[PathChar], _cc: &CrashContext) {
     unsafe {
         write_marker(path_cbytes, 0, 0, 0);
