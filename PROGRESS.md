@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-08-07 · `main` @ `7309414` (pushed, nothing unpushed) · 137 tests, 0 failed · clippy `-D warnings` + fmt clean · MSRV 1.86 (`Cargo.lock` committed, CI `--locked`; no new **direct** deps — the tree gained one transitive crate, `mach2`, with the `crash-handler` 0.8 bump). Working tree clean._
+_Snapshot: 2026-08-07 · `main` @ `d511079` (pushed, nothing unpushed) · 137 tests, 0 failed · clippy `-D warnings` + fmt clean **on Linux, macOS and Windows** · MSRV 1.88 (`Cargo.lock` committed, CI `--locked`). Working tree clean._
 
 > **Ingestion is verified end to end against a live deployment.** A real crash
 > from a real binary routes, symbolicates against uploaded symbols, and groups
