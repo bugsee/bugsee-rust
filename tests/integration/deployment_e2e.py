@@ -54,6 +54,11 @@ from pathlib import Path
 SDK_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENDPOINT = "https://apidev.bugsee.com"
 
+# Cargo names the binary `<crate>.exe` on Windows. Every path this script builds
+# for an executable has to carry it, or the run dies at the "build produced no
+# binary" check having actually built one perfectly well.
+EXE = ".exe" if platform.system() == "Windows" else ""
+
 
 class Failure(Exception):
     pass
@@ -172,7 +177,7 @@ def discover_cli() -> Path:
 
     sibling = SDK_ROOT.parent / "bugsee-cli"
     for profile in ("release", "debug"):
-        candidate = sibling / "target" / profile / "bugsee-cli"
+        candidate = sibling / "target" / profile / f"bugsee-cli{EXE}"
         if candidate.exists():
             return candidate
 
@@ -225,8 +230,17 @@ def write_project(workdir: Path, version: str) -> Path:
     if platform.system() == "Darwin":
         split = 'split-debuginfo = "packed"'
 
+    # Forward slashes, ALWAYS — including on Windows. `path = "..."` is a TOML
+    # basic string, so it processes escape sequences: a native `E:\bugsee\rust`
+    # is read as `E:<backspace>ugsee<CR>ust`, since `\b` and `\r` are both valid
+    # TOML escapes. That parses cleanly and merely points the dependency at a
+    # directory that does not exist, so the failure surfaces as a baffling
+    # "path dependency not found" with a correct-looking path in the message.
+    # Cargo accepts forward slashes on Windows, so this is safe everywhere.
+    sdk = SDK_ROOT.as_posix()
+
     (root / "Cargo.toml").write_text(
-        CARGO_TOML.format(sdk=SDK_ROOT, version=version, split_debuginfo=split)
+        CARGO_TOML.format(sdk=sdk, version=version, split_debuginfo=split)
     )
     (root / "src" / "main.rs").write_text(MAIN_RS)
     return root
@@ -245,9 +259,17 @@ def build(root: Path, cfg: dict) -> Path:
         flags = env.get("RUSTFLAGS", "")
         env["RUSTFLAGS"] = f"{flags} -C link-arg=-Wl,--build-id".strip()
 
+    # Pin the target dir rather than inheriting it. A CARGO_TARGET_DIR in the
+    # ambient environment (common on machines that redirect builds to a roomier
+    # volume) would silently send the artifacts elsewhere, and every path below
+    # — binary, PDB, the directory handed to the symbol upload — would point at
+    # a target dir that was never written.
+    target = root / "target"
+    env["CARGO_TARGET_DIR"] = str(target)
+
     run(["cargo", "build", "--release"], cwd=root, env=env)
 
-    exe = root / "target" / "release" / "bugsee-deploy-e2e"
+    exe = target / "release" / f"bugsee-deploy-e2e{EXE}"
     if not exe.exists():
         raise Failure(f"build produced no binary at {exe}")
     return exe
@@ -319,12 +341,28 @@ def crash_and_deliver(exe: Path, workdir: Path, run_index: int) -> None:
     crashed = subprocess.run(
         [str(exe), "crash", str(data_dir)], capture_output=True, text=True
     )
-    if crashed.returncode >= 0:
-        raise Failure(
-            f"run {run_index}: expected death by signal, got exit "
-            f"{crashed.returncode} (stdout: {crashed.stdout!r})"
-        )
-    print(f"  ✓ run {run_index}: died on signal {-crashed.returncode}")
+
+    # How a fatal fault shows up in the exit status is platform-specific, and
+    # the POSIX rule is not merely absent on Windows — it is inverted. POSIX
+    # reports death-by-signal as a NEGATIVE returncode; Windows has no signals
+    # and surfaces the NTSTATUS instead, so an access violation arrives as a
+    # LARGE POSITIVE value (0xC0000005 -> 3221225477). Checking `>= 0` there
+    # would reject a textbook segfault as "did not crash".
+    if platform.system() == "Windows":
+        if crashed.returncode == 0:
+            raise Failure(
+                f"run {run_index}: expected a fatal exception, but the process "
+                f"exited cleanly (stdout: {crashed.stdout!r})"
+            )
+        status = crashed.returncode & 0xFFFFFFFF
+        print(f"  ✓ run {run_index}: died with NTSTATUS 0x{status:08X}")
+    else:
+        if crashed.returncode >= 0:
+            raise Failure(
+                f"run {run_index}: expected death by signal, got exit "
+                f"{crashed.returncode} (stdout: {crashed.stdout!r})"
+            )
+        print(f"  ✓ run {run_index}: died on signal {-crashed.returncode}")
 
     delivered = subprocess.run(
         [str(exe), "deliver", str(data_dir)],
