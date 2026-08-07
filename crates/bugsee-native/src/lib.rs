@@ -23,6 +23,10 @@ use std::path::PathBuf;
 use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 
 /// Max crashing-thread frames captured for the dedup signature.
+// Gated to the platforms whose handler actually captures frames. Widening
+// this cfg is part of adding Windows native capture — the helper is needed
+// verbatim there, so it is gated rather than `allow(dead_code)`d.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 const MAX_FRAMES: usize = 64;
 /// Module-map file (base→name) written next to `crash.info` at install time and
 /// read back by recovery to turn crash-time frame PCs into stable module offsets.
@@ -196,11 +200,15 @@ fn on_crash(path_cbytes: &[u8], _cc: &CrashContext) {
 }
 
 /// A small stack-only formatter — no heap, no locks (async-signal-safe).
+// Unix-only until the Windows marker writers exist; they will use this
+// buffer unchanged, which is why it is cfg'd rather than allow'd.
+#[cfg(unix)]
 struct StackBuf {
     buf: [u8; 160],
     len: usize,
 }
 
+#[cfg(unix)]
 impl StackBuf {
     fn new() -> Self {
         StackBuf {
@@ -352,10 +360,9 @@ unsafe fn write_marker(_path_cbytes: &[u8], _signo: i32, _code: i32, _addr: usiz
     // Windows marker writing is added with the Windows exception path.
 }
 
-#[cfg(not(unix))]
-unsafe fn append_frames(_path_cbytes: &[u8], _frames: &[usize]) {
-    // Windows marker writing is added with the Windows exception path.
-}
+// NOTE: there is deliberately no `cfg(not(unix))` `append_frames`. The
+// non-unix `on_crash` captures no frames, so a stub would itself be dead code;
+// the Windows exception path adds both together.
 
 // ---------------------------------------------------------------------------
 // Module map (captured at install) + crash-time frame capture.
@@ -387,6 +394,7 @@ fn write_modules_file(path: &std::path::Path) {
 }
 
 /// Lowercase hex of raw id bytes (the form the symbol service stores).
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
