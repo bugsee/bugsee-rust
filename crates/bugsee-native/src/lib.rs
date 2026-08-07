@@ -394,7 +394,13 @@ fn write_modules_file(path: &std::path::Path) {
 }
 
 /// Lowercase hex of raw id bytes (the form the symbol service stores).
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    windows,
+    test,
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android"
+))]
 fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -637,7 +643,262 @@ fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
     modules
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+// ---------------------------------------------------------------------------
+// Windows: loaded-module map with PE debug ids.
+//
+// The backend keys its symbol store on the identity `symbolic` reads from an
+// uploaded PDB, so the SDK has to report the SAME string or an upload resolves
+// nothing — the exact failure that made Mach-O crashes unsymbolicatable before
+// `code_id` existed. For PE that identity is the CodeView record's GUID + age,
+// rendered the way the `debugid` crate renders it.
+//
+// The parsing is deliberately split from the Win32 enumeration and kept pure so
+// it can be unit-tested on ANY host: the byte-order transform below is the part
+// that is easy to get wrong and impossible to eyeball.
+// ---------------------------------------------------------------------------
+
+/// Read a little-endian `u16` at `off`, or `None` if it would run off the end.
+#[cfg(any(windows, test))]
+fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
+}
+
+/// Read a little-endian `u32` at `off`, or `None` if it would run off the end.
+#[cfg(any(windows, test))]
+fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
+}
+
+/// The debug id of a loaded PE image, in the canonical dashless-lowercase form.
+///
+/// `image` is the module as MAPPED, so data-directory RVAs index straight into
+/// it (`AddressOfRawData`, not the file-offset `PointerToRawData`).
+///
+/// Every field access is bounds-checked against the slice: this walks
+/// attacker-influenced-in-principle headers of arbitrary DLLs, and a malformed
+/// or truncated image must yield `None` rather than read out of bounds.
+///
+/// Returns `None` when the image carries no CodeView record — a DLL built
+/// without debug info. Recovery then simply omits the id, exactly as it does
+/// for an ELF linked without `--build-id`.
+#[cfg(any(windows, test))]
+fn pe_debug_id(image: &[u8]) -> Option<String> {
+    const DOS_MAGIC: u16 = 0x5A4D; // "MZ"
+    const PE_SIG: u32 = 0x0000_4550; // "PE\0\0"
+    const MAGIC_PE32: u16 = 0x010B;
+    const MAGIC_PE32PLUS: u16 = 0x020B;
+    const DIR_DEBUG: usize = 6;
+    const DEBUG_TYPE_CODEVIEW: u32 = 2;
+    const CV_SIG_RSDS: u32 = 0x5344_5352; // "RSDS", little-endian
+                                          // A deterministic (Portable PDB) entry stores the id's second half in
+                                          // TimeDateStamp instead of Age — see the PE-COFF spec's CodeView entry.
+    const MINOR_DETERMINISTIC: u16 = 0x504D;
+
+    if rd_u16(image, 0)? != DOS_MAGIC {
+        return None;
+    }
+    let pe_off = rd_u32(image, 0x3C)? as usize;
+    if rd_u32(image, pe_off)? != PE_SIG {
+        return None;
+    }
+
+    // COFF header is 20 bytes; the optional header follows it.
+    let opt_off = pe_off.checked_add(24)?;
+    // The data directory sits after the magic-dependent tail of the optional
+    // header: 96 bytes for PE32, 112 for PE32+ (the extra 16 come from the
+    // 64-bit fields).
+    let dir_off = match rd_u16(image, opt_off)? {
+        MAGIC_PE32 => opt_off.checked_add(96)?,
+        MAGIC_PE32PLUS => opt_off.checked_add(112)?,
+        _ => return None,
+    };
+
+    let debug_rva = rd_u32(image, dir_off + DIR_DEBUG * 8)? as usize;
+    let debug_size = rd_u32(image, dir_off + DIR_DEBUG * 8 + 4)? as usize;
+    if debug_rva == 0 || debug_size == 0 {
+        return None;
+    }
+
+    // Walk the IMAGE_DEBUG_DIRECTORY array (28 bytes per entry) for CodeView.
+    let count = debug_size / 28;
+    for i in 0..count {
+        let e = debug_rva.checked_add(i * 28)?;
+        if rd_u32(image, e + 12)? != DEBUG_TYPE_CODEVIEW {
+            continue;
+        }
+        let minor = rd_u16(image, e + 10)?;
+        let cv = rd_u32(image, e + 20)? as usize; // AddressOfRawData (an RVA here)
+        if rd_u32(image, cv)? != CV_SIG_RSDS {
+            continue;
+        }
+
+        let guid: &[u8] = image.get(cv + 4..cv + 20)?;
+        let age = if minor == MINOR_DETERMINISTIC {
+            rd_u32(image, e + 4)? // TimeDateStamp
+        } else {
+            rd_u32(image, cv + 20)? // Age
+        };
+        return Some(format_pe_debug_id(guid, age));
+    }
+
+    None
+}
+
+/// Render a CodeView GUID + age the way the symbol store stores it.
+///
+/// **The byte order is the whole point.** A CodeView GUID is stored
+/// mixed-endian — the first three fields little-endian, the last eight bytes
+/// as-is — so the printed id is NOT the raw bytes in order. Getting this wrong
+/// produces a plausible-looking id that matches no symbol file ever, which is
+/// invisible without an end-to-end upload.
+///
+/// The age is appended as lowercase hex and **omitted entirely when zero**,
+/// matching how `debugid` renders it; always appending `0` would mismatch every
+/// module whose age is zero.
+#[cfg(any(windows, test))]
+fn format_pe_debug_id(guid: &[u8], age: u32) -> String {
+    let swapped = [
+        guid[3], guid[2], guid[1], guid[0], // Data1, LE
+        guid[5], guid[4], // Data2, LE
+        guid[7], guid[6], // Data3, LE
+        guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15],
+    ];
+    let mut s = hex_lower(&swapped);
+    if age != 0 {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{age:x}");
+    }
+    s
+}
+
+/// Minimal Win32 bindings.
+///
+/// Declared here rather than pulling a binding crate, mirroring what
+/// `crash-handler` itself does (it dropped `winapi` for embedded bindings). The
+/// surface is four stable, decades-old entry points; a whole crate to reach
+/// them would be a poor trade for a library that keeps its dependency list
+/// deliberately short. All four live in `kernel32`, which Rust links by default
+/// on Windows targets — the `K32`-prefixed forms exist precisely so `psapi` is
+/// not needed.
+#[cfg(windows)]
+mod win32 {
+    #[repr(C)]
+    pub struct ModuleInfo {
+        pub base_of_dll: *mut core::ffi::c_void,
+        pub size_of_image: u32,
+        pub entry_point: *mut core::ffi::c_void,
+    }
+
+    unsafe extern "system" {
+        pub fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        pub fn K32EnumProcessModules(
+            process: *mut core::ffi::c_void,
+            modules: *mut *mut core::ffi::c_void,
+            cb: u32,
+            needed: *mut u32,
+        ) -> i32;
+        pub fn K32GetModuleInformation(
+            process: *mut core::ffi::c_void,
+            module: *mut core::ffi::c_void,
+            info: *mut ModuleInfo,
+            cb: u32,
+        ) -> i32;
+        pub fn K32GetModuleFileNameExW(
+            process: *mut core::ffi::c_void,
+            module: *mut core::ffi::c_void,
+            filename: *mut u16,
+            size: u32,
+        ) -> u32;
+    }
+}
+
+/// Enumerate loaded modules as `(load_base, image_size, code_id, name)`.
+///
+/// Runs from `install`, in normal context — NOT from the handler. That is what
+/// makes ordinary enumeration safe here: calling this on a crashing thread is
+/// the classic crash-reporter deadlock, because the module APIs can take the
+/// loader lock the faulting thread may already hold.
+///
+/// The consequence is the same one the Apple and Linux paths carry: a module
+/// loaded AFTER install is absent from the map, so a crash inside it reports
+/// but cannot be symbolicated. That bites harder on Windows, where plugins and
+/// delay-loaded DLLs are routine — a known limitation, not an oversight.
+#[cfg(windows)]
+fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
+    // Generous but bounded: a large process can map a few hundred modules, and
+    // this runs once at startup.
+    const MAX_MODULES: usize = 1024;
+    let mut out = Vec::new();
+
+    unsafe {
+        let process = win32::GetCurrentProcess();
+        let mut handles: Vec<*mut core::ffi::c_void> = vec![core::ptr::null_mut(); MAX_MODULES];
+        let mut needed: u32 = 0;
+        let cb = (handles.len() * core::mem::size_of::<*mut core::ffi::c_void>()) as u32;
+        if win32::K32EnumProcessModules(process, handles.as_mut_ptr(), cb, &mut needed) == 0 {
+            return out;
+        }
+        // `needed` reports the bytes REQUIRED, which may exceed what was
+        // written; clamp so a process with more modules than the cap truncates
+        // instead of reading uninitialised handles.
+        let count =
+            (needed as usize / core::mem::size_of::<*mut core::ffi::c_void>()).min(handles.len());
+
+        for &module in handles.iter().take(count) {
+            if module.is_null() {
+                continue;
+            }
+
+            let mut info = win32::ModuleInfo {
+                base_of_dll: core::ptr::null_mut(),
+                size_of_image: 0,
+                entry_point: core::ptr::null_mut(),
+            };
+            if win32::K32GetModuleInformation(
+                process,
+                module,
+                &mut info,
+                core::mem::size_of::<win32::ModuleInfo>() as u32,
+            ) == 0
+            {
+                continue;
+            }
+            let base = info.base_of_dll as usize;
+            let size = info.size_of_image as usize;
+            if base == 0 || size == 0 {
+                continue;
+            }
+
+            let mut buf = [0u16; 260]; // MAX_PATH
+            let n = win32::K32GetModuleFileNameExW(process, module, buf.as_mut_ptr(), 260);
+            let path = String::from_utf16_lossy(&buf[..n as usize]);
+
+            // The mapped image, read through the loaded pages: data-directory
+            // RVAs index straight into this.
+            let image = core::slice::from_raw_parts(base as *const u8, size);
+            let code_id = pe_debug_id(image).unwrap_or_default();
+
+            out.push((base, size, code_id, basename(&path)));
+        }
+    }
+
+    out
+}
+
+/// Last path component. Windows separates with `\`, and accepts `/` too, so
+/// both are honoured — a module reported by its full path would never match the
+/// frame's module name, which the worker joins on.
+#[cfg(windows)]
+fn basename(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
+#[cfg(not(any(
+    windows,
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android"
+)))]
 fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
     Vec::new()
 }
@@ -788,4 +1049,112 @@ fn capture_frames(_cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
         });
     }
     n
+}
+
+#[cfg(test)]
+mod pe_tests {
+    use super::*;
+
+    /// Build a minimal mapped PE32+ image carrying one CodeView record.
+    ///
+    /// Synthetic on purpose: the real check is the byte-order transform, and a
+    /// hand-built image lets it be asserted on every host rather than only on a
+    /// Windows runner — where a wrong id would still *look* like a plausible id.
+    fn image_with_codeview(guid: &[u8; 16], age: u32, minor: u16) -> Vec<u8> {
+        let mut img = vec![0u8; 0x800];
+        img[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // "MZ"
+        let pe = 0x100usize;
+        img[0x3C..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+        img[pe..pe + 4].copy_from_slice(&0x0000_4550u32.to_le_bytes()); // "PE\0\0"
+
+        let opt = pe + 24;
+        img[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+        let dir = opt + 112; // data directory for PE32+
+
+        // DataDirectory[6] = DEBUG -> one 28-byte entry at RVA 0x400.
+        let dbg_rva = 0x400usize;
+        img[dir + 6 * 8..dir + 6 * 8 + 4].copy_from_slice(&(dbg_rva as u32).to_le_bytes());
+        img[dir + 6 * 8 + 4..dir + 6 * 8 + 8].copy_from_slice(&28u32.to_le_bytes());
+
+        let cv_rva = 0x500usize;
+        img[dbg_rva + 4..dbg_rva + 8].copy_from_slice(&age.to_le_bytes()); // TimeDateStamp
+        img[dbg_rva + 10..dbg_rva + 12].copy_from_slice(&minor.to_le_bytes());
+        img[dbg_rva + 12..dbg_rva + 16].copy_from_slice(&2u32.to_le_bytes()); // CODEVIEW
+        img[dbg_rva + 20..dbg_rva + 24].copy_from_slice(&(cv_rva as u32).to_le_bytes());
+
+        img[cv_rva..cv_rva + 4].copy_from_slice(&0x5344_5352u32.to_le_bytes()); // "RSDS"
+        img[cv_rva + 4..cv_rva + 20].copy_from_slice(guid);
+        img[cv_rva + 20..cv_rva + 24].copy_from_slice(&age.to_le_bytes()); // Age
+        img
+    }
+
+    /// The GUID bytes as a CodeView record stores them, and the id the symbol
+    /// store holds for them. Mixed-endian: first three fields byte-swapped,
+    /// last eight verbatim.
+    const GUID: [u8; 16] = [
+        0x3A, 0xE4, 0xB8, 0xDF, // Data1 LE -> dfb8e43a
+        0x42, 0xF2, // Data2 LE -> f242
+        0x73, 0x3D, // Data3 LE -> 3d73
+        0xA4, 0x53, 0xAE, 0xB6, 0xA7, 0x77, 0xEF, 0x75, // Data4 verbatim
+    ];
+    const UUID_HEX: &str = "dfb8e43af2423d73a453aeb6a777ef75";
+
+    #[test]
+    fn guid_is_byte_swapped_not_copied_in_order() {
+        // The regression that matters: a straight hex dump of the raw bytes
+        // yields `3ae4b8df...`, which matches no symbol file ever uploaded.
+        let id = format_pe_debug_id(&GUID, 1);
+        assert_eq!(id, format!("{UUID_HEX}1"));
+        assert!(!id.starts_with("3ae4b8df"), "raw byte order leaked: {id}");
+    }
+
+    #[test]
+    fn a_zero_age_is_omitted_entirely() {
+        // `debugid` renders the age only when non-zero. Appending a literal
+        // "0" would mismatch every module built with age 0.
+        assert_eq!(format_pe_debug_id(&GUID, 0), UUID_HEX);
+    }
+
+    #[test]
+    fn a_multi_digit_age_is_lowercase_hex_not_decimal() {
+        assert_eq!(format_pe_debug_id(&GUID, 26), format!("{UUID_HEX}1a"));
+    }
+
+    #[test]
+    fn parses_a_mapped_image_end_to_end() {
+        let img = image_with_codeview(&GUID, 1, 0);
+        assert_eq!(pe_debug_id(&img).as_deref(), Some(&*format!("{UUID_HEX}1")));
+    }
+
+    #[test]
+    fn a_deterministic_entry_takes_its_age_from_the_timestamp() {
+        // Portable-PDB / deterministic builds (MinorVersion 0x504d) carry the
+        // second half of the id in TimeDateStamp instead of Age.
+        let img = image_with_codeview(&GUID, 0x2A, 0x504D);
+        assert_eq!(
+            pe_debug_id(&img).as_deref(),
+            Some(&*format!("{UUID_HEX}2a"))
+        );
+    }
+
+    #[test]
+    fn malformed_or_debugless_images_yield_none_rather_than_reading_wild() {
+        // This walks the headers of arbitrary third-party DLLs, so anything
+        // unexpected must return None, never index out of bounds.
+        assert_eq!(pe_debug_id(&[]), None);
+        assert_eq!(pe_debug_id(&[0u8; 64]), None, "no MZ");
+
+        let mut no_debug = image_with_codeview(&GUID, 1, 0);
+        let pe = 0x100usize;
+        let dir = pe + 24 + 112;
+        no_debug[dir + 48..dir + 56].fill(0); // clear the DEBUG directory
+        assert_eq!(pe_debug_id(&no_debug), None);
+
+        let truncated = &image_with_codeview(&GUID, 1, 0)[..0x420];
+        assert_eq!(pe_debug_id(truncated), None, "CodeView record off the end");
+
+        let mut bad_pe = image_with_codeview(&GUID, 1, 0);
+        bad_pe[0x3C..0x40].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert_eq!(pe_debug_id(&bad_pe), None, "e_lfanew past the image");
+    }
 }
