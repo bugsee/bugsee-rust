@@ -1,6 +1,6 @@
 # Bugsee Rust SDK — Progress
 
-_Snapshot: 2026-08-07 · `main` @ `de0a55e` (pushed, nothing unpushed) · 148 tests, 0 failed · clippy `-D warnings` + fmt clean **on Linux, macOS and Windows** · MSRV 1.88 (`Cargo.lock` committed, CI `--locked`). Working tree clean._
+_Snapshot: 2026-08-07 · `main` @ `0164a30` · 149 tests on macOS / 121 on Windows, 0 failed · clippy `-D warnings` + fmt clean **on Linux, macOS and Windows** · MSRV 1.88 (`Cargo.lock` committed, CI `--locked`). The Windows figure is lower only because the Apple-gated tests do not compile there; it was measured on a real Windows 11 x64 host, not in CI._
 
 > **Ingestion is verified end to end against a live deployment.** A real crash
 > from a real binary routes, symbolicates against uploaded symbols, and groups
@@ -342,9 +342,36 @@ could not use, or whose module map came out empty, passed both.
 modules, a client dedup signature. No network or credentials, so it runs in the
 ordinary matrix — and it passes on Windows.
 
-**Still unproven, and only a Windows host can prove it:** uploading a real PDB
-with `bugsee-cli` and confirming frames actually symbolicate on a deployment.
-The id format is verified by construction; that last hop is not.
+**The PDB hop is now proven on real hardware** (Windows 11 x64, 2026-08-07).
+The whole workspace — 121 tests — passes natively there, including the two that
+had only ever run in CI: a real SEH access violation producing a marker, and our
+PE CodeView parse agreeing with `symbolic` on a real PE. Then the full
+`deployment_e2e.py` round trip against apidev: build with a PDB → upload →
+crash → recover → deliver, twice.
+
+Both events grouped onto **one** issue, and the frames **resolved** —
+`core::ptr::write_volatile()` at `library/core/src/ptr/mod.rs:2194`, function
+and line, from a report that carries nothing but addresses. The identity match
+is exact rather than inferred: `bugsee-cli` keyed the upload on
+`77d8e168-d091-40ed-aad3-1206b1809c77-1`, the crash reported
+`77d8e168d09140edaad31206b1809c771`, and those are the same string once
+canonicalized. That is the mixed-endian CodeView GUID+age formatting confirmed
+against the authority both the CLI and the worker use.
+
+**What the run cost to get there** — the harness had never executed on Windows,
+and carried three defects that each stopped it dead (fixed in `0164a30`): a
+missing `.exe` suffix; a crash check applying the POSIX death-by-signal rule,
+which is *inverted* on Windows, where an access violation arrives as a large
+positive NTSTATUS (`0xC0000005`) rather than a negative returncode; and a native
+path interpolated into `path = "..."`, a TOML **basic** string, so `E:\bugsee\rust`
+parsed as `E:<backspace>ugsee<CR>ust` — cleanly, pointing the dependency at a
+directory that does not exist and reporting a path that looks correct.
+
+**One finding is the backend's, not ours.** The issue came back
+`symbolication_status = "missing_sym"` with an empty key despite our module
+resolving, because a Windows module map necessarily includes ~25 Microsoft
+system DLLs whose symbols nobody can upload. So the issue is unaddressable by
+key via the MCP tools, permanently rather than transiently.
 
 **Two limitations, recorded rather than hidden.** Frames after index 0 may
 include a few handler frames — `RtlCaptureStackBackTrace` starts where it is
@@ -386,13 +413,14 @@ can fix.
 
 ### Next up — actionable now
 
-1. **Symbolicate a Windows crash against a real PDB.** The one hop nothing has
-   exercised: `bugsee-cli debug-files upload --type rust` from a Windows host,
-   then confirm the frames resolve on a deployment. The `code_id` format is
-   verified against the shared canonicalization vectors by construction, but
-   construction is not the same as a round trip — the equivalent step on macOS
-   is what caught six defects. Needs a Windows machine and an app token;
-   `tests/integration/deployment_e2e.py` already does everything else.
+1. **`missing_sym` never clears on Windows, and the issue never gets a key.**
+   Backend-side, surfaced by the round trip above. A Windows module map always
+   carries ~25 Microsoft system DLLs that no one can supply symbols for, so the
+   issue stays `missing_sym` and keyless even when the application's own frames
+   resolve — which means `get_issue` / `get_issue_resource` cannot address it at
+   all. Android NDK almost certainly has the same shape. Either
+   known-unsymbolicatable system modules should not count toward the status, or
+   key assignment should not wait on complete symbolication.
 2. **JavaScript `source_*` adoption** — deferred, not dropped: there is parallel
    work in flight on that SDK. Findings are held for whoever owns it. Note the
    browser SDK is also the remaining producer exposed to the
