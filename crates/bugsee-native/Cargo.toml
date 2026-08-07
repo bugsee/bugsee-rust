@@ -23,3 +23,14 @@ mach2 = "0.4"
 # unwinder captures its own stack (handles both x86_64 and aarch64).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 backtrace = "0.3"
+
+# Dev-only: the AUTHORITATIVE implementation of a module's debug identity — the
+# same crate `bugsee-cli` uses to key an upload and the worker uses to key the
+# symbol store. Present so a test can cross-check what this crate reports at
+# crash time against what the pipeline will store, rather than against another
+# copy of our own arithmetic.
+[dev-dependencies]
+# Default features: the granular ones are not actually independent
+# (`sourcebundle` is required by `base`/`dwarf` regardless), so pinning a subset
+# fails to compile. Dev-only, so the weight costs test builds and nothing shipped.
+symbolic-debuginfo = "13"

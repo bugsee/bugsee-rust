@@ -78,6 +78,17 @@ type PathChar = u16;
 #[cfg(not(any(unix, windows)))]
 type PathChar = u8;
 
+/// The loaded-module map, exposed for tests only.
+///
+/// Lets a test cross-check the identity this crate reports at crash time
+/// against `symbolic` — the crate the CLI keys an upload on and the worker keys
+/// the symbol store on. A mismatch there is silent: symbolication simply
+/// resolves nothing.
+#[doc(hidden)]
+pub fn snapshot_modules_for_test() -> Vec<(usize, usize, String, String)> {
+    snapshot_modules()
+}
+
 /// NUL-terminated path, prepared at install time so the crash-time path
 /// performs no allocation.
 #[cfg(unix)]
