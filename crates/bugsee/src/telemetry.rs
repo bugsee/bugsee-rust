@@ -124,36 +124,36 @@ fn disk_for(data_dir: &Path) -> (Option<u64>, Option<u64>) {
 
 /// `platform.locale` in the `en_US` form the other SDKs report.
 ///
-/// Unix reads the POSIX environment, most specific first, exactly as the C
-/// library resolves it. The encoding and modifier suffixes are dropped
+/// Reads the POSIX environment, most specific first, exactly as the C library
+/// resolves it. Encoding and modifier suffixes are dropped
 /// (`en_US.UTF-8@euro` -> `en_US`) so the value matches what Android and iOS
 /// send; `"C"` and `"POSIX"` mean "no locale configured" and are reported as
 /// absent rather than as a language.
 ///
-/// Windows returns `None` for now: there is no environment convention to read
-/// and `GetUserDefaultLocaleName` needs either a Win32 binding or a crate, and
-/// this SDK has taken no new dependencies. The field is optional, so a Windows
-/// report is simply missing it rather than carrying a wrong value.
+/// The lookup is NOT unix-gated. Those variables are a convention rather than a
+/// syscall, and Windows environments do set them — MSYS2, Cygwin, Git Bash and
+/// plenty of CI images — so reading them there costs nothing and is right when
+/// present. Gating it off would also have meant gating this function's tests,
+/// losing coverage of platform-independent string logic for no benefit.
+///
+/// What Windows still lacks is the *fallback* when the environment says
+/// nothing: `GetUserDefaultLocaleName` needs a Win32 binding or a crate, and
+/// this SDK has taken no new dependencies. The field is optional, so such a
+/// report simply omits it rather than carrying a wrong value.
 fn locale() -> Option<String> {
-    #[cfg(unix)]
-    {
-        // Most specific first, exactly as the C library resolves it.
-        ["LC_ALL", "LC_MESSAGES", "LANG"]
-            .into_iter()
-            .filter_map(|key| std::env::var(key).ok())
-            .find_map(|raw| normalize_locale(&raw))
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find_map(|raw| normalize_locale(&raw))
 }
 
 /// `en_US.UTF-8@euro` -> `en_US`; `C`/`POSIX`/empty -> `None`.
 ///
 /// Split out from [`locale`] so the rule is testable without mutating process
 /// environment — the ambient locale differs per machine and CI runner, so an
-/// environment-driven test asserts nothing on a host set to `C`.
+/// environment-driven test asserts nothing on a host set to `C`. Being a plain
+/// string transform, it is worth testing on every platform, which is the other
+/// reason [`locale`] is not unix-gated.
 fn normalize_locale(raw: &str) -> Option<String> {
     let value = raw.split(['.', '@']).next().unwrap_or("").trim();
     // "C" and "POSIX" mean "no locale configured"; reporting either as if it
