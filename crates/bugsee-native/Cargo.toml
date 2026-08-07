@@ -10,7 +10,7 @@ description = "Native fatal-crash handler (signal/exception) for the Bugsee Rust
 
 [dependencies]
 bugsee-core = { workspace = true }
-crash-handler = "0.8"
+crash-handler = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
