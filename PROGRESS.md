@@ -490,4 +490,6 @@ Rust and are worth evaluating before building one.
 - Phase 4: sessions / release-health.
 - Phase 5: general PII scrubber, rate limits.
 - Phase 6: iOS/Android target builds; Swift/Kotlin language wrappers.
-- CI: cross-platform matrix (currently ubuntu-only); loom/miri/fuzz jobs.
+- CI: ~~cross-platform matrix~~ **done**; loom/miri/fuzz jobs still open — fuzzing is
+  newly justified now that `pe_debug_id` parses headers of arbitrary third-party
+  DLLs, and the marker/module-map readers parse files a crash can truncate mid-write.
