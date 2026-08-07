@@ -7,6 +7,18 @@
 //! A real fatal-crash test: a child process installs the native handler and
 //! dereferences null; the parent asserts the crash-info marker was written and
 //! the child died from the signal.
+//!
+//! **Unix only, and that gate is the point.** On Windows `write_marker` and
+//! `append_frames` are still no-op stubs (`bugsee-native/src/lib.rs`), so an
+//! access violation produces no marker at all — the handler installs, the
+//! process dies, and nothing is recorded. This test would fail there for a real
+//! reason, not an environmental one.
+//!
+//! **Deleting `#![cfg(unix)]` is the acceptance criterion for the Windows
+//! native work.** The assertions below need no changes to be meaningful there:
+//! the marker format is shared, and a Windows `EXCEPTION_ACCESS_VIOLATION` is
+//! expected to map to `signal=11` exactly as `EXC_BAD_ACCESS` does on Apple.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Command;
