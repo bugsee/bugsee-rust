@@ -63,10 +63,20 @@ pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
     Ok(NativeHandler { _handler: handler })
 }
 
-/// NUL-terminated path bytes, prepared at install time so the crash-time path
+/// The element type of the prepared path: bytes for the POSIX `open`, UTF-16
+/// units for `CreateFileW`. Both are NUL-terminated at install time so the
+/// crash-time path allocates nothing.
+#[cfg(unix)]
+type PathChar = u8;
+#[cfg(windows)]
+type PathChar = u16;
+#[cfg(not(any(unix, windows)))]
+type PathChar = u8;
+
+/// NUL-terminated path, prepared at install time so the crash-time path
 /// performs no allocation.
 #[cfg(unix)]
-fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
+fn path_to_cbytes(path: &std::path::Path) -> Vec<PathChar> {
     use std::os::unix::ffi::OsStrExt;
     // Use the real OS bytes (paths are not guaranteed UTF-8); a lossy conversion
     // would target the wrong file and silently lose the crash marker.
@@ -75,8 +85,23 @@ fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
     bytes
 }
 
-#[cfg(not(unix))]
-fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
+/// UTF-16 for `CreateFileW`, deliberately not the ANSI `CreateFileA`.
+///
+/// A Windows path is UTF-16 natively, and the ANSI form goes through the
+/// active code page: a data directory under a profile like `C:\Users\Ünal`
+/// would resolve to a different path or fail outright, losing the crash marker
+/// on exactly the machines least able to report it. `encode_wide` is the
+/// lossless conversion.
+#[cfg(windows)]
+fn path_to_cbytes(path: &std::path::Path) -> Vec<PathChar> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    units.push(0);
+    units
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_to_cbytes(path: &std::path::Path) -> Vec<PathChar> {
     let mut bytes = path.to_string_lossy().into_owned().into_bytes();
     bytes.push(0);
     bytes
@@ -84,7 +109,7 @@ fn path_to_cbytes(path: &std::path::Path) -> Vec<u8> {
 
 // Linux/Android deliver a POSIX signal — `siginfo` carries signo/code/addr.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
+fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
     let si = &cc.siginfo;
     let signo = si.ssi_signo as i32;
     let code = si.ssi_code;
@@ -134,7 +159,7 @@ fn fault_address(si: &libc::signalfd_siginfo, signo: i32) -> usize {
 
 // Apple platforms deliver a Mach exception — map it to the closest signal.
 #[cfg(target_vendor = "apple")]
-fn on_crash(path_cbytes: &[u8], cc: &CrashContext) {
+fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
     // Mach exception kinds + codes we special-case (mach/exception_types.h).
     const EXC_BAD_ACCESS: u32 = 1;
     const EXC_SOFTWARE: u32 = 5;
@@ -193,22 +218,20 @@ fn mach_to_signal(kind: u32) -> i32 {
 
 // Other Unixes / Windows: record that a crash occurred; details vary per OS.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn on_crash(path_cbytes: &[u8], _cc: &CrashContext) {
+fn on_crash(path_cbytes: &[PathChar], _cc: &CrashContext) {
     unsafe {
         write_marker(path_cbytes, 0, 0, 0);
     }
 }
 
 /// A small stack-only formatter — no heap, no locks (async-signal-safe).
-// Unix-only until the Windows marker writers exist; they will use this
-// buffer unchanged, which is why it is cfg'd rather than allow'd.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct StackBuf {
     buf: [u8; 160],
     len: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl StackBuf {
     fn new() -> Self {
         StackBuf {
@@ -279,7 +302,7 @@ impl StackBuf {
 /// non-async-signal-safe) frame capture runs — a re-fault there then loses only
 /// the frames, not the whole crash report (F29).
 #[cfg(unix)]
-unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize) {
+unsafe fn write_marker(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize) {
     let fd = unsafe {
         libc::open(
             path_cbytes.as_ptr() as *const libc::c_char,
@@ -327,7 +350,7 @@ unsafe fn write_marker(path_cbytes: &[u8], signo: i32, code: i32, addr: usize) {
 /// line is formatted in its own stack buffer and written immediately (no heap),
 /// so an arbitrary frame count never overruns a single fixed buffer.
 #[cfg(unix)]
-unsafe fn append_frames(path_cbytes: &[u8], frames: &[usize]) {
+unsafe fn append_frames(path_cbytes: &[PathChar], frames: &[usize]) {
     if frames.is_empty() {
         return;
     }
@@ -355,8 +378,196 @@ unsafe fn append_frames(path_cbytes: &[u8], frames: &[usize]) {
     }
 }
 
-#[cfg(not(unix))]
-unsafe fn write_marker(_path_cbytes: &[u8], _signo: i32, _code: i32, _addr: usize) {
+/// Map a Windows exception code onto the POSIX signal number the wire contract
+/// uses, mirroring `mach_to_signal` on Apple.
+///
+/// `crash.json`'s `signal` object is shared across SDKs and consumers read a
+/// POSIX signal there, so the platform vocabulary is translated once, here.
+/// An unrecognised exception reports 0 rather than being rounded to SIGABRT —
+/// the same choice the Apple mapping makes, because a wrong signal is worse
+/// than an honestly unknown one.
+#[cfg(any(windows, test))]
+fn exception_to_signal(code: i32) -> i32 {
+    const SIGILL: i32 = 4;
+    const SIGTRAP: i32 = 5;
+    const SIGABRT: i32 = 6;
+    const SIGBUS: i32 = 7;
+    const SIGFPE: i32 = 8;
+    const SIGSEGV: i32 = 11;
+
+    match code as u32 {
+        0xC000_0005 => SIGSEGV, // ACCESS_VIOLATION
+        // A stack overflow IS a memory fault; reporting it as SIGSEGV keeps it
+        // with the other faults rather than inventing a Windows-only number.
+        0xC000_00FD => SIGSEGV, // STACK_OVERFLOW
+        0xC000_001D => SIGILL,  // ILLEGAL_INSTRUCTION
+        0xC000_0096 => SIGILL,  // PRIVILEGED_INSTRUCTION
+        0x8000_0002 => SIGBUS,  // DATATYPE_MISALIGNMENT
+        0xC000_008C => SIGSEGV, // ARRAY_BOUNDS_EXCEEDED
+        0xC000_0094 => SIGFPE,  // INT_DIVIDE_BY_ZERO
+        0xC000_0095 => SIGFPE,  // INT_OVERFLOW
+        0xC000_008E => SIGFPE,  // FLT_DIVIDE_BY_ZERO
+        0x8000_0003 => SIGTRAP, // BREAKPOINT
+        // The CRT/abort family: these really are "the program gave up".
+        0xC000_0374 => SIGABRT, // HEAP_CORRUPTION
+        0x4000_0015 => SIGABRT, // FATAL_APP_EXIT
+        0xC000_000D => SIGABRT, // INVALID_PARAMETER
+        0xC000_0025 => SIGABRT, // NONCONTINUABLE_EXCEPTION (purecall)
+        _ => 0,
+    }
+}
+
+/// The faulting ADDRESS for an access violation, or 0.
+///
+/// Deliberately not `ExceptionAddress`, which is the instruction that faulted —
+/// the unix `si_addr` this field mirrors is the address that was *accessed*,
+/// and for an access violation Windows puts that in `ExceptionInformation[1]`.
+/// Reporting the instruction pointer instead would look plausible and be wrong.
+#[cfg(windows)]
+unsafe fn fault_address(cc: &CrashContext) -> usize {
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+
+    if cc.exception_pointers.is_null() {
+        return 0;
+    }
+    let record = unsafe { (*cc.exception_pointers).ExceptionRecord };
+    if record.is_null() {
+        return 0;
+    }
+    let record = unsafe { &*record };
+    if record.ExceptionCode as u32 != EXCEPTION_ACCESS_VIOLATION {
+        return 0;
+    }
+    // [0] is the access type (read/write/execute), [1] the address touched.
+    record.ExceptionInformation[1]
+}
+
+#[cfg(windows)]
+fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
+    let signo = exception_to_signal(cc.exception_code);
+    let addr = unsafe { fault_address(cc) };
+    // `code` stays 0: it mirrors POSIX `si_code`, and Windows has no equivalent
+    // vocabulary. The access type IS available in ExceptionInformation[0], but
+    // putting it in a field consumers read as an si_code would be a wrong
+    // answer in a right-shaped slot.
+    unsafe {
+        write_marker(path_cbytes, signo, 0, addr);
+    }
+    // Frame capture is added with the stack walk; the header is written first
+    // and independently so it survives regardless (F29).
+}
+
+/// Open the marker for writing, creating/truncating it. Returns the raw handle
+/// or `INVALID_HANDLE_VALUE`.
+///
+/// `CreateFileW`/`WriteFile` are the analogue of the unix `open`/`write` used
+/// here: plain kernel calls that take no loader lock and allocate nothing, so
+/// they are usable from an exception handler.
+#[cfg(windows)]
+unsafe fn open_marker(path_cbytes: &[PathChar], append: bool) -> *mut core::ffi::c_void {
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_APPEND_DATA: u32 = 0x0004;
+    const CREATE_ALWAYS: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    let (access, disposition) = if append {
+        (FILE_APPEND_DATA, OPEN_EXISTING)
+    } else {
+        (GENERIC_WRITE, CREATE_ALWAYS)
+    };
+
+    unsafe {
+        win32::CreateFileW(
+            path_cbytes.as_ptr(),
+            access,
+            0,
+            core::ptr::null_mut(),
+            disposition,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+#[cfg(windows)]
+unsafe fn write_all(handle: *mut core::ffi::c_void, bytes: &[u8]) {
+    let mut written: u32 = 0;
+    unsafe {
+        win32::WriteFile(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        );
+    }
+}
+
+/// Write the crash-info marker. Byte-for-byte the same document the unix path
+/// writes, so recovery parses it with no platform knowledge at all.
+#[cfg(windows)]
+unsafe fn write_marker(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize) {
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    let handle = unsafe { open_marker(path_cbytes, false) };
+    if handle as isize == INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    // Crash time (epoch ms), so next-launch recovery can bound panic<->crash
+    // correlation by freshness exactly as it does on unix. FILETIME counts
+    // 100ns ticks from 1601; the constant is the offset to the Unix epoch.
+    const TICKS_PER_MS: u64 = 10_000;
+    const EPOCH_DELTA_MS: u64 = 11_644_473_600_000;
+    let mut ft = win32::FileTime { low: 0, high: 0 };
+    unsafe { win32::GetSystemTimeAsFileTime(&mut ft) };
+    let ticks = ((ft.high as u64) << 32) | ft.low as u64;
+    let time_ms = (ticks / TICKS_PER_MS).saturating_sub(EPOCH_DELTA_MS) as i64;
+
+    let mut b = StackBuf::new();
+    b.s(b"signal=");
+    b.dec(signo as i64);
+    b.s(b"\ncode=");
+    b.dec(code as i64);
+    b.s(b"\naddress=0x");
+    b.hex(addr);
+    b.s(b"\ntime=");
+    b.dec(time_ms);
+    b.byte(b'\n');
+    unsafe {
+        write_all(handle, &b.buf[..b.len]);
+        win32::CloseHandle(handle);
+    }
+}
+
+/// Append one `frame=0x<pc>` line per captured PC, mirroring the unix path:
+/// kept separate so the header survives even if frame capture faulted (F29),
+/// and each line formatted in its own stack buffer so an arbitrary frame count
+/// cannot overrun one fixed buffer.
+#[cfg(windows)]
+unsafe fn append_frames(path_cbytes: &[PathChar], frames: &[usize]) {
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    if frames.is_empty() {
+        return;
+    }
+    let handle = unsafe { open_marker(path_cbytes, true) };
+    if handle as isize == INVALID_HANDLE_VALUE {
+        return;
+    }
+    for pc in frames {
+        let mut fb = StackBuf::new();
+        fb.s(b"frame=0x");
+        fb.hex(*pc);
+        fb.byte(b'\n');
+        unsafe { write_all(handle, &fb.buf[..fb.len]) };
+    }
+    unsafe { win32::CloseHandle(handle) };
+}
+
+#[cfg(not(any(unix, windows)))]
+unsafe fn write_marker(_path_cbytes: &[PathChar], _signo: i32, _code: i32, _addr: usize) {
     // Windows marker writing is added with the Windows exception path.
 }
 
@@ -789,8 +1000,32 @@ mod win32 {
         pub entry_point: *mut core::ffi::c_void,
     }
 
+    #[repr(C)]
+    pub struct FileTime {
+        pub low: u32,
+        pub high: u32,
+    }
+
     unsafe extern "system" {
         pub fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        pub fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut core::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        pub fn WriteFile(
+            handle: *mut core::ffi::c_void,
+            buf: *const u8,
+            len: u32,
+            written: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+        pub fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        pub fn GetSystemTimeAsFileTime(ft: *mut FileTime);
         pub fn K32EnumProcessModules(
             process: *mut core::ffi::c_void,
             modules: *mut *mut core::ffi::c_void,
@@ -1156,5 +1391,49 @@ mod pe_tests {
         let mut bad_pe = image_with_codeview(&GUID, 1, 0);
         bad_pe[0x3C..0x40].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         assert_eq!(pe_debug_id(&bad_pe), None, "e_lfanew past the image");
+    }
+}
+
+#[cfg(test)]
+mod windows_signal_tests {
+    use super::*;
+
+    #[test]
+    fn faults_map_to_the_posix_signals_the_contract_uses() {
+        // `crash.json`'s `signal` object is shared across SDKs; consumers read a
+        // POSIX number there, so the Windows vocabulary is translated once.
+        assert_eq!(exception_to_signal(0xC000_0005u32 as i32), 11, "SIGSEGV");
+        assert_eq!(exception_to_signal(0xC000_001Du32 as i32), 4, "SIGILL");
+        assert_eq!(exception_to_signal(0xC000_0094u32 as i32), 8, "SIGFPE");
+        assert_eq!(exception_to_signal(0x8000_0003u32 as i32), 5, "SIGTRAP");
+        assert_eq!(exception_to_signal(0x8000_0002u32 as i32), 7, "SIGBUS");
+    }
+
+    #[test]
+    fn a_stack_overflow_is_reported_as_a_memory_fault() {
+        // It IS one. Grouping it with the other faults beats inventing a
+        // Windows-only number the rest of the pipeline has never seen.
+        assert_eq!(exception_to_signal(0xC000_00FDu32 as i32), 11);
+    }
+
+    #[test]
+    fn the_abort_family_maps_to_sigabrt() {
+        for code in [
+            0xC000_0374u32, // HEAP_CORRUPTION
+            0x4000_0015,    // FATAL_APP_EXIT
+            0xC000_000D,    // INVALID_PARAMETER
+            0xC000_0025,    // NONCONTINUABLE_EXCEPTION (purecall)
+        ] {
+            assert_eq!(exception_to_signal(code as i32), 6, "code {code:#x}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_exception_is_zero_not_rounded_to_sigabrt() {
+        // Same choice the Apple mapping makes: a wrong signal is worse than an
+        // honestly unknown one, and 0 is what the wire contract expects for
+        // "could not be named".
+        assert_eq!(exception_to_signal(0xDEAD_BEEFu32 as i32), 0);
+        assert_eq!(exception_to_signal(0), 0);
     }
 }
