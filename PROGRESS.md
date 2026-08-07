@@ -382,10 +382,38 @@ right and the schema was missing it.
    Third-party; track upstream / consider a fork or a different backend.
 5. **Dependency-spec dedup** (LOW): centralize `zip`/`backtrace` in `[workspace.dependencies]`.
 
+### Architecture to revisit — crash-handling backend
+
+We are fully in-process: marker on disk, next-launch recovery. That matches the documented
+in-process pattern (the reference implementations' in-process backends write to disk and
+send on the next run), and the hard half — recovery, panic↔signal correlation, client-side
+dedup — already works on two platforms.
+
+But **in-process stack-overflow handling cannot be made reliable**. The guard page is already
+consumed, so the handler runs in whatever few hundred bytes remain; our `StackBuf` is 160
+bytes and heap-free, which suits it, but that is not the same as robust. Windows compounds it:
+the top-level exception filter can be overwritten by other components, a second fault
+re-enters the handler, and module enumeration must avoid the loader lock. The established
+reporters all state that writing a minidump from inside the faulting process is unsafe, which
+is why they offer an out-of-process option everywhere.
+
+**Direction:** build-time backend selection, as the reference implementations do — in-process
+(today's default, no extra binary) or out-of-process (a monitor process, the only way stack
+overflow and heap corruption become genuinely reliable). It has to be a *build-time choice*
+rather than a change of default, because out-of-process means shipping and launching a second
+executable, and we are a library — we cannot impose that on a host's packaging.
+
+**Do not block the Windows work on this.** Windows native capture is a total gap today (the
+handler is a no-op stub), and every piece of it — marker format, the PE module map with a
+debug-id `code_id`, next-launch recovery — is backend-independent. Revisit alongside the
+Phase 3 out-of-process minidump, which is the same machinery. `minidumper` /
+`minidumper-child` (same authors as `crash-handler`) already implement the monitor pattern in
+Rust and are worth evaluating before building one.
+
 ### Remaining phase work
 
 - Phase 2: subsystem quarantine (auto-disable a repeatedly-faulting integration).
-- Phase 3: best-effort in-flight flush at crash; full out-of-process minidump (desktop).
+- Phase 3: best-effort in-flight flush at crash; full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
 - Phase 4: sessions / release-health.
 - Phase 5: general PII scrubber, rate limits.
 - Phase 6: iOS/Android target builds; Swift/Kotlin language wrappers.
