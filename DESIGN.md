@@ -2,7 +2,7 @@
 
 **Status:** Approved design (brainstorm-validated). Implementation in progress.
 **Date:** 2026-07-25
-**Scope:** A standalone, cross-platform Rust SDK — a **crash + native-fatal + panic + handled-error reporter** built in the architectural style of the Bugsee mobile SDKs, producing **backend-compatible report bundles** that ingest into the existing Bugsee appserver/viewer unchanged.
+**Scope:** A cross-platform Rust **shared engine** + facade — crash / native-fatal / panic / handled-error reporting in Bugsee mobile-SDK style, producing **backend-compatible report bundles** that ingest into the existing Bugsee appserver/viewer unchanged.
 
 > **Layout amendment (2026-08-08):** the workspace is evolving into a **shared embeddable engine** (basement for most Bugsee SDKs) with pluggable platform capabilities, a C host vtable, and private console backends. See [`DESIGN_PLATFORM.md`](./DESIGN_PLATFORM.md) — it amends product-shape and I/O-boundary decisions below; wire format and ingestion are unchanged.
 >
@@ -12,8 +12,8 @@
 
 ## 1. Understanding Summary
 
-- **What:** *Bugsee for Rust* — core deliverable is a crash/native-fatal/panic/handled-error reporter, built the Bugsee way, emitting the same report-bundle wire format the mobile SDKs upload.
-- **Targets:** Linux, Windows, macOS, Android + iOS (via FFI). Tier-1 = desktop/server; mobile reuses the same core.
+- **What:** *Bugsee for Rust* — shared embeddable crash/native-fatal/panic/handled-error **engine** (basement for Bugsee SDKs) plus a thin Rust facade, emitting the same report-bundle wire format the mobile SDKs upload. See `DESIGN_PLATFORM.md`.
+- **Targets:** Linux, Windows, macOS, Android + iOS (via FFI); Xbox / PlayStation via private NDA backends. Tier-1 = desktop/server; mobile/console reuse the same core.
 - **Capture channels:** logs / events / custom-data, network, system/process telemetry, breadcrumbs + contexts + scopes. **No UI/video.**
 - **Error channel (full):** explicit `capture_error`/`capture_message`; `std::error::Error`/`anyhow`/`eyre`/`thiserror` source-chain + backtrace; `tracing`/`log` integration; `Result` ergonomics.
 - **Surrounding features (v1):** offline persistence + retry + next-launch upload; before-send / PII-scrub / sampling / fingerprinting; sessions / release-health / perf spans (APM).
@@ -41,7 +41,7 @@
 
 | # | Decision | Alternatives | Why |
 |---|---|---|---|
-| 1 | Fully standalone product | Embed in Bugsee / standalone core + Bugsee backend | Cleaner product story; Bugsee is default backend, not a coupling |
+| 1 | **Shared embeddable engine**; Rust standalone facade is one thin consumer (amended 2026-08-08) | Fully standalone-only product | Basement for most Bugsee SDKs; see `DESIGN_PLATFORM.md` P1 |
 | 2 | All platforms; desktop/server tier-1 | Mobile-first | Standalone core simplest to build/test on desktop; mobile reuses it |
 | 3 | Full error channel (explicit + ecosystem + tracing/log + `Result` ergonomics) | Explicit-API only | Differentiator vs. a plain crash reporter |
 | 4 | Full v1 feature set + port mobile-SDK principles | Minimal capture core | Parity with mobile SDK APIs/mechanics |
@@ -53,9 +53,9 @@
 | 10 | Hybrid caps, disk-backed capture window | Faithful mobile time-window / in-memory ring | Crash-survivable context + adapts to server throughput |
 | 11 | Rust signature = two feeds, mirror Bugsee | Frame-only / location-only | Best grouping fidelity; not byte-identical across platforms (never was) |
 | 12 | Layered workspace, `std` core | Single crate / async-first | Most modular, no forced runtime, reusable core |
-| 13 | JSON on disk (codec-flag escape hatch) | msgpack/binary on disk | Parse-free export; overhead off the caller's path; upgradeable if profiled |
+| 13 | **Capture parts: versioned protobuf** (+ outer timestamp framing); **wire export remains JSON** (amended 2026-08-08) | JSON-only parts (as built); msgpack | C/binary providers need opaque payloads; see `DESIGN_CAPTURE.md` C2/C14 |
 | 14 | GPU under `hardware.gpu` | `platform.gpu` / both | Android-compatible, zero viewer change |
-| 15 | Snapshot = pin bounds + hard-link current parts; filter at export | Seal/rotate on snapshot; copy; move | No churn, no data duplication, refcount-safe |
+| 15 | Snapshot = pin bounds + **tiered materialization**: hardlink → reflink/CoW → content-addressed dedup (`DedupStore`); filter at export (amended 2026-08-08) | Hardlink-only; seal/rotate; always copy | Portable across FS; see `DESIGN_CAPTURE.md` §7 |
 | 16 | In-memory queue + best-effort crash flush | mmap-ring ingress / hybrid | Simple, fast producers; mmap-ring noted as future max-durability upgrade |
 | 17 | Red-green TDD; E2E test per flow | Test-after | Executable spec per flow; contract-conformance gated in CI |
 
@@ -177,7 +177,9 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 <data>/queue/                                finished *.bundle.zip awaiting upload
 ```
 
-**Record format** (ours — JSON wire lets us skip msgpack): `[u64 LE timestamp][u32 LE len][entry-as-JSON-bytes]`. Payoffs: timestamp-filter without parsing; parse-free export (concat payloads into the envelope). A per-stream **codec flag** (mirrors mobile's descriptor bit) allows swapping in a compact codec later; **JSON is the default**. Parts stay uncompressed on disk (bounded by eviction); compression happens once in the bundle ZIP.
+**Record format (as built today):** `[u64 LE timestamp][u32 LE len][entry-as-JSON-bytes]` — timestamp-filter without parsing; parse-free export via payload concat. Parts stay uncompressed on disk; compression happens in the bundle ZIP.
+
+**Record format (target — `DESIGN_CAPTURE.md`):** same outer `[timestamp][len]` framing wrapping a **protobuf** body per `type_id` stream (`.bgs`), with versioned schemas in a `proto/` crate. Export decodes streaming into one reused entry → DefaultJson / Custom exporters → wire JSON (or media). Perf budget and migration phases live in the platform/capture design docs.
 
 **Rotation + hybrid eviction (the sliding window):** ~1 s timer rolls the active part (also on a size cap); after each roll, evict oldest parts while **any** cap is exceeded — `max_window` (time), `max_bytes` (global), `max_events`/per-channel count caps (breadcrumbs 100). Eviction = `unlink` (refcount-safe vs. live snapshots). The worker recv's with a timeout bounded by the next rotation deadline and runs the rotation/eviction/telemetry tick whenever that deadline passes — via a message OR a timeout — so **sustained capture traffic can't starve the window** (an earlier "only on recv-timeout" placement let steady messages reset the timer forever, bypassing `max_bytes`/`max_window`).
 
@@ -187,7 +189,7 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 
 **Generations:** each launch bumps `gen`; next-launch recovery reads the **previous** gen's parts before advancing.
 
-**Snapshot (no seal, no copy):** pin `[start,end]` (`end`=snapshot instant, `start`=`end−window`) + **hard-link current parts including the active one** into the report dir (`PartStore::snapshot_into`, after a `flush`). At export, read linked parts and include only entries with `start ≤ timestamp ≤ end` (monotonic order → early-stop at the tail; the self-terminating `RecordIter` cleanly ignores any torn trailing write on the active part). Bounds become `manifest.time.start/end`. Cost: 2 timestamps + O(#parts) `link` syscalls. Fallback to copy on FAT/exFAT/cross-volume (capability-probed once). Reflink (APFS `clonefile` / Linux `FICLONE`) a noted future tier.
+**Snapshot (no seal):** pin `[start,end]` (`end`=snapshot instant, `start`=`end−window`) then materialize part files into the report dir after a `flush`. **As built today:** hard-link (fallback copy) via `PartStore::snapshot_into`. **Target tiers** (`DESIGN_CAPTURE.md` §7): (1) hardlink, (2) reflink/CoW, (3) `DedupStore` content-addressed share with **hardlink into `shared_content`** (symlink not required — Windows-safe). At export, stream linked parts and include only entries with `start ≤ timestamp ≤ end` (monotonic early-stop). Bounds become `manifest.time.start/end`. Capability probes cached per data volume.
 
 ## 9. Failure pipeline
 
