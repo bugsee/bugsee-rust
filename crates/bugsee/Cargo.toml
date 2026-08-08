@@ -10,6 +10,8 @@ description = "Bugsee SDK for Rust — crash, panic, and error reporting with ba
 
 [dependencies]
 bugsee-core = { workspace = true }
+bugsee-platform = { workspace = true }
+bugsee-platform-desktop = { workspace = true }
 bugsee-panic = { workspace = true, optional = true }
 bugsee-native = { workspace = true, optional = true }
 serde_json = { workspace = true }

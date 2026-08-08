@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use bugsee_core::capture::record;
 use bugsee_core::{MockTransport, Recorder, RecorderConfig};
+use bugsee_platform::Storage;
+use bugsee_platform_desktop::FsStorage;
 use serde_json::Value;
 use zip::ZipArchive;
 
@@ -36,6 +38,15 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+fn fs_config(dir: &Path, token: &str) -> RecorderConfig {
+    let storage = Arc::new(FsStorage::new(dir).unwrap()) as Arc<dyn Storage>;
+    RecorderConfig::new(storage, dir, token)
+}
+
+fn storage_for(dir: &Path) -> Arc<dyn Storage> {
+    Arc::new(FsStorage::new(dir).unwrap()) as Arc<dyn Storage>
 }
 
 /// Lay down a crashed generation `gen` on disk: gen counter, a `.alive` marker,
@@ -66,7 +77,7 @@ fn abnormal_prior_session_is_recovered_on_next_launch() {
 
     let transport = Arc::new(MockTransport::default());
     let recorder =
-        Recorder::launch(RecorderConfig::new(&dir.path, "TOKEN"), transport.clone()).unwrap();
+        Recorder::launch(fs_config(&dir.path, "TOKEN"), transport.clone()).unwrap();
 
     // recovery runs on the worker before the drain loop; flush waits past it.
     assert!(recorder.flush(Duration::from_secs(5)));
@@ -169,7 +180,7 @@ fn native_crash_is_recovered_with_minidump_and_signal() {
 
     let transport = Arc::new(MockTransport::default());
     let recorder =
-        Recorder::launch(RecorderConfig::new(&dir.path, "T"), transport.clone()).unwrap();
+        Recorder::launch(fs_config(&dir.path, "T"), transport.clone()).unwrap();
     assert!(recorder.flush(Duration::from_secs(5)));
 
     let bundles = transport.uploaded_bundles.lock().unwrap();
@@ -247,7 +258,11 @@ fn seed_aborting_panic(data: &Path, generation: u64) {
             },
         }],
     };
-    info.write_to(&gen_dir.join("panic.info")).unwrap();
+    info.write_to(
+        storage_for(data).as_ref(),
+        &format!("parts/{generation}/panic.info"),
+    )
+    .unwrap();
 
     let sessions = data.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -261,7 +276,7 @@ fn aborting_panic_correlates_with_sigabrt_into_one_event() {
 
     let transport = Arc::new(MockTransport::default());
     let recorder =
-        Recorder::launch(RecorderConfig::new(&dir.path, "T"), transport.clone()).unwrap();
+        Recorder::launch(fs_config(&dir.path, "T"), transport.clone()).unwrap();
     assert!(recorder.flush(Duration::from_secs(5)));
 
     let bundles = transport.uploaded_bundles.lock().unwrap();
@@ -326,14 +341,14 @@ fn live_peer_marker_is_skipped_until_owner_exits() {
 
     // Owner alive → skipped (deferred, not resurrected as a crash).
     assert!(
-        find_pending(&dir.path, 2).is_empty(),
+        find_pending(storage_for(&dir.path).as_ref(), 2).is_empty(),
         "a live peer's session must not be recovered"
     );
 
     // Owner exits → the very same marker is now recoverable.
     child.kill().unwrap();
     child.wait().unwrap();
-    let pending = find_pending(&dir.path, 2);
+    let pending = find_pending(storage_for(&dir.path).as_ref(), 2);
     assert_eq!(
         pending.len(),
         1,
@@ -349,13 +364,13 @@ fn clean_shutdown_is_not_recovered() {
 
     // First session: launch and cleanly drop (removes its marker).
     {
-        let r = Recorder::launch(RecorderConfig::new(&dir.path, "T"), transport.clone()).unwrap();
+        let r = Recorder::launch(fs_config(&dir.path, "T"), transport.clone()).unwrap();
         r.flush(Duration::from_secs(5));
     } // clean Drop → session.end()
 
     // Second session should find nothing to recover.
     let transport2 = Arc::new(MockTransport::default());
-    let r2 = Recorder::launch(RecorderConfig::new(&dir.path, "T"), transport2.clone()).unwrap();
+    let r2 = Recorder::launch(fs_config(&dir.path, "T"), transport2.clone()).unwrap();
     assert!(r2.flush(Duration::from_secs(5)));
     assert_eq!(
         transport2.uploaded_bundles.lock().unwrap().len(),

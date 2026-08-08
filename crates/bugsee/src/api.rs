@@ -12,7 +12,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bugsee_core::errors::{self, Cause};
@@ -21,6 +21,8 @@ use bugsee_core::model::enums::{LogLevel, LogSource, Severity};
 use bugsee_core::reporting::{manual_upload_meta, ReportMeta};
 use bugsee_core::util::epoch_ms;
 use bugsee_core::{Recorder, RecorderConfig};
+use bugsee_platform::Storage;
+use bugsee_platform_desktop::FsStorage;
 use serde_json::{Map, Value};
 
 use crate::options::LaunchOptions;
@@ -57,6 +59,7 @@ impl Bugsee {
     pub fn launch_with(options: LaunchOptions) -> io::Result<LaunchGuard> {
         let data_dir = options.resolved_data_dir();
         std::fs::create_dir_all(&data_dir)?;
+        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(&data_dir)?);
 
         let transport = match options.transport.clone() {
             Some(t) => t,
@@ -77,7 +80,11 @@ impl Bugsee {
             }
         };
 
-        let mut config = RecorderConfig::new(data_dir, options.app_token.clone());
+        let mut config = RecorderConfig::new(
+            Arc::clone(&storage),
+            data_dir,
+            options.app_token.clone(),
+        );
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
         config.before_send = options.before_send;
@@ -107,7 +114,9 @@ impl Bugsee {
         let recorder = Recorder::launch(config, transport)?;
 
         #[cfg(feature = "panic")]
-        let panic_info_path = recorder.panic_info_path();
+        let panic_info_rel = recorder.panic_info_rel();
+        #[cfg(feature = "panic")]
+        let panic_storage = recorder.storage();
 
         // Install the native crash handler pointing at this generation's marker.
         // Replace under a brief lock, then drop the OLD handler outside it.
@@ -148,7 +157,7 @@ impl Bugsee {
             // SIGABRT on the next launch — and so an uncaught UNWINDING panic is
             // recovered as a fatal panic (the marker is kept because
             // `Recorder::drop` sees `thread::panicking()`).
-            bugsee_panic::set_snapshot_path(panic_info_path);
+            bugsee_panic::set_snapshot(panic_storage, panic_info_rel);
             // Opt-in: report immediately from the hook instead of via recovery.
             bugsee_panic::set_report_from_hook(options.report_panics_from_hook);
         }

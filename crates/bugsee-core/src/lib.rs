@@ -21,6 +21,8 @@ pub mod capture;
 pub mod errors;
 pub mod model;
 pub mod panic_info;
+pub mod platform_io;
+pub mod platform_services;
 pub mod queue;
 pub mod recovery;
 pub mod reporting;

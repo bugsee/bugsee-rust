@@ -156,6 +156,8 @@ dependencies = [
  "bugsee-core",
  "bugsee-native",
  "bugsee-panic",
+ "bugsee-platform",
+ "bugsee-platform-desktop",
  "serde_json",
  "sysinfo",
  "ureq",
@@ -166,7 +168,8 @@ dependencies = [
 name = "bugsee-core"
 version = "0.1.0"
 dependencies = [
- "getrandom 0.2.17",
+ "bugsee-platform",
+ "bugsee-platform-desktop",
  "libc",
  "proptest",
  "serde",
@@ -212,6 +215,23 @@ version = "0.1.0"
 dependencies = [
  "backtrace",
  "bugsee-core",
+ "bugsee-platform",
+]
+
+[[package]]
+name = "bugsee-platform"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
+name = "bugsee-platform-desktop"
+version = "0.1.0"
+dependencies = [
+ "bugsee-platform",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]

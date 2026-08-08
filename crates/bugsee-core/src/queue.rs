@@ -12,41 +12,30 @@
 //! caps; a fresh launch resumes it (DESIGN.md §10).
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use bugsee_platform::Storage;
+
+use crate::platform_io::{io_err, storage_path};
 use crate::reporting::AssembledReport;
 
 /// Sub-directory holding queued bundles.
 const QUEUE_DIR: &str = "queue";
 
-/// A queued report on disk.
+/// A queued report on disk (relative basename under `queue/`).
 pub struct QueuedReport {
-    /// Path to the `*.bundle.zip`.
-    pub bundle: PathBuf,
+    /// Basename of the `*.bundle.zip` under the queue directory.
+    pub bundle_name: String,
 }
 
 impl QueuedReport {
-    fn req_path(&self) -> PathBuf {
-        sibling(&self.bundle, "req")
+    fn rel(&self, ext: &str) -> String {
+        format!("{QUEUE_DIR}/{}.{ext}", self.bundle_name)
     }
-    fn meta_path(&self) -> PathBuf {
-        sibling(&self.bundle, "meta")
-    }
-    fn endpoint_path(&self) -> PathBuf {
-        sibling(&self.bundle, "endpoint")
-    }
-}
 
-fn sibling(bundle: &Path, ext: &str) -> PathBuf {
-    let mut s = bundle.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
-}
-
-/// The queue directory under `data_dir`.
-pub fn queue_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join(QUEUE_DIR)
+    fn bundle_rel(&self) -> String {
+        format!("{QUEUE_DIR}/{}", self.bundle_name)
+    }
 }
 
 /// Persist an assembled report to the queue.
@@ -54,32 +43,40 @@ pub fn queue_dir(data_dir: &Path) -> PathBuf {
 /// The bundle is written to a temp file and atomically `rename`d into place as
 /// the final step, so a concurrent reader (the uploader) or a crash mid-write
 /// never observes a partially-written `.bundle.zip`.
-pub fn enqueue(data_dir: &Path, report: &AssembledReport) -> std::io::Result<()> {
-    let dir = queue_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    let bundle = dir.join(&report.bundle_name);
-    std::fs::write(sibling(&bundle, "req"), &report.request_json)?;
-    // meta: "<retry> <next_attempt_epoch_ms>".
-    std::fs::write(sibling(&bundle, "meta"), "0 0")?;
-    // Write to a temp path, then atomically rename into place last.
-    let tmp = sibling(&bundle, "tmp");
-    std::fs::write(&tmp, &report.zip)?;
-    std::fs::rename(&tmp, &bundle)?;
+pub fn enqueue(storage: &dyn Storage, report: &AssembledReport) -> std::io::Result<()> {
+    storage
+        .create_dir_all(&storage_path(QUEUE_DIR))
+        .map_err(io_err)?;
+    let qr = QueuedReport {
+        bundle_name: report.bundle_name.clone(),
+    };
+    storage
+        .write_file(&storage_path(qr.rel("req")), &report.request_json)
+        .map_err(io_err)?;
+    storage
+        .write_file(&storage_path(qr.rel("meta")), b"0 0")
+        .map_err(io_err)?;
+    let tmp = qr.rel("tmp");
+    storage
+        .write_file(&storage_path(&tmp), &report.zip)
+        .map_err(io_err)?;
+    storage
+        .rename(&storage_path(&tmp), &storage_path(qr.bundle_rel()))
+        .map_err(io_err)?;
     Ok(())
 }
 
 /// List queued bundles (entries missing their sidecars are skipped).
-pub fn list_pending(data_dir: &Path) -> Vec<QueuedReport> {
+pub fn list_pending(storage: &dyn Storage) -> Vec<QueuedReport> {
     let mut out = Vec::new();
-    let read = match std::fs::read_dir(queue_dir(data_dir)) {
+    let read = match storage.read_dir(&storage_path(QUEUE_DIR)) {
         Ok(r) => r,
         Err(_) => return out,
     };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path.to_string_lossy().ends_with(".bundle.zip") {
-            let qr = QueuedReport { bundle: path };
-            if qr.req_path().exists() {
+    for name in read {
+        if name.ends_with(".bundle.zip") {
+            let qr = QueuedReport { bundle_name: name };
+            if storage.exists(&storage_path(qr.rel("req"))) {
                 out.push(qr);
             }
         }
@@ -89,15 +86,26 @@ pub fn list_pending(data_dir: &Path) -> Vec<QueuedReport> {
 
 /// Load a queued report's bundle bytes, request body, retry count, and the
 /// earliest next-attempt time (epoch ms).
-pub fn load(report: &QueuedReport) -> std::io::Result<(Vec<u8>, Vec<u8>, u32, i64)> {
-    let zip = std::fs::read(&report.bundle)?;
-    let request = std::fs::read(report.req_path())?;
-    let (retry, next_attempt_ms) = read_meta(report);
+pub fn load(
+    storage: &dyn Storage,
+    report: &QueuedReport,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, u32, i64)> {
+    let zip = storage
+        .read_file(&storage_path(report.bundle_rel()))
+        .map_err(io_err)?;
+    let request = storage
+        .read_file(&storage_path(report.rel("req")))
+        .map_err(io_err)?;
+    let (retry, next_attempt_ms) = read_meta(storage, report);
     Ok((zip, request, retry, next_attempt_ms))
 }
 
-fn read_meta(report: &QueuedReport) -> (u32, i64) {
-    let text = std::fs::read_to_string(report.meta_path()).unwrap_or_default();
+fn read_meta(storage: &dyn Storage, report: &QueuedReport) -> (u32, i64) {
+    let text = storage
+        .read_file(&storage_path(report.rel("meta")))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
     let mut parts = text.split_whitespace();
     let retry = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let next = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -105,52 +113,49 @@ fn read_meta(report: &QueuedReport) -> (u32, i64) {
 }
 
 /// Record a report's retry count and next-attempt time.
-pub fn set_meta(report: &QueuedReport, retry: u32, next_attempt_ms: i64) {
-    let _ = std::fs::write(report.meta_path(), format!("{retry} {next_attempt_ms}"));
+pub fn set_meta(storage: &dyn Storage, report: &QueuedReport, retry: u32, next_attempt_ms: i64) {
+    let _ = storage.write_file(
+        &storage_path(report.rel("meta")),
+        format!("{retry} {next_attempt_ms}").as_bytes(),
+    );
 }
 
-/// The earliest next-attempt time for a queued report (epoch ms), reading only
-/// the small meta sidecar.
-pub fn next_attempt(report: &QueuedReport) -> i64 {
-    read_meta(report).1
+/// The earliest next-attempt time for a queued report (epoch ms).
+pub fn next_attempt(storage: &dyn Storage, report: &QueuedReport) -> i64 {
+    read_meta(storage, report).1
 }
 
-/// The cached presigned upload endpoint for a report, if a prior attempt created
-/// the issue but the PUT failed transiently. A retry resumes at the PUT (step 3)
-/// instead of re-POSTing `create_issue` (which would mint a duplicate issue, or
-/// trip server dedup `12003` and drop the bundle without ever uploading it).
-pub fn endpoint(report: &QueuedReport) -> Option<String> {
-    std::fs::read_to_string(report.endpoint_path())
+/// The cached presigned upload endpoint for a report, if any.
+pub fn endpoint(storage: &dyn Storage, report: &QueuedReport) -> Option<String> {
+    storage
+        .read_file(&storage_path(report.rel("endpoint")))
         .ok()
+        .and_then(|b| String::from_utf8(b).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 /// Cache the presigned upload endpoint so the next attempt resumes at the PUT.
-pub fn set_endpoint(report: &QueuedReport, endpoint: &str) {
-    let _ = std::fs::write(report.endpoint_path(), endpoint);
+pub fn set_endpoint(storage: &dyn Storage, report: &QueuedReport, endpoint: &str) {
+    let _ = storage.write_file(&storage_path(report.rel("endpoint")), endpoint.as_bytes());
 }
 
-/// Drop any cached presigned endpoint (it expired, or the issue must be recreated).
-pub fn clear_endpoint(report: &QueuedReport) {
-    let _ = std::fs::remove_file(report.endpoint_path());
+/// Drop any cached presigned endpoint.
+pub fn clear_endpoint(storage: &dyn Storage, report: &QueuedReport) {
+    let _ = storage.remove_file(&storage_path(report.rel("endpoint")));
 }
 
 /// Delete a queued report (bundle + all sidecars).
-pub fn remove(report: &QueuedReport) {
-    let _ = std::fs::remove_file(&report.bundle);
-    let _ = std::fs::remove_file(report.req_path());
-    let _ = std::fs::remove_file(report.meta_path());
-    let _ = std::fs::remove_file(report.endpoint_path());
+pub fn remove(storage: &dyn Storage, report: &QueuedReport) {
+    let _ = storage.remove_file(&storage_path(report.bundle_rel()));
+    let _ = storage.remove_file(&storage_path(report.rel("req")));
+    let _ = storage.remove_file(&storage_path(report.rel("meta")));
+    let _ = storage.remove_file(&storage_path(report.rel("endpoint")));
 }
 
 /// The bundle file's base name (for reconstructing an [`AssembledReport`]).
 pub fn bundle_name(report: &QueuedReport) -> String {
-    report
-        .bundle
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    report.bundle_name.clone()
 }
 
 /// The crash dedup signatures a report carries (parsed from its `request.json`).
@@ -167,12 +172,11 @@ pub fn signatures_of(report: &AssembledReport) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn blacklist_path(data_dir: &Path) -> PathBuf {
-    queue_dir(data_dir).join(".blacklist")
-}
-
-fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
-    std::fs::read_to_string(blacklist_path(data_dir))
+fn load_blacklist(storage: &dyn Storage) -> BTreeSet<String> {
+    storage
+        .read_file(&storage_path(format!("{QUEUE_DIR}/.blacklist")))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
         .map(|s| {
             s.lines()
                 .filter(|l| !l.is_empty())
@@ -183,72 +187,57 @@ fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
 }
 
 /// Persist crash signatures the server told us to stop sending (`12004`).
-///
-/// Appends only the not-yet-present signatures, each on its own line, under
-/// `O_APPEND`. Appending (rather than read-modify-rewrite of the whole set) is
-/// safe under concurrent writers sharing the data dir: each small append is
-/// atomic, so no process can lose another's addition — which a rewrite would,
-/// silently un-blacklisting a signature and resurrecting a suppressed crash loop.
-/// Reads dedup, so a duplicate line from a rare append race is harmless.
-pub fn blacklist_add(data_dir: &Path, sigs: &[String]) {
+pub fn blacklist_add(storage: &dyn Storage, sigs: &[String]) {
     if sigs.is_empty() {
         return;
     }
-    let existing = load_blacklist(data_dir);
+    let existing = load_blacklist(storage);
     let fresh: Vec<&String> = sigs.iter().filter(|s| !existing.contains(*s)).collect();
     if fresh.is_empty() {
         return;
     }
-    let _ = std::fs::create_dir_all(queue_dir(data_dir));
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(blacklist_path(data_dir))
-    {
-        use std::io::Write;
-        for s in fresh {
-            let _ = writeln!(f, "{s}");
-        }
+    let _ = storage.create_dir_all(&storage_path(QUEUE_DIR));
+    // One write_append per signature so POSIX O_APPEND atomicity holds for
+    // concurrent shared-data-dir peers (a batched buffer can exceed PIPE_BUF).
+    let path = storage_path(format!("{QUEUE_DIR}/.blacklist"));
+    for s in fresh {
+        let mut line = Vec::with_capacity(s.len() + 1);
+        line.extend_from_slice(s.as_bytes());
+        line.push(b'\n');
+        let _ = storage.write_append(&path, &line);
     }
 }
 
-/// Reap orphaned queue sidecars: a `.req`/`.meta`/`.tmp` file with no matching
-/// `.bundle.zip`, left by a process killed mid-`enqueue`/`remove` (neither is
-/// crash-atomic across its multiple files). Without this they accumulate
-/// unbounded. Call once at startup on the worker thread, before any enqueue, so
-/// it never races this process's own queue writes.
-pub fn gc_orphans(data_dir: &Path) {
-    let dir = queue_dir(data_dir);
-    let read = match std::fs::read_dir(&dir) {
+/// Reap orphaned queue sidecars.
+pub fn gc_orphans(storage: &dyn Storage) {
+    let read = match storage.read_dir(&storage_path(QUEUE_DIR)) {
         Ok(r) => r,
         Err(_) => return,
     };
-    for entry in read.flatten() {
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        // Sidecar name is `<bundle>.req|.meta|.tmp`; stripping the suffix yields
-        // the bundle file name it belongs to.
+    for name in read {
         let bundle_name = name
             .strip_suffix(".req")
             .or_else(|| name.strip_suffix(".meta"))
             .or_else(|| name.strip_suffix(".endpoint"))
             .or_else(|| name.strip_suffix(".tmp"));
         if let Some(bundle_name) = bundle_name {
-            if !dir.join(bundle_name).exists() {
-                let _ = std::fs::remove_file(&path);
+            if !storage.exists(&storage_path(format!("{QUEUE_DIR}/{bundle_name}"))) {
+                let _ = storage.remove_file(&storage_path(format!("{QUEUE_DIR}/{name}")));
             }
         }
     }
 }
 
-/// Whether any of `sigs` is locally blacklisted (report should be suppressed).
-pub fn any_blacklisted(data_dir: &Path, sigs: &[String]) -> bool {
+/// Whether any of `sigs` is locally blacklisted.
+pub fn any_blacklisted(storage: &dyn Storage, sigs: &[String]) -> bool {
     if sigs.is_empty() {
         return false;
     }
-    let set = load_blacklist(data_dir);
+    let set = load_blacklist(storage);
     sigs.iter().any(|s| set.contains(s))
+}
+
+/// Arc convenience wrappers used by the runtime worker threads.
+pub fn enqueue_arc(storage: &Arc<dyn Storage>, report: &AssembledReport) -> std::io::Result<()> {
+    enqueue(storage.as_ref(), report)
 }

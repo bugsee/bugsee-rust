@@ -10,8 +10,7 @@
 //! window. A native minidump, when present, produces the thin native variant;
 //! otherwise the exit is reported as an abnormal termination (DESIGN.md §5).
 
-use std::path::{Path, PathBuf};
-
+use bugsee_platform::Storage;
 use serde_json::Map;
 
 use crate::model::crash::{CrashReport, ExceptionInfo, SOURCE_SDK};
@@ -19,8 +18,10 @@ use crate::model::enums::{IssueType, Severity, TriggerType};
 use crate::model::environment::{source_arch, source_platform};
 use crate::model::report::Source;
 use crate::panic_info::{PanicInfo, PANIC_INFO_NAME};
+use crate::platform_io::storage_path;
 use crate::reporting::{ExtraFile, ReportMeta};
 use crate::signature::panic_signature;
+use crate::util::epoch_ms;
 
 /// The native minidump file name written by the crash handler under a part dir.
 pub const MINIDUMP_NAME: &str = "crash.minidump";
@@ -35,14 +36,14 @@ const SIGABRT: i32 = 6;
 /// A prior generation awaiting recovery.
 pub struct PendingSession {
     pub generation: u64,
-    /// `<data>/parts/<gen>` — the crashed session's captured parts.
-    pub parts_dir: PathBuf,
-    /// Path to a native minidump, if the crash handler wrote one.
-    pub minidump: Option<PathBuf>,
-    /// Path to the native crash-info marker, if present.
-    pub crash_info: Option<PathBuf>,
-    /// Path to a persisted panic snapshot, if the observer wrote one.
-    pub panic_info: Option<PathBuf>,
+    /// Relative `parts/<gen>` — the crashed session's captured parts.
+    pub parts_dir: String,
+    /// Relative path to a native minidump, if the crash handler wrote one.
+    pub minidump: Option<String>,
+    /// Relative path to the native crash-info marker, if present.
+    pub crash_info: Option<String>,
+    /// Relative path to a persisted panic snapshot, if the observer wrote one.
+    pub panic_info: Option<String>,
 }
 
 /// A report built from a pending session, ready to assemble + deliver.
@@ -60,17 +61,14 @@ pub struct RecoveredReport {
 /// shared data dir, a concurrently-running peer (which claimed a lower generation
 /// because it launched earlier) has a live marker that is *not* a crash. Its
 /// marker is left in place for a future launch to recover once the peer is gone.
-pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSession> {
+pub fn find_pending(storage: &dyn Storage, current_generation: u64) -> Vec<PendingSession> {
     let mut pending = Vec::new();
-    let sessions = data_dir.join("sessions");
-    let read = match std::fs::read_dir(&sessions) {
+    let read = match storage.read_dir(&storage_path("sessions")) {
         Ok(r) => r,
         Err(_) => return pending,
     };
     let self_pid = std::process::id();
-    for entry in read.flatten() {
-        let marker = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for name in read {
         let Some(gen_str) = name.strip_suffix(".alive") else {
             continue;
         };
@@ -80,9 +78,14 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         if generation >= current_generation {
             continue;
         }
+        let marker_rel = format!("sessions/{name}");
         // Decide from the marker's recorded owner pid whether this is a real
         // crash or a still-running shared-dir peer.
-        let owner = std::fs::read_to_string(&marker).unwrap_or_default();
+        let owner = storage
+            .read_file(&storage_path(&marker_rel))
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
         let owner = owner.trim();
         if owner.is_empty() {
             // Present but not yet populated: `Session::begin` creates the marker
@@ -94,7 +97,7 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
             // disk); recover it so its crash is surfaced and its generation
             // reclaimed instead of being re-scanned and leaked on every future
             // launch (F28). No pid ⇒ no liveness check; fall through to recover.
-            if marker_is_fresh(&marker) {
+            if marker_is_fresh(storage, &marker_rel) {
                 continue;
             }
         } else if let Ok(pid) = owner.parse::<u32>() {
@@ -106,10 +109,10 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
             }
         }
         // Non-empty but unparseable content ⇒ the owner is gone; recover.
-        let parts_dir = data_dir.join("parts").join(generation.to_string());
-        let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
-        let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
-        let panic_info = exists_opt(parts_dir.join(PANIC_INFO_NAME));
+        let parts_dir = format!("parts/{generation}");
+        let minidump = exists_opt(storage, format!("{parts_dir}/{MINIDUMP_NAME}"));
+        let crash_info = exists_opt(storage, format!("{parts_dir}/{CRASH_INFO_NAME}"));
+        let panic_info = exists_opt(storage, format!("{parts_dir}/{PANIC_INFO_NAME}"));
         pending.push(PendingSession {
             generation,
             parts_dir,
@@ -121,29 +124,35 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
     pending
 }
 
-fn exists_opt(p: PathBuf) -> Option<PathBuf> {
-    p.exists().then_some(p)
+fn exists_opt(storage: &dyn Storage, rel: String) -> Option<String> {
+    storage.exists(&storage_path(&rel)).then_some(rel)
 }
 
 /// Grace window for an empty (pid-not-yet-written) liveness marker: a launching
 /// peer writes its pid within microseconds of the O_EXCL create, so a marker
 /// still empty after this is a dead session, not a live peer mid-launch.
-const EMPTY_MARKER_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+const EMPTY_MARKER_GRACE_MS: i64 = 30_000;
 
-/// Whether `marker` was last modified within [`EMPTY_MARKER_GRACE`] of now (so it
-/// could still be a peer that just created it). An unreadable/absent or
+/// Whether `marker` was last modified within the empty-marker grace of now (so
+/// it could still be a peer that just created it). An unreadable/absent or
 /// future-dated mtime is treated as fresh — the conservative choice never
 /// disturbs a possibly-live peer.
-fn marker_is_fresh(marker: &Path) -> bool {
-    std::fs::metadata(marker)
-        .and_then(|m| m.modified())
-        .map(|modified| {
-            modified
-                .elapsed()
-                .map(|age| age < EMPTY_MARKER_GRACE)
-                .unwrap_or(true)
-        })
-        .unwrap_or(true)
+fn marker_is_fresh(storage: &dyn Storage, marker_rel: &str) -> bool {
+    match storage
+        .metadata(&storage_path(marker_rel))
+        .ok()
+        .and_then(|m| m.modified_unix_ms)
+    {
+        Some(modified_ms) => {
+            let now = epoch_ms();
+            if modified_ms > now {
+                true
+            } else {
+                now - modified_ms < EMPTY_MARKER_GRACE_MS
+            }
+        }
+        None => true,
+    }
 }
 
 /// Whether a process with `pid` currently exists.
@@ -175,13 +184,17 @@ fn process_is_alive(_pid: u32) -> bool {
 /// any other native signal yields the thin native variant; a lone panic snapshot
 /// is a fatal **unwinding** panic; and a session with neither is an abnormal
 /// termination.
-pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
+pub fn build_report(
+    storage: &dyn Storage,
+    pending: &PendingSession,
+    timestamp: i64,
+) -> RecoveredReport {
     let has_native = pending.minidump.is_some() || pending.crash_info.is_some();
-    let signal = read_signal_info(pending);
+    let signal = read_signal_info(storage, pending);
     let panic = pending
         .panic_info
         .as_ref()
-        .and_then(|p| PanicInfo::read_from(p));
+        .and_then(|rel| PanicInfo::read_from(storage, rel));
 
     match (has_native, panic) {
         // Correlate ONLY a fresh panic snapshot with a SIGABRT — a stale snapshot
@@ -191,9 +204,9 @@ pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport
             if signal.as_ref().map(|s| s.number) == Some(SIGABRT)
                 && signal.as_ref().map(|s| is_fresh(s, &info)).unwrap_or(false) =>
         {
-            build_correlated(pending, info, timestamp)
+            build_correlated(storage, pending, info, timestamp)
         }
-        (true, _) => build_native(pending, timestamp),
+        (true, _) => build_native(storage, pending, timestamp),
         // A lone panic snapshot with NO native signal is an uncaught UNWINDING
         // panic — the Rust default, and the case that previously went entirely
         // unreported. Two invariants make this unambiguous:
@@ -246,9 +259,10 @@ fn build_fatal_panic(info: PanicInfo, timestamp: i64) -> RecoveredReport {
     }
 }
 
-fn read_signal_info(pending: &PendingSession) -> Option<SignalInfo> {
-    let path = pending.crash_info.as_ref()?;
-    let text = std::fs::read_to_string(path).ok()?;
+fn read_signal_info(storage: &dyn Storage, pending: &PendingSession) -> Option<SignalInfo> {
+    let rel = pending.crash_info.as_ref()?;
+    let bytes = storage.read_file(&storage_path(rel)).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
     Some(parse_crash_info(&text))
 }
 
@@ -256,7 +270,12 @@ fn read_signal_info(pending: &PendingSession) -> Option<SignalInfo> {
 /// the panic frames/message, with the signal recorded via the exception
 /// `domain` (the contract reserves the `signal` object for the native variant,
 /// so a managed variant must not emit it).
-fn build_correlated(pending: &PendingSession, info: PanicInfo, timestamp: i64) -> RecoveredReport {
+fn build_correlated(
+    storage: &dyn Storage,
+    pending: &PendingSession,
+    info: PanicInfo,
+    timestamp: i64,
+) -> RecoveredReport {
     let frame_sigs: Vec<String> = info
         .frames
         .iter()
@@ -288,7 +307,7 @@ fn build_correlated(pending: &PendingSession, info: PanicInfo, timestamp: i64) -
     RecoveredReport {
         meta: crash_meta(vec![signature], TriggerType::Crash),
         crash_json: crash.to_bytes().unwrap_or_default(),
-        extra_files: read_minidump(pending),
+        extra_files: read_minidump(storage, pending),
     }
 }
 
@@ -299,10 +318,10 @@ fn reason_with_location(info: &PanicInfo) -> String {
     }
 }
 
-fn read_minidump(pending: &PendingSession) -> Vec<ExtraFile> {
+fn read_minidump(storage: &dyn Storage, pending: &PendingSession) -> Vec<ExtraFile> {
     let mut extra = Vec::new();
     if let Some(dump) = &pending.minidump {
-        if let Ok(data) = std::fs::read(dump) {
+        if let Ok(data) = storage.read_file(&storage_path(dump)) {
             extra.push(ExtraFile {
                 filename: format!("{}.minidump", crate::util::random_hex(10)),
                 file_type: "minidump".into(),
@@ -317,32 +336,37 @@ fn read_minidump(pending: &PendingSession) -> Vec<ExtraFile> {
 /// **first**: a crash between the steps then leaks a parts directory (later
 /// GC'able via [`gc_orphans`]) rather than leaving a marker that would re-recover
 /// a phantom empty report or duplicate the already-delivered one.
-pub fn discard(data_dir: &Path, pending: &PendingSession) {
-    let sessions = data_dir.join("sessions");
-    let _ = std::fs::remove_file(sessions.join(format!("{}.alive", pending.generation)));
-    let _ = std::fs::remove_file(sessions.join(format!("{}.attempts", pending.generation)));
-    let _ = std::fs::remove_dir_all(&pending.parts_dir);
+pub fn discard(storage: &dyn Storage, pending: &PendingSession) {
+    let _ = storage.remove_file(&storage_path(format!(
+        "sessions/{}.alive",
+        pending.generation
+    )));
+    let _ = storage.remove_file(&storage_path(format!(
+        "sessions/{}.attempts",
+        pending.generation
+    )));
+    let _ = storage.remove_dir_all(&storage_path(&pending.parts_dir));
 }
 
-/// The recovery-attempt-counter sidecar path for a generation.
-fn attempts_path(data_dir: &Path, generation: u64) -> PathBuf {
-    data_dir
-        .join("sessions")
-        .join(format!("{generation}.attempts"))
+/// The recovery-attempt-counter sidecar relative path for a generation.
+fn attempts_rel(generation: u64) -> String {
+    format!("sessions/{generation}.attempts")
 }
 
 /// Increment and return a pending session's recovery-attempt count. Bumped
 /// **before** each attempt so a pending that repeatedly panics the build/assemble
 /// path (a corrupt-parts poison pill) still converges to the cap and is abandoned
 /// instead of re-running — and aborting the whole recovery loop — every launch.
-pub fn bump_attempts(data_dir: &Path, pending: &PendingSession) -> u32 {
-    let path = attempts_path(data_dir, pending.generation);
-    let next = std::fs::read_to_string(&path)
+pub fn bump_attempts(storage: &dyn Storage, pending: &PendingSession) -> u32 {
+    let rel = attempts_rel(pending.generation);
+    let next = storage
+        .read_file(&storage_path(&rel))
         .ok()
+        .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
         .saturating_add(1);
-    let _ = std::fs::write(&path, next.to_string());
+    let _ = storage.write_file(&storage_path(&rel), next.to_string().as_bytes());
     next
 }
 
@@ -353,27 +377,26 @@ pub fn bump_attempts(data_dir: &Path, pending: &PendingSession) -> u32 {
 ///
 /// Only marker-less generations are touched, so a live shared-dir peer's session
 /// (marker present) and any pending awaiting recovery are never disturbed.
-pub fn gc_orphans(data_dir: &Path, current_generation: u64) {
-    let sessions = data_dir.join("sessions");
-    let alive = |generation: u64| sessions.join(format!("{generation}.alive")).exists();
+pub fn gc_orphans(storage: &dyn Storage, current_generation: u64) {
+    let alive = |generation: u64| {
+        storage.exists(&storage_path(format!("sessions/{generation}.alive")))
+    };
 
-    if let Ok(read) = std::fs::read_dir(data_dir.join("parts")) {
-        for entry in read.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+    if let Ok(read) = storage.read_dir(&storage_path("parts")) {
+        for name in read {
             if let Ok(generation) = name.parse::<u64>() {
                 if generation < current_generation && !alive(generation) {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    let _ = storage.remove_dir_all(&storage_path(format!("parts/{name}")));
                 }
             }
         }
     }
-    if let Ok(read) = std::fs::read_dir(&sessions) {
-        for entry in read.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+    if let Ok(read) = storage.read_dir(&storage_path("sessions")) {
+        for name in read {
             if let Some(gen_str) = name.strip_suffix(".attempts") {
                 if let Ok(generation) = gen_str.parse::<u64>() {
                     if generation < current_generation && !alive(generation) {
-                        let _ = std::fs::remove_file(entry.path());
+                        let _ = storage.remove_file(&storage_path(format!("sessions/{name}")));
                     }
                 }
             }
@@ -415,14 +438,18 @@ fn build_abnormal_exit(timestamp: i64) -> RecoveredReport {
     }
 }
 
-fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
+fn build_native(
+    storage: &dyn Storage,
+    pending: &PendingSession,
+    timestamp: i64,
+) -> RecoveredReport {
     // Thin native variant: frames/threads are reconstructed server-side from the
     // minidump. When the crash handler captured the crashing thread's frames, we
     // ALSO compute a stable client-side dedup signature from module-relative
     // offsets (mirroring the iOS/Android native feed) — this is what lets the
     // local blacklist suppress a native crash-on-launch loop.
-    let signal = read_signal_info(pending);
-    let signature = native_frame_signature(pending, signal.as_ref());
+    let signal = read_signal_info(storage, pending);
+    let signature = native_frame_signature(storage, pending, signal.as_ref());
     let signatures: Vec<String> = signature.clone().into_iter().collect();
 
     let mut crash = serde_json::json!({
@@ -447,7 +474,8 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
     // `reladdr` within it. Modules without a code id are still reported (they
     // give the crash address context) but can never resolve — an ELF needs
     // `-Wl,--build-id` to be symbolicatable.
-    let modules = read_modules(&pending.parts_dir.join(MODULES_NAME));
+    let modules_rel = format!("{}/{}", pending.parts_dir, MODULES_NAME);
+    let modules = read_modules(storage, &modules_rel);
     if !modules.is_empty() {
         crash["modules"] = serde_json::Value::Array(
             modules
@@ -506,7 +534,7 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
     RecoveredReport {
         meta: crash_meta(signature.into_iter().collect(), TriggerType::Crash),
         crash_json,
-        extra_files: read_minidump(pending),
+        extra_files: read_minidump(storage, pending),
     }
 }
 
@@ -514,12 +542,17 @@ fn build_native(pending: &PendingSession, timestamp: i64) -> RecoveredReport {
 /// resolved to `(module, offset)` via the install-time module map. Returns `None`
 /// when no frames or module map are available (recovery then sends no client
 /// signature, leaving dedup to the server, rather than a too-coarse one).
-fn native_frame_signature(pending: &PendingSession, signal: Option<&SignalInfo>) -> Option<String> {
+fn native_frame_signature(
+    storage: &dyn Storage,
+    pending: &PendingSession,
+    signal: Option<&SignalInfo>,
+) -> Option<String> {
     let signal = signal?;
     if signal.frames.is_empty() {
         return None;
     }
-    let modules = read_modules(&pending.parts_dir.join(MODULES_NAME));
+    let modules_rel = format!("{}/{}", pending.parts_dir, MODULES_NAME);
+    let modules = read_modules(storage, &modules_rel);
     if modules.is_empty() {
         return None;
     }
@@ -572,8 +605,12 @@ fn resolve_module_offset(pc: usize, modules: &[ModuleEntry]) -> Option<(String, 
 /// - `base \t size \t name` — no code id (pre-symbolication builds)
 /// - `base \t name`         — no size either; treated as unbounded, preserving
 ///   the old nearest-module behavior for that entry only.
-fn read_modules(path: &Path) -> Vec<ModuleEntry> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+fn read_modules(storage: &dyn Storage, rel: &str) -> Vec<ModuleEntry> {
+    let text = storage
+        .read_file(&storage_path(rel))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
     text.lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.splitn(4, '\t').collect();

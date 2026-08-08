@@ -1,14 +1,16 @@
 [package]
-name = "bugsee-panic"
+name = "bugsee-platform-desktop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Rust panic observer and catch_unwind boundary guards for the Bugsee SDK."
+description = "Desktop (std::fs / OS) platform backends for the Bugsee Rust engine."
 
 [dependencies]
-bugsee-core = { workspace = true }
 bugsee-platform = { workspace = true }
-backtrace = "0.3"
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

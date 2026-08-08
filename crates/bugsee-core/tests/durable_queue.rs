@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use bugsee_core::transport::{Transport, TransportError};
 use bugsee_core::{queue, MockTransport, Recorder, RecorderConfig};
+use bugsee_platform::Storage;
+use bugsee_platform_desktop::FsStorage;
 
 struct TempDir {
     path: PathBuf,
@@ -91,10 +93,15 @@ impl Transport for AlwaysFailUpload {
 }
 
 fn config(dir: &std::path::Path) -> RecorderConfig {
-    let mut c = RecorderConfig::new(dir, "TOKEN");
+    let storage = Arc::new(FsStorage::new(dir).unwrap()) as Arc<dyn Storage>;
+    let mut c = RecorderConfig::new(storage.clone(), dir, "TOKEN");
     // Fast backoff so retries resolve within the test.
     c.upload_backoff_base = Duration::from_millis(20);
     c
+}
+
+fn storage_for(dir: &std::path::Path) -> Arc<dyn Storage> {
+    Arc::new(FsStorage::new(dir).unwrap()) as Arc<dyn Storage>
 }
 
 #[test]
@@ -145,7 +152,7 @@ fn transient_failures_are_retried_until_delivered() {
         1,
         "delivered after retries"
     );
-    assert!(queue::list_pending(&dir.path).is_empty(), "queue drained");
+    assert!(queue::list_pending(storage_for(&dir.path).as_ref()).is_empty(), "queue drained");
 }
 
 #[test]
@@ -164,7 +171,7 @@ fn forced_flush_offline_keeps_queued_report() {
         "an offline flush cannot drain the queue"
     );
     assert!(
-        !queue::list_pending(&dir.path).is_empty(),
+        !queue::list_pending(storage_for(&dir.path).as_ref()).is_empty(),
         "the queued crash bundle survives an offline flush (F13)"
     );
 }
@@ -181,7 +188,7 @@ fn queued_report_survives_restart_and_delivers_next_launch() {
         recorder.report(bugsee_core::reporting::manual_upload_meta(), None);
     } // clean drop enqueues then stops
     assert!(
-        !queue::list_pending(&dir.path).is_empty(),
+        !queue::list_pending(storage_for(&dir.path).as_ref()).is_empty(),
         "undelivered bundle persisted on disk"
     );
 
@@ -196,7 +203,7 @@ fn queued_report_survives_restart_and_delivers_next_launch() {
         "queued bundle delivered on the next launch"
     );
     assert!(
-        queue::list_pending(&dir.path).is_empty(),
+        queue::list_pending(storage_for(&dir.path).as_ref()).is_empty(),
         "queue drained after relaunch"
     );
 }

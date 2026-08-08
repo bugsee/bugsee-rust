@@ -9,15 +9,18 @@
 //! hard-link snapshots.
 //!
 //! Layout: `<parts_root>/<part_num>/<channel>.part`, where `<parts_root>` is
-//! `<data>/parts/<gen>`. Each part is a directory of per-channel append files.
-//! Rotation starts a new part; eviction `unlink`s whole old parts (refcount-safe
-//! against live snapshots). A snapshot hard-links the parts intersecting a
-//! window into a report directory without copying payload bytes.
+//! `parts/<gen>` relative to the [`Storage`] root. Each part is a directory of
+//! per-channel append files. Rotation starts a new part; eviction removes whole
+//! old parts (refcount-safe against live snapshots). A snapshot hard-links the
+//! parts intersecting a window into a report directory without copying payload
+//! bytes when the volume supports it.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bugsee_platform::{AppendSink, Storage, StoragePath};
+
+use crate::platform_io::{io_err, storage_path};
 
 use super::record;
 
@@ -56,9 +59,11 @@ struct PartMeta {
 
 /// A generation's worth of capture parts.
 pub struct PartStore {
-    parts_root: PathBuf,
+    storage: Arc<dyn Storage>,
+    /// Relative prefix `parts/<generation>`.
+    parts_prefix: String,
     current: u64,
-    open: HashMap<String, File>,
+    open: HashMap<String, Box<dyn AppendSink>>,
     parts: Vec<PartMeta>,
     caps: WindowCaps,
     total_bytes: u64,
@@ -66,11 +71,16 @@ pub struct PartStore {
 }
 
 impl PartStore {
-    /// Open (creating) the parts root for `generation` under `data_dir`.
-    pub fn new(data_dir: &Path, generation: u64, caps: WindowCaps) -> std::io::Result<Self> {
-        let parts_root = data_dir.join("parts").join(generation.to_string());
+    /// Open (creating) the parts root for `generation` under `storage`.
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        generation: u64,
+        caps: WindowCaps,
+    ) -> std::io::Result<Self> {
+        let parts_prefix = format!("parts/{generation}");
         let mut store = PartStore {
-            parts_root,
+            storage,
+            parts_prefix,
             current: 0,
             open: HashMap::new(),
             parts: Vec::new(),
@@ -82,8 +92,18 @@ impl PartStore {
         Ok(store)
     }
 
+    fn part_dir(&self, num: u64) -> StoragePath {
+        storage_path(format!("{}/{}", self.parts_prefix, num))
+    }
+
+    fn channel_path(&self, num: u64, channel: &str) -> StoragePath {
+        storage_path(format!("{}/{}/{channel}.part", self.parts_prefix, num))
+    }
+
     fn begin_part(&mut self, num: u64) -> std::io::Result<()> {
-        std::fs::create_dir_all(self.part_dir(num))?;
+        self.storage
+            .create_dir_all(&self.part_dir(num))
+            .map_err(io_err)?;
         self.parts.push(PartMeta {
             num,
             start_ts: i64::MAX,
@@ -95,20 +115,20 @@ impl PartStore {
         Ok(())
     }
 
-    fn part_dir(&self, num: u64) -> PathBuf {
-        self.parts_root.join(num.to_string())
-    }
-
     /// Append a framed `payload` for `channel`, stamped `ts` (epoch ms).
     pub fn append(&mut self, channel: &str, ts: i64, payload: &[u8]) -> std::io::Result<()> {
         if !self.open.contains_key(channel) {
-            let path = self.part_dir(self.current).join(format!("{channel}.part"));
-            let file = OpenOptions::new().create(true).append(true).open(path)?;
-            self.open.insert(channel.to_string(), file);
+            let path = self.channel_path(self.current, channel);
+            let sink = self.storage.open_append(&path).map_err(io_err)?;
+            self.open.insert(channel.to_string(), sink);
         }
         let mut framed = Vec::with_capacity(record::framed_len(payload.len()));
         record::frame(ts, payload, &mut framed);
-        self.open.get_mut(channel).unwrap().write_all(&framed)?;
+        self.open
+            .get_mut(channel)
+            .unwrap()
+            .write_all(&framed)
+            .map_err(io_err)?;
 
         let n = framed.len() as u64;
         self.total_bytes += n;
@@ -138,10 +158,6 @@ impl PartStore {
             if self.parts.len() <= 1 {
                 break;
             }
-            // The newest real timestamp across all parts. `rotate()` calls
-            // `evict()` right after pushing a fresh empty part (end_ts = MIN), so
-            // `parts.last()` would always be that empty part — using it made the
-            // time cap dead. Exclude empty parts here.
             let newest_end = self
                 .parts
                 .iter()
@@ -159,7 +175,7 @@ impl PartStore {
                 break;
             }
             let victim = self.parts.remove(0);
-            let _ = std::fs::remove_dir_all(self.part_dir(victim.num));
+            let _ = self.storage.remove_dir_all(&self.part_dir(victim.num));
             self.total_bytes = self.total_bytes.saturating_sub(victim.bytes);
             self.total_events = self.total_events.saturating_sub(victim.count);
         }
@@ -169,7 +185,7 @@ impl PartStore {
     /// Flush all open part files to the OS.
     pub fn flush(&mut self) -> std::io::Result<()> {
         for f in self.open.values_mut() {
-            f.flush()?;
+            f.flush().map_err(io_err)?;
         }
         Ok(())
     }
@@ -191,31 +207,38 @@ impl PartStore {
         Some((start, end))
     }
 
-    /// Hard-link the parts intersecting `[start, end]` into `dest_dir`, so the
-    /// snapshot shares storage with the live window. Falls back to copy when
-    /// hard links are unsupported (cross-volume / FAT).
-    pub fn snapshot_into(&mut self, dest_dir: &Path, start: i64, end: i64) -> std::io::Result<()> {
-        // Flush so the linked inodes carry the latest committed records.
+    /// Hard-link the parts intersecting `[start, end]` into `dest_prefix`
+    /// (relative to the storage root), falling back to copy when hard links
+    /// are unsupported.
+    pub fn snapshot_into(
+        &mut self,
+        dest_prefix: &str,
+        start: i64,
+        end: i64,
+    ) -> std::io::Result<()> {
         self.flush()?;
         for meta in &self.parts {
-            let intersects = meta.start_ts == i64::MAX // empty current part — include, may fill
+            let intersects = meta.start_ts == i64::MAX
                 || (meta.start_ts <= end && meta.end_ts >= start);
             if !intersects {
                 continue;
             }
             let src_dir = self.part_dir(meta.num);
-            let dst_dir = dest_dir.join(meta.num.to_string());
-            std::fs::create_dir_all(&dst_dir)?;
-            let entries = match std::fs::read_dir(&src_dir) {
+            let dst_dir = storage_path(format!("{dest_prefix}/{}", meta.num));
+            self.storage.create_dir_all(&dst_dir).map_err(io_err)?;
+            let entries = match self.storage.read_dir(&src_dir) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let src = src_dir.join(&name);
-                let dst = dst_dir.join(&name);
-                if std::fs::hard_link(&src, &dst).is_err() {
-                    std::fs::copy(&src, &dst)?;
+            for name in entries {
+                let src = src_dir
+                    .join(&name)
+                    .ok_or_else(|| std::io::Error::other("bad join"))?;
+                let dst = dst_dir
+                    .join(&name)
+                    .ok_or_else(|| std::io::Error::other("bad join"))?;
+                if self.storage.hard_link(&src, &dst).is_err() {
+                    self.storage.copy_file(&src, &dst).map_err(io_err)?;
                 }
             }
         }
@@ -226,45 +249,32 @@ impl PartStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmp_dir() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("bugsee-store-{}", crate::util::random_hex(8)));
-        p
-    }
+    use bugsee_platform::MemoryStorage;
 
     #[test]
     fn event_count_cap_evicts_oldest_parts() {
-        let dir = tmp_dir();
-        // Isolate the event-count cap: time and byte caps are effectively
-        // unbounded so only the count trigger can fire.
         let caps = WindowCaps {
             max_window_ms: i64::MAX,
             max_bytes: u64::MAX,
             max_events: 2,
         };
-        let mut store = PartStore::new(&dir, 0, caps).unwrap();
+        let mut store = PartStore::new(Arc::new(MemoryStorage::new()), 0, caps).unwrap();
 
-        // One entry per part, rotating after each so eviction has a chance to run.
         for i in 0..6i64 {
             store.append("log", 1000 + i, b"x").unwrap();
             store.rotate().unwrap();
         }
 
-        // The running count must stay at or below the cap after eviction.
         assert!(
             store.total_events <= caps.max_events,
             "total_events={} exceeded cap={}",
             store.total_events,
             caps.max_events
         );
-        // Eviction actually happened: far fewer parts than the 7 created.
         assert!(
             store.parts.len() < 7,
             "expected eviction, still have {} parts",
             store.parts.len()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,24 +7,22 @@
 
 //! Small dependency-light helpers: epoch-ms wall clock, random hex ids, and
 //! ISO-8601 formatting (no `chrono`/`time` dependency).
+//!
+//! Clock/entropy come from [`crate::platform_services`] (installed at launch).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::platform_services;
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
 pub fn epoch_ms() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as i64,
-        // Clock before 1970 — clamp to 0 rather than panic.
-        Err(_) => 0,
-    }
+    platform_services::unix_time_ms()
 }
 
 /// A lowercase hex string of `n_bytes` random bytes (`2 * n_bytes` chars).
 pub fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
-    // getrandom only fails on platforms without an entropy source; fall back to
+    // Entropy backends only fail on platforms without a source; fall back to
     // a time-seeded value so id generation never panics.
-    if getrandom::getrandom(&mut buf).is_err() {
+    if platform_services::fill_entropy(&mut buf).is_err() {
         let seed = epoch_ms() as u64;
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (seed.rotate_left(i as u32 * 8) & 0xff) as u8;
@@ -42,7 +40,7 @@ pub fn random_hex(n_bytes: usize) -> String {
 /// unavailable, so sampling never accidentally drops a report on error.
 pub fn random_unit_f64() -> f64 {
     let mut buf = [0u8; 8];
-    if getrandom::getrandom(&mut buf).is_err() {
+    if platform_services::fill_entropy(&mut buf).is_err() {
         return 1.0;
     }
     let v = u64::from_le_bytes(buf);

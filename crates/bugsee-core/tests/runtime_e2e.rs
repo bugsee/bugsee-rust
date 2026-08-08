@@ -17,6 +17,8 @@ use bugsee_core::model::enums::{LogLevel, LogSource};
 use bugsee_core::reporting::manual_upload_meta;
 use bugsee_core::util::epoch_ms;
 use bugsee_core::{MockTransport, Recorder, RecorderConfig};
+use bugsee_platform::Storage;
+use bugsee_platform_desktop::FsStorage;
 use serde_json::{Map, Value};
 use zip::ZipArchive;
 
@@ -63,7 +65,7 @@ fn launch_capture_upload_produces_valid_bundle() {
     let transport = Arc::new(MockTransport::default());
 
     let recorder = Recorder::launch(
-        RecorderConfig::new(&dir.path, "APP_TOKEN_123"),
+        RecorderConfig::new(Arc::new(FsStorage::new(&dir.path).unwrap()) as Arc<dyn Storage>, &dir.path, "APP_TOKEN_123"),
         transport.clone(),
     )
     .expect("launch");
@@ -152,7 +154,7 @@ fn capture_after_flush_still_uploads_second_report() {
     let dir = TempDir::new();
     let transport = Arc::new(MockTransport::default());
     let recorder =
-        Recorder::launch(RecorderConfig::new(&dir.path, "T"), transport.clone()).unwrap();
+        Recorder::launch(RecorderConfig::new(Arc::new(FsStorage::new(&dir.path).unwrap()) as Arc<dyn Storage>, &dir.path, "T"), transport.clone()).unwrap();
 
     recorder.capture(log("one"));
     recorder.report(manual_upload_meta(), None);

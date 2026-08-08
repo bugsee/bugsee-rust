@@ -17,13 +17,14 @@
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use bugsee_core::model::crash::{Frame, FrameData};
 use bugsee_core::panic_info::PanicInfo;
+use bugsee_core::platform_io::storage_path;
 use bugsee_core::util::epoch_ms;
+use bugsee_platform::Storage;
 
 /// A captured panic, handed to the reporter.
 pub struct PanicReport {
@@ -65,19 +66,20 @@ thread_local! {
 static REPORTER: OnceLock<Arc<dyn PanicReporter>> = OnceLock::new();
 static INSTALL: Once = Once::new();
 /// Where to persist the panic snapshot for next-launch abort correlation.
-static SNAPSHOT_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static SNAPSHOT: Mutex<Option<(Arc<dyn Storage>, String)>> = Mutex::new(None);
 
-/// Set the on-disk path where the observer persists a panic snapshot (used to
+/// Set the storage target where the observer persists a panic snapshot (used to
 /// correlate an aborting panic with its `SIGABRT` on the next launch).
-pub fn set_snapshot_path(path: PathBuf) {
-    if let Ok(mut guard) = SNAPSHOT_PATH.lock() {
-        *guard = Some(path);
+/// `rel` is relative to the storage root (e.g. `parts/<gen>/panic.info`).
+pub fn set_snapshot(storage: Arc<dyn Storage>, rel: impl Into<String>) {
+    if let Ok(mut guard) = SNAPSHOT.lock() {
+        *guard = Some((storage, rel.into()));
     }
 }
 
-/// Clear the persisted-snapshot path.
-pub fn clear_snapshot_path() {
-    if let Ok(mut guard) = SNAPSHOT_PATH.lock() {
+/// Clear the persisted-snapshot target.
+pub fn clear_snapshot() {
+    if let Ok(mut guard) = SNAPSHOT.lock() {
         *guard = None;
     }
 }
@@ -174,8 +176,8 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
             // Persist a snapshot so an aborting panic can be correlated with its
             // SIGABRT on the next launch. try_lock avoids any deadlock if the
             // panic happened while the path was being set.
-            if let Ok(guard) = SNAPSHOT_PATH.try_lock() {
-                if let Some(path) = guard.as_ref() {
+            if let Ok(guard) = SNAPSHOT.try_lock() {
+                if let Some((storage, rel)) = guard.as_ref() {
                     let snapshot = PanicInfo {
                         reason: reason.clone(),
                         file: file.clone(),
@@ -184,7 +186,7 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
                         timestamp: epoch_ms(),
                         frames: frames.clone(),
                     };
-                    let _ = snapshot.write_to(path);
+                    let _ = snapshot.write_to(storage.as_ref(), rel);
                 }
             }
 
@@ -286,9 +288,9 @@ fn report_caught(payload: &(dyn std::any::Any + Send)) {
     // self-deadlock): this runs AFTER `catch_unwind` returns — the panic has
     // fully unwound and released any locks — so a spuriously-lost `try_lock` race
     // must not silently skip the cleanup and strand a stale snapshot.
-    if let Ok(guard) = SNAPSHOT_PATH.lock() {
-        if let Some(path) = guard.as_ref() {
-            let _ = std::fs::remove_file(path);
+    if let Ok(guard) = SNAPSHOT.lock() {
+        if let Some((storage, rel)) = guard.as_ref() {
+            let _ = storage.remove_file(&storage_path(rel));
         }
     }
 

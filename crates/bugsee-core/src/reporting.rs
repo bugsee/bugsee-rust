@@ -9,8 +9,7 @@
 //! report bundle (the ZIP) plus the `request.json` body used to create the
 //! issue server-side.
 
-use std::path::Path;
-
+use bugsee_platform::Storage;
 use serde_json::{Map, Value};
 
 use crate::bundle::{bundle_filename, write_bundle, BundleEntry};
@@ -63,10 +62,11 @@ pub struct AssembledReport {
     pub request_json: Vec<u8>,
 }
 
-/// Assemble a report bundle from the snapshot at `report_dir` covering
-/// `window`, plus optional pre-serialized `crash.json` bytes.
+/// Assemble a report bundle from the snapshot at `report_prefix` (relative to
+/// `storage`) covering `window`, plus optional pre-serialized `crash.json` bytes.
 pub fn assemble(
-    report_dir: &Path,
+    storage: &dyn Storage,
+    report_prefix: &str,
     window: TimeWindow,
     meta: &ReportMeta,
     env: &Environment,
@@ -75,7 +75,8 @@ pub fn assemble(
     created_on_ms: i64,
 ) -> std::io::Result<AssembledReport> {
     assemble_with_extras(
-        report_dir,
+        storage,
+        report_prefix,
         window,
         meta,
         env,
@@ -89,7 +90,8 @@ pub fn assemble(
 /// Like [`assemble`] but also bundles `extra_files` (e.g. a native minidump).
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_with_extras(
-    report_dir: &Path,
+    storage: &dyn Storage,
+    report_prefix: &str,
     window: TimeWindow,
     meta: &ReportMeta,
     env: &Environment,
@@ -98,7 +100,7 @@ pub fn assemble_with_extras(
     app_token: &str,
     created_on_ms: i64,
 ) -> std::io::Result<AssembledReport> {
-    let docs = export_report(report_dir, window.start, window.end)?;
+    let docs = export_report(storage, report_prefix, window.start, window.end)?;
 
     let mut files: Vec<FileDescriptor> = Vec::new();
     let mut entries: Vec<BundleEntry> = Vec::new();

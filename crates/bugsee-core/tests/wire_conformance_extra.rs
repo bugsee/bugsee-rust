@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 
 use bugsee_core::model::perf::{Span, Status, Transaction};
 use bugsee_core::recovery::{build_report, find_pending};
+use bugsee_platform::Storage;
+use bugsee_platform_desktop::FsStorage;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // §4.12 — APM transaction + nested span golden shape.
@@ -168,6 +171,10 @@ impl Drop for TempDir {
     }
 }
 
+fn storage_for(dir: &Path) -> Arc<dyn Storage> {
+    Arc::new(FsStorage::new(dir).unwrap()) as Arc<dyn Storage>
+}
+
 /// Write the liveness marker for an abnormally-ended generation. The marker
 /// records the (now-dead) owning pid; `"0"` is a portable "owner gone" sentinel
 /// (recovery's `process_is_alive` treats pid 0 as dead), so recovery does not
@@ -193,9 +200,9 @@ fn native_crash_json_matches_contract_4_14() {
     .unwrap();
     std::fs::write(gen_dir.join("crash.minidump"), b"MDMP\x00fake-bytes").unwrap();
 
-    let pending = find_pending(&dir.path, 2);
+    let pending = find_pending(storage_for(&dir.path).as_ref(), 2);
     assert_eq!(pending.len(), 1, "the crashed generation is pending");
-    let report = build_report(&pending[0], 1_720_531_200_000);
+    let report = build_report(storage_for(&dir.path).as_ref(), &pending[0], 1_720_531_200_000);
     let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
 
     // Thin native variant.
@@ -250,8 +257,8 @@ fn native_crash_signature_from_module_offsets() {
     )
     .unwrap();
 
-    let pending = find_pending(&dir.path, 2);
-    let report = build_report(&pending[0], 1_720_531_200_000);
+    let pending = find_pending(storage_for(&dir.path).as_ref(), 2);
+    let report = build_report(storage_for(&dir.path).as_ref(), &pending[0], 1_720_531_200_000);
     let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
 
     let sigs = crash["signatures"].as_array().expect("signatures array");
@@ -263,7 +270,7 @@ fn native_crash_signature_from_module_offsets() {
         .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 
     // Deterministic: the same crash on the next launch yields the same signature.
-    let report2 = build_report(&find_pending(&dir.path, 2)[0], 999);
+    let report2 = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 999);
     let crash2: Value = serde_json::from_slice(&report2.crash_json).unwrap();
     assert_eq!(crash2["signatures"][0].as_str().unwrap(), sig, "stable");
 
@@ -274,7 +281,7 @@ fn native_crash_signature_from_module_offsets() {
     )
     .unwrap();
     let other: Value =
-        serde_json::from_slice(&build_report(&find_pending(&dir.path, 2)[0], 1).crash_json)
+        serde_json::from_slice(&build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1).crash_json)
             .unwrap();
     assert_ne!(
         other["signatures"][0].as_str().unwrap(),
@@ -310,7 +317,8 @@ fn seed_panic_info(gen_dir: &Path, reason: &str) {
             frame("app::checkout::pay", false),
         ],
     };
-    info.write_to(&gen_dir.join(PANIC_INFO_NAME)).unwrap();
+    let bytes = serde_json::to_vec(&info).unwrap();
+    std::fs::write(gen_dir.join(PANIC_INFO_NAME), bytes).unwrap();
 }
 
 #[test]
@@ -361,7 +369,7 @@ fn every_crash_json_variant_identifies_its_source_sdk() {
         std::fs::create_dir_all(&gen_dir).unwrap();
         seed(&gen_dir);
 
-        let report = build_report(&find_pending(&dir.path, 2)[0], 1_720_531_200_000);
+        let report = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1_720_531_200_000);
         let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
         assert_source_provenance(&crash, label);
     }
@@ -437,7 +445,7 @@ fn lone_panic_snapshot_is_recovered_as_a_fatal_panic() {
     std::fs::create_dir_all(&gen_dir).unwrap();
     seed_panic_info(&gen_dir, "checkout exploded");
 
-    let report = build_report(&find_pending(&dir.path, 2)[0], 1_720_531_200_000);
+    let report = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1_720_531_200_000);
     let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
 
     assert_eq!(
@@ -476,7 +484,7 @@ fn no_panic_snapshot_still_reports_an_abnormal_exit() {
     seed_alive_marker(&dir.path, 1);
     std::fs::create_dir_all(dir.path.join("parts").join("1")).unwrap();
 
-    let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+    let report = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1);
     let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
     assert_eq!(crash["exception"]["name"], json!("AppExit"));
 }
@@ -504,7 +512,7 @@ fn native_crash_json_carries_modules_with_code_id_and_relative_frames() {
     )
     .unwrap();
 
-    let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+    let report = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1);
     let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
 
     let modules = crash["modules"].as_array().expect("modules array");
@@ -552,7 +560,7 @@ fn legacy_module_map_formats_still_recover() {
         .unwrap();
         std::fs::write(gen_dir.join("crash.modules"), map).unwrap();
 
-        let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+        let report = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1);
         let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
         let modules = crash["modules"].as_array().expect("modules array");
         assert_eq!(modules[0]["filename"], "MyApp", "map: {map:?}");
@@ -583,7 +591,7 @@ fn native_signature_skips_pc_outside_every_module_range() {
         )
         .unwrap();
         std::fs::write(gen_dir.join("crash.modules"), module_map).unwrap();
-        let report = build_report(&find_pending(&dir.path, 2)[0], 1);
+        let report = build_report(storage_for(&dir.path).as_ref(), &find_pending(storage_for(&dir.path).as_ref(), 2)[0], 1);
         let crash: Value = serde_json::from_slice(&report.crash_json).unwrap();
         crash["signatures"][0].as_str().unwrap().to_string()
     };
@@ -609,9 +617,9 @@ fn native_crash_json_without_crash_info_still_emits_signal() {
     std::fs::create_dir_all(&gen_dir).unwrap();
     std::fs::write(gen_dir.join("crash.minidump"), b"MDMP\x00only").unwrap();
 
-    let pending = find_pending(&dir.path, 2);
+    let pending = find_pending(storage_for(&dir.path).as_ref(), 2);
     assert_eq!(pending.len(), 1);
-    let report = build_report(&pending[0], 1_720_531_200_000);
+    let report = build_report(storage_for(&dir.path).as_ref(), &pending[0], 1_720_531_200_000);
     let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
 
     assert_eq!(crash["exception_type"], json!("native"));
@@ -659,11 +667,15 @@ fn correlated_panic_crash_json_matches_contract_4_14() {
             },
         }],
     };
-    info.write_to(&gen_dir.join("panic.info")).unwrap();
+    info.write_to(
+        storage_for(&dir.path).as_ref(),
+        "parts/1/panic.info",
+    )
+    .unwrap();
 
-    let pending = find_pending(&dir.path, 2);
+    let pending = find_pending(storage_for(&dir.path).as_ref(), 2);
     assert_eq!(pending.len(), 1);
-    let report = build_report(&pending[0], 1_720_531_200_000);
+    let report = build_report(storage_for(&dir.path).as_ref(), &pending[0], 1_720_531_200_000);
     let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
 
     // Managed variant: exception object, no top-level `signal`, `domain` null
@@ -705,9 +717,9 @@ fn abnormal_exit_crash_json_matches_contract_4_14() {
     // snapshot — so this is an abnormal termination.
     seed_alive_marker(&dir.path, 1);
 
-    let pending = find_pending(&dir.path, 2);
+    let pending = find_pending(storage_for(&dir.path).as_ref(), 2);
     assert_eq!(pending.len(), 1);
-    let report = build_report(&pending[0], 1_720_531_200_000);
+    let report = build_report(storage_for(&dir.path).as_ref(), &pending[0], 1_720_531_200_000);
     let crash: Value = serde_json::from_slice(&report.crash_json).expect("parse crash.json");
 
     assert_eq!(crash["ndkCrash"], json!(false));

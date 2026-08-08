@@ -8,8 +8,11 @@
 //! export, and byte/time eviction.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bugsee_core::capture::{export_report, PartStore, WindowCaps};
+use bugsee_platform::Storage;
+use bugsee_platform_desktop::FsStorage;
 use serde_json::Value;
 
 /// A throwaway temp dir under the system temp, cleaned up on drop.
@@ -35,6 +38,10 @@ impl Drop for TempDir {
     }
 }
 
+fn storage_for(dir: &std::path::Path) -> Arc<dyn Storage> {
+    Arc::new(FsStorage::new(dir).unwrap()) as Arc<dyn Storage>
+}
+
 fn log_payload(msg: &str) -> Vec<u8> {
     format!(r#"{{"timestamp":1,"level":3,"source":1,"message":"{msg}"}}"#).into_bytes()
 }
@@ -42,7 +49,8 @@ fn log_payload(msg: &str) -> Vec<u8> {
 #[test]
 fn snapshot_export_filters_by_timestamp() {
     let dir = TempDir::new("snap");
-    let mut store = PartStore::new(&dir.path, 0, WindowCaps::default()).unwrap();
+    let storage = storage_for(&dir.path);
+    let mut store = PartStore::new(Arc::clone(&storage), 0, WindowCaps::default()).unwrap();
 
     // Three log entries at ts 100/200/300, one network entry at 250.
     store.append("log", 100, &log_payload("a")).unwrap();
@@ -54,10 +62,9 @@ fn snapshot_export_filters_by_timestamp() {
     store.append("log", 300, &log_payload("c")).unwrap();
 
     // Snapshot window [150, 260] should include log@200, network@250; drop 100 & 300.
-    let report_dir = dir.path.join("reports").join("r1");
-    store.snapshot_into(&report_dir, 150, 260).unwrap();
+    store.snapshot_into("reports/r1", 150, 260).unwrap();
 
-    let docs = export_report(&report_dir, 150, 260).unwrap();
+    let docs = export_report(storage.as_ref(), "reports/r1", 150, 260).unwrap();
     let by: std::collections::HashMap<_, _> =
         docs.into_iter().map(|d| (d.channel, d.bytes)).collect();
 
@@ -83,16 +90,16 @@ fn snapshot_export_filters_by_timestamp() {
 #[test]
 fn export_preserves_order_across_parts() {
     let dir = TempDir::new("order");
-    let mut store = PartStore::new(&dir.path, 0, WindowCaps::default()).unwrap();
+    let storage = storage_for(&dir.path);
+    let mut store = PartStore::new(Arc::clone(&storage), 0, WindowCaps::default()).unwrap();
     for (i, ts) in [10i64, 20, 30, 40].into_iter().enumerate() {
         store
             .append("log", ts, &log_payload(&format!("m{i}")))
             .unwrap();
         store.rotate().unwrap();
     }
-    let report_dir = dir.path.join("reports").join("r");
-    store.snapshot_into(&report_dir, 0, 1000).unwrap();
-    let docs = export_report(&report_dir, 0, 1000).unwrap();
+    store.snapshot_into("reports/r", 0, 1000).unwrap();
+    let docs = export_report(storage.as_ref(), "reports/r", 0, 1000).unwrap();
     let log: Value = serde_json::from_slice(&docs[0].bytes).unwrap();
     let msgs: Vec<&str> = log["events"]
         .as_array()
@@ -110,12 +117,13 @@ fn export_preserves_order_across_parts() {
 #[test]
 fn byte_cap_evicts_oldest_parts() {
     let dir = TempDir::new("evict");
+    let storage = storage_for(&dir.path);
     let caps = WindowCaps {
         max_window_ms: i64::MAX, // isolate the byte cap
         max_bytes: 200,
         max_events: u64::MAX,
     };
-    let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
+    let mut store = PartStore::new(Arc::clone(&storage), 0, caps).unwrap();
     // Each ~50-byte payload in its own part; after enough rotations the oldest
     // parts must be unlinked to stay under 200 bytes.
     let big = "x".repeat(50);
@@ -137,12 +145,13 @@ fn time_cap_evicts_parts_beyond_the_window() {
     // Regression: time-based eviction previously never fired (it read the
     // freshly-rotated empty part's end_ts).
     let dir = TempDir::new("timecap");
+    let storage = storage_for(&dir.path);
     let caps = WindowCaps {
         max_window_ms: 100,  // 100 ms window
         max_bytes: u64::MAX, // isolate the time cap
         max_events: u64::MAX,
     };
-    let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
+    let mut store = PartStore::new(Arc::clone(&storage), 0, caps).unwrap();
     // One entry per part, timestamps 0,50,100,...,500 — span 500 ms >> 100 ms.
     for i in 0..=10 {
         store
@@ -167,17 +176,17 @@ fn time_cap_evicts_parts_beyond_the_window() {
 #[test]
 fn hard_link_snapshot_survives_eviction() {
     let dir = TempDir::new("refcount");
+    let storage = storage_for(&dir.path);
     let caps = WindowCaps {
         max_window_ms: i64::MAX,
         max_bytes: 60,
         max_events: u64::MAX,
     };
-    let mut store = PartStore::new(&dir.path, 0, caps).unwrap();
+    let mut store = PartStore::new(Arc::clone(&storage), 0, caps).unwrap();
     store.append("log", 10, &log_payload("keep-me")).unwrap();
 
     // Snapshot the first part before it is evicted.
-    let report_dir = dir.path.join("reports").join("r");
-    store.snapshot_into(&report_dir, 0, 1000).unwrap();
+    store.snapshot_into("reports/r", 0, 1000).unwrap();
 
     // Now push data that forces eviction of the original part from the live pool.
     for ts in 1..8 {
@@ -188,7 +197,7 @@ fn hard_link_snapshot_survives_eviction() {
     }
 
     // The snapshot's hard link keeps the data alive despite live eviction.
-    let docs = export_report(&report_dir, 0, 50).unwrap();
+    let docs = export_report(storage.as_ref(), "reports/r", 0, 50).unwrap();
     let log: Value = serde_json::from_slice(&docs[0].bytes).unwrap();
     assert_eq!(log["events"][0]["message"], "keep-me");
 }
