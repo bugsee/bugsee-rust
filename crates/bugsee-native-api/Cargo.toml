@@ -1,0 +1,13 @@
+[package]
+name = "bugsee-native-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The contract between the Bugsee SDK and a native fatal-crash backend (in-process handler, PLCrashReporter, Crashpad, ...)."
+
+# Deliberately dependency-free: every backend crate depends on this one, and none
+# of them should drag in the others — or the SDK — to do so.
+[dependencies]

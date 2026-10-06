@@ -12,12 +12,13 @@ built in **Bugsee mobile-SDK style**, producing **backend-compatible report bund
 that ingest into the existing appserver/viewer unchanged. Design + decision log live
 in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-structure`.
 
-## Crates (8)
+## Crates (9)
 
 | Crate | Role |
 |---|---|
 | `bugsee-core` | Pure-`std` capture/persistence/export engine; recovery; queue; signatures. One contained `unsafe` (`kill(pid,0)` liveness probe, unix). |
 | `bugsee-panic` | Chained global panic observer + `catch_unwind` boundary guards. |
+| `bugsee-native-api` | Dependency-free contract for native fatal-crash backends (`CrashBackend`, `BackendGuard`, `BackendConfig`). Backend crates — in-process, and planned PLCrashReporter (Apple mobile) and Crashpad (Android) — depend on this, not on the SDK or each other. |
 | `bugsee-native` | Native fatal-crash handler (POSIX signal / Mach exception / Windows SEH) → allocation-free marker + frame capture + code-id-bearing module map (Mach-O `LC_UUID`, GNU build-id, PE CodeView) for next-launch recovery. |
 | `bugsee` | Public facade + default `ureq` HTTP transport + APM. |
 | `bugsee-reqwest` | `reqwest` network-capture middleware (sanitized). |

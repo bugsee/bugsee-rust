@@ -54,14 +54,36 @@ mod imp {
     /// MUST match `bugsee_core::recovery::MODULES_NAME`.
     const MODULES_NAME: &str = "crash.modules";
 
-    /// Keeps the native crash handler installed for its lifetime.
-    pub struct NativeHandler {
+    /// Keeps the in-process crash handler installed for its lifetime.
+    pub struct InProcessGuard {
         _handler: CrashHandler,
+    }
+
+    impl bugsee_native_api::BackendGuard for InProcessGuard {}
+
+    /// The in-process backend: a signal / Mach-exception / SEH handler written in
+    /// Rust (on top of the `crash-handler` crate) that writes an async-signal-safe
+    /// marker for next-launch recovery. Needs no helper process and no third-party
+    /// native code, which is why it is the default wherever nothing better exists.
+    pub struct InProcessBackend;
+
+    impl bugsee_native_api::CrashBackend for InProcessBackend {
+        fn name(&self) -> &'static str {
+            "in-process"
+        }
+
+        fn install(
+            &self,
+            config: &bugsee_native_api::BackendConfig,
+        ) -> std::io::Result<Box<dyn bugsee_native_api::BackendGuard>> {
+            let guard = install_in_process(config.crash_info_path.clone())?;
+            Ok(Box::new(guard))
+        }
     }
 
     /// Install the native crash handler, writing the marker to `crash_info_path` on
     /// a fatal crash. Keep the returned guard alive for the handler to stay active.
-    pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
+    fn install_in_process(crash_info_path: PathBuf) -> std::io::Result<InProcessGuard> {
         let path_bytes = path_to_cbytes(&crash_info_path);
 
         // The deadline thread must exist BEFORE a crash: creating a thread inside an
@@ -90,7 +112,7 @@ mod imp {
         })
         .map_err(|e| std::io::Error::other(format!("crash handler attach failed: {e}")))?;
 
-        Ok(NativeHandler { _handler: handler })
+        Ok(InProcessGuard { _handler: handler })
     }
 
     /// How long the crash handler may run before the process is killed outright.
@@ -1916,23 +1938,23 @@ pub use imp::*;
     target_os = "windows"
 )))]
 mod unsupported {
-    use std::path::PathBuf;
+    use bugsee_native_api::{BackendConfig, BackendGuard, CrashBackend};
 
-    /// Placeholder: there is no native handler on this target.
-    pub struct NativeHandler;
+    /// The backend for a target that has none: installing always fails with
+    /// `Unsupported`, which the facade treats as "no native capture".
+    pub struct InProcessBackend;
 
-    // Matches the real handler's Drop contract, so callers' deliberate
-    // `drop(handler)` is not `clippy::drop_non_drop` on this target.
-    impl Drop for NativeHandler {
-        fn drop(&mut self) {}
-    }
+    impl CrashBackend for InProcessBackend {
+        fn name(&self) -> &'static str {
+            "unsupported"
+        }
 
-    /// Always fails: no native crash handler exists for this target.
-    pub fn install(_crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "native crash capture is not implemented for this target",
-        ))
+        fn install(&self, _config: &BackendConfig) -> std::io::Result<Box<dyn BackendGuard>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "native crash capture is not implemented for this target",
+            ))
+        }
     }
 
     /// No modules are enumerated on an unsupported target.
@@ -1949,3 +1971,114 @@ mod unsupported {
     target_os = "windows"
 )))]
 pub use unsupported::*;
+
+pub use bugsee_native_api::{BackendConfig, BackendGuard, CrashBackend};
+
+use std::path::PathBuf;
+
+/// Keeps the native crash handler installed for its lifetime.
+pub struct NativeHandler {
+    _guard: Box<dyn BackendGuard>,
+}
+
+/// The backend used when none is chosen explicitly.
+///
+/// Today that is the in-process Rust handler everywhere it exists (and a stub
+/// that reports `Unsupported` elsewhere). This is the one place a platform's
+/// default changes when it gains a better engine — PLCrashReporter on Apple
+/// mobile, Crashpad on Android.
+pub fn default_backend() -> Box<dyn CrashBackend> {
+    Box::new(InProcessBackend)
+}
+
+/// Install the default backend, writing the marker to `crash_info_path` on a
+/// fatal crash. Keep the returned guard alive for the handler to stay active.
+pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
+    install_with(&*default_backend(), BackendConfig::new(crash_info_path))
+}
+
+/// Install a specific backend. This is what lets a host (or a test) pick an
+/// engine other than the platform default.
+pub fn install_with(
+    backend: &dyn CrashBackend,
+    config: BackendConfig,
+) -> std::io::Result<NativeHandler> {
+    Ok(NativeHandler {
+        _guard: backend.install(&config)?,
+    })
+}
+
+#[cfg(test)]
+mod backend_plumbing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct Recorded(Arc<AtomicBool>);
+    impl BackendGuard for Recorded {}
+    impl Drop for Recorded {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct Fake {
+        dropped: Arc<AtomicBool>,
+        seen: std::sync::Mutex<Option<PathBuf>>,
+    }
+    impl CrashBackend for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn install(&self, config: &BackendConfig) -> std::io::Result<Box<dyn BackendGuard>> {
+            *self.seen.lock().unwrap() = Some(config.crash_info_path.clone());
+            Ok(Box::new(Recorded(self.dropped.clone())))
+        }
+    }
+
+    struct Refusing;
+    impl CrashBackend for Refusing {
+        fn name(&self) -> &'static str {
+            "refusing"
+        }
+        fn install(&self, _: &BackendConfig) -> std::io::Result<Box<dyn BackendGuard>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    #[test]
+    fn a_chosen_backend_gets_the_session_config_and_is_uninstalled_on_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let fake = Fake {
+            dropped: dropped.clone(),
+            seen: Default::default(),
+        };
+        let handler = install_with(&fake, BackendConfig::new("/tmp/sess/crash.info")).unwrap();
+        assert_eq!(
+            fake.seen.lock().unwrap().as_deref(),
+            Some(std::path::Path::new("/tmp/sess/crash.info"))
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "installed while held");
+        drop(handler);
+        assert!(dropped.load(Ordering::SeqCst), "dropping uninstalls");
+    }
+
+    #[test]
+    fn a_backend_that_refuses_surfaces_its_error_rather_than_a_handler() {
+        let err = install_with(&Refusing, BackendConfig::new("/tmp/x"))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn the_session_dir_is_the_markers_parent() {
+        let c = BackendConfig::new("/data/gen-3/crash.info");
+        assert_eq!(c.session_dir(), Some(std::path::Path::new("/data/gen-3")));
+    }
+
+    #[test]
+    fn the_default_backend_is_named() {
+        assert!(!default_backend().name().is_empty());
+    }
+}

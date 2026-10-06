@@ -10,6 +10,7 @@ description = "Native fatal-crash handler (signal/exception) for the Bugsee Rust
 
 [dependencies]
 bugsee-core = { workspace = true }
+bugsee-native-api = { workspace = true }
 
 # `crash-handler` has no iOS/tvOS/watchOS backend (its `CrashContext` does not
 # exist there), so it is only pulled in where it can compile; every other target
