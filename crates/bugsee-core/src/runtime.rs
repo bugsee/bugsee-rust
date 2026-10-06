@@ -245,8 +245,18 @@ pub struct Recorder {
     caps: WindowCaps,
     data_dir: PathBuf,
     session: Session,
+    rotate_interval: Duration,
+    backoff_base: Duration,
     worker: Option<JoinHandle<()>>,
     uploader: Option<JoinHandle<()>>,
+}
+
+/// The two pipeline threads and the channels that feed them.
+struct Pipeline {
+    tx: Sender<Msg>,
+    upload_tx: Sender<UploadMsg>,
+    worker: JoinHandle<()>,
+    uploader: JoinHandle<()>,
 }
 
 impl Recorder {
@@ -278,65 +288,82 @@ impl Recorder {
         });
 
         let session = Session::begin(&config.data_dir)?;
-        let generation = session.generation();
         let data_dir = config.data_dir.clone();
-
-        // Uploader thread: drains the durable queue with retry.
-        let (upload_tx, upload_rx) = channel();
-        let uploader_shared = Arc::clone(&shared);
-        let uploader_data_dir = data_dir.clone();
-        let backoff_base = config.upload_backoff_base;
-        let uploader = std::thread::Builder::new()
-            .name("bugsee-uploader".into())
-            .spawn(move || {
-                uploader_loop(upload_rx, uploader_shared, uploader_data_dir, backoff_base)
-            })?;
-
-        // Capture worker: owns the part store; enqueues reports.
-        let (tx, rx) = channel();
-        let store = PartStore::new(&config.data_dir, generation, config.caps)?;
-        let worker_shared = Arc::clone(&shared);
-        let rotate_interval = config.rotate_interval;
-        let worker_data_dir = data_dir.clone();
-        let caps = config.caps;
-        let sampler = config.sampler;
-        let worker_upload_tx = upload_tx.clone();
-
-        let worker = std::thread::Builder::new()
-            .name("bugsee-capture".into())
-            .spawn(move || {
-                // Queue any crashed prior session before capturing this one.
-                // Contained: a panic here (e.g. a host before_send on a recovered
-                // crash) must not abort the thread before worker_loop starts.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Reap orphaned queue sidecars from a prior killed enqueue/
-                    // remove first (runs before this session enqueues anything).
-                    queue::gc_orphans(&worker_data_dir);
-                    run_recovery(&worker_shared, &worker_data_dir, generation);
-                }));
-                let _ = worker_upload_tx.send(UploadMsg::Wake);
-                worker_loop(
-                    rx,
-                    store,
-                    worker_shared,
-                    rotate_interval,
-                    worker_data_dir,
-                    caps,
-                    sampler,
-                    worker_upload_tx,
-                );
-            })?;
+        let pipeline = spawn_pipeline(
+            &shared,
+            &data_dir,
+            session.generation(),
+            config.caps,
+            config.rotate_interval,
+            config.upload_backoff_base,
+            config.sampler,
+            true,
+        )?;
 
         Ok(Recorder {
-            tx,
-            upload_tx,
+            tx: pipeline.tx,
+            upload_tx: pipeline.upload_tx,
             shared,
-            caps,
+            caps: config.caps,
             data_dir,
             session,
-            worker: Some(worker),
-            uploader: Some(uploader),
+            rotate_interval: config.rotate_interval,
+            backoff_base: config.upload_backoff_base,
+            worker: Some(pipeline.worker),
+            uploader: Some(pipeline.uploader),
         })
+    }
+
+    /// Bring a recorder back to life in a **fork child**.
+    ///
+    /// `fork()` copies this struct but not its threads: the capture worker and
+    /// the uploader do not exist in the child, so every channel send would
+    /// succeed into a queue nobody reads and the child would silently stop
+    /// reporting. This abandons the dead pipeline (never joined — there is
+    /// nothing to join) and starts a fresh one, keeping everything that makes the
+    /// recorder *this app's* recorder: hooks, scope, transport, environment.
+    ///
+    /// The child gets its **own session generation and liveness marker**, so a
+    /// crash in the child is recovered as the child's, and it never touches the
+    /// parent's capture parts. It does not run recovery of prior sessions (the
+    /// parent already did, and doing it twice would double-deliver), and does not
+    /// force-drain the shared queue (the parent's uploader is already on it).
+    ///
+    /// `sampler` replaces the telemetry sampler, which died with the worker.
+    pub fn revive_after_fork(
+        &mut self,
+        sampler: Option<Box<dyn TelemetrySampler>>,
+    ) -> std::io::Result<()> {
+        // The parent's threads are not ours to join; drop their handles without
+        // running anything.
+        std::mem::forget(self.worker.take());
+        std::mem::forget(self.uploader.take());
+
+        // Entries queued to the dead worker will never be processed, so the
+        // back-pressure counters they incremented would stay high forever and
+        // eventually drop everything.
+        self.shared.queued.store(0, Ordering::SeqCst);
+        self.shared.report_queued.store(0, Ordering::SeqCst);
+
+        let session = Session::begin(&self.data_dir)?;
+        let pipeline = spawn_pipeline(
+            &self.shared,
+            &self.data_dir,
+            session.generation(),
+            self.caps,
+            self.rotate_interval,
+            self.backoff_base,
+            sampler,
+            false,
+        )?;
+
+        // The parent's session is still the parent's: leave its marker alone.
+        std::mem::forget(std::mem::replace(&mut self.session, session));
+        self.tx = pipeline.tx;
+        self.upload_tx = pipeline.upload_tx;
+        self.worker = Some(pipeline.worker);
+        self.uploader = Some(pipeline.uploader);
+        Ok(())
     }
 
     /// Enqueue an entry. Never blocks; drops (newest) under back-pressure or if
@@ -617,6 +644,80 @@ fn report_into(
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
 /// The crashed session's state is discarded ONLY after the report is durably
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
+/// Start the uploader and the capture worker for `generation`.
+///
+/// `fresh_launch` is true for a process's first pipeline and false for one
+/// revived in a fork child: only a fresh launch recovers crashed prior sessions
+/// and force-drains the durable queue.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pipeline(
+    shared: &Arc<Shared>,
+    data_dir: &Path,
+    generation: u64,
+    caps: WindowCaps,
+    rotate_interval: Duration,
+    backoff_base: Duration,
+    sampler: Option<Box<dyn TelemetrySampler>>,
+    fresh_launch: bool,
+) -> std::io::Result<Pipeline> {
+    // Uploader thread: drains the durable queue with retry.
+    let (upload_tx, upload_rx) = channel();
+    let uploader_shared = Arc::clone(shared);
+    let uploader_data_dir = data_dir.to_path_buf();
+    let uploader = std::thread::Builder::new()
+        .name("bugsee-uploader".into())
+        .spawn(move || {
+            uploader_loop(
+                upload_rx,
+                uploader_shared,
+                uploader_data_dir,
+                backoff_base,
+                fresh_launch,
+            )
+        })?;
+
+    // Capture worker: owns the part store; enqueues reports.
+    let (tx, rx) = channel();
+    let store = PartStore::new(data_dir, generation, caps)?;
+    let worker_shared = Arc::clone(shared);
+    let worker_data_dir = data_dir.to_path_buf();
+    let worker_upload_tx = upload_tx.clone();
+
+    let worker = std::thread::Builder::new()
+        .name("bugsee-capture".into())
+        .spawn(move || {
+            if fresh_launch {
+                // Queue any crashed prior session before capturing this one.
+                // Contained: a panic here (e.g. a host before_send on a recovered
+                // crash) must not abort the thread before worker_loop starts.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Reap orphaned queue sidecars from a prior killed enqueue/
+                    // remove first (runs before this session enqueues anything).
+                    queue::gc_orphans(&worker_data_dir);
+                    run_recovery(&worker_shared, &worker_data_dir, generation);
+                }));
+            }
+            let _ = worker_upload_tx.send(UploadMsg::Wake);
+            worker_loop(
+                rx,
+                store,
+                worker_shared,
+                rotate_interval,
+                worker_data_dir,
+                caps,
+                sampler,
+                worker_upload_tx,
+            );
+        })?;
+
+    Ok(Pipeline {
+        tx,
+        upload_tx,
+        worker,
+        uploader,
+    })
+}
+
 fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
     for pending in recovery::find_pending(data_dir, current_generation) {
         // Count the attempt *before* processing: a corrupt session that panics
@@ -934,14 +1035,18 @@ fn uploader_loop(
     shared: Arc<Shared>,
     data_dir: PathBuf,
     backoff_base: Duration,
+    fresh_launch: bool,
 ) {
     let poll = Duration::from_secs(5);
     // A fresh launch retries any queued report immediately (force), ignoring
-    // backoff scheduled by the prior session. Guarded so a panicking Transport
-    // impl can't kill the uploader.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drain(&shared, &data_dir, backoff_base, true)
-    }));
+    // backoff scheduled by the prior session. A fork child skips this: the
+    // parent's uploader is already working the shared queue. Guarded so a
+    // panicking Transport impl can't kill the uploader.
+    if fresh_launch {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain(&shared, &data_dir, backoff_base, true)
+        }));
+    }
     loop {
         match rx.recv_timeout(poll) {
             Ok(UploadMsg::Wake) => {

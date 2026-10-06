@@ -19,6 +19,7 @@
 pub mod bundle;
 pub mod capture;
 pub mod errors;
+pub mod fork;
 pub mod model;
 pub mod panic_info;
 pub mod queue;

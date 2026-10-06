@@ -11,11 +11,11 @@
 //! and after stop.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bugsee_core::errors::{self, Cause};
+use bugsee_core::fork::ForkMutex;
 use bugsee_core::model::entry::{CaptureEntry, EventEntry, LogEntry, TraceEntry};
 use bugsee_core::model::enums::{LogLevel, LogSource, Severity};
 use bugsee_core::reporting::{manual_upload_meta, ReportMeta};
@@ -28,10 +28,24 @@ use crate::report::Report;
 
 // A `Mutex` (not `RwLock`) because `mpsc::Sender` inside `Recorder` is `Send`
 // but not `Sync`; the lock is held only long enough to enqueue.
-static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
+//
+// `ForkMutex` rather than `Mutex` so a `fork()` child can abandon a lock a
+// vanished thread held (see `bugsee_core::fork`).
+static RECORDER: ForkMutex<Option<Recorder>> = ForkMutex::new(|| None);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "native")]
-static NATIVE: Mutex<Option<bugsee_native::NativeHandler>> = Mutex::new(None);
+static NATIVE: ForkMutex<Option<bugsee_native::NativeHandler>> = ForkMutex::new(|| None);
+
+/// What reviving the recorder in a fork child needs beyond the recorder itself.
+#[derive(Clone, Copy)]
+struct ReviveInfo {
+    /// Whether to restart the telemetry sampler (it dies with the worker thread).
+    system_telemetry: bool,
+}
+static REVIVE_INFO: ForkMutex<Option<ReviveInfo>> = ForkMutex::new(|| None);
+
+/// The fork epoch this process last reconciled with.
+static SEEN_FORK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// The Bugsee SDK facade.
 pub struct Bugsee;
@@ -55,6 +69,8 @@ impl Bugsee {
 
     /// Launch with explicit [`LaunchOptions`].
     pub fn launch_with(options: LaunchOptions) -> io::Result<LaunchGuard> {
+        bugsee_core::fork::install_fork_hook();
+        check_fork();
         let data_dir = options.resolved_data_dir();
         std::fs::create_dir_all(&data_dir)?;
 
@@ -114,10 +130,7 @@ impl Bugsee {
         #[cfg(feature = "native")]
         if options.native_crash_capture {
             if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
-                let old = NATIVE
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .replace(handler);
+                let old = NATIVE.lock().replace(handler);
                 drop(old);
             }
         } else {
@@ -126,7 +139,7 @@ impl Bugsee {
             // would otherwise also point at a stale generation's marker path and
             // conflict with a host-owned crash handler). Take under the lock, drop
             // outside it — mirrors `stop()`.
-            let old = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let old = NATIVE.lock().take();
             drop(old);
         }
 
@@ -134,12 +147,12 @@ impl Bugsee {
         // `Recorder::drop` joins the worker/uploader threads (blocking up to a few
         // seconds), and doing that under the global lock would stall every
         // concurrent capture call — the same hazard `stop()` guards against.
-        let old = RECORDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(recorder);
+        let old = RECORDER.lock().replace(recorder);
         drop(old);
         PAUSED.store(false, Ordering::SeqCst);
+        *REVIVE_INFO.lock() = Some(ReviveInfo {
+            system_telemetry: options.system_telemetry,
+        });
 
         #[cfg(feature = "panic")]
         {
@@ -158,30 +171,32 @@ impl Bugsee {
 
     /// Stop the SDK and flush pending work (dropping the recorder joins the worker).
     pub fn stop() {
+        check_fork();
         #[cfg(feature = "native")]
         {
-            let handler = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let handler = NATIVE.lock().take();
             drop(handler);
         }
         // Take the recorder out and RELEASE the lock before dropping it — its
         // Drop joins the worker/uploader threads and must never run while the
         // global lock is held (that would deadlock every concurrent capture call
         // if a thread were wedged).
-        let recorder = RECORDER.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let recorder = RECORDER.lock().take();
         drop(recorder);
     }
 
     /// Whether the SDK is launched and not paused.
     pub fn is_active() -> bool {
-        RECORDER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-            && !PAUSED.load(Ordering::SeqCst)
+        check_fork();
+        RECORDER.lock().is_some() && !PAUSED.load(Ordering::SeqCst)
     }
 
     /// Whether the SDK is launched, regardless of pause state. Lets callers (e.g.
     /// the FFI `bugsee_flush`) distinguish "not launched" from "launched but the
     /// flush timed out".
     pub fn is_launched() -> bool {
-        RECORDER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        check_fork();
+        RECORDER.lock().is_some()
     }
 
     /// Pause capture (events are dropped until [`Bugsee::resume`]). Also gates
@@ -366,23 +381,96 @@ impl Bugsee {
     }
 
     fn with_recorder<R>(f: impl FnOnce(&Recorder) -> R) -> Option<R> {
-        RECORDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(f)
+        check_fork();
+        RECORDER.lock().as_ref().map(f)
     }
 
     /// Clone a cheap [`bugsee_core::RecorderHandle`] out from under the global
     /// lock, so blocking or host-callback work runs WITHOUT holding the mutex
     /// (avoids the capture-wide stall and the re-entrant-callback deadlock).
     fn handle() -> Option<bugsee_core::RecorderHandle> {
-        RECORDER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|r| r.handle())
+        check_fork();
+        RECORDER.lock().as_ref().map(|r| r.handle())
     }
+}
+
+/// If this process was `fork()`ed since the SDK last looked, rebuild what the
+/// fork did not carry over. Cheap on the hot path: one atomic load.
+///
+/// Called from every facade entry point rather than from the `pthread_atfork`
+/// hook itself, because between `fork` and `exec` a multithreaded process's
+/// child may only do async-signal-safe things — and rebuilding a recorder is
+/// the opposite of that. The hook just bumps a counter; this notices it.
+#[inline]
+fn check_fork() {
+    let epoch = bugsee_core::fork::fork_epoch();
+    if epoch == SEEN_FORK_EPOCH.load(Ordering::Relaxed) {
+        return;
+    }
+    // One thread does the rebuild; any other racing thread carries on (its
+    // captures may be dropped for the few microseconds until the new pipeline is
+    // installed, which beats blocking it behind a lock a dead thread might hold).
+    if SEEN_FORK_EPOCH.swap(epoch, Ordering::SeqCst) != epoch {
+        revive_after_fork();
+    }
+}
+
+/// Runs in a fork child, on its first SDK call. See
+/// [`bugsee_core::Recorder::revive_after_fork`] for what the child gets.
+fn revive_after_fork() {
+    // Every lock below may have been held by a thread that did not survive the
+    // fork; `ForkMutex::reset_after_fork` abandons them rather than waiting.
+    let old_recorder = RECORDER.reset_after_fork().flatten();
+    #[cfg(feature = "native")]
+    let old_native = NATIVE.reset_after_fork().flatten();
+    let info = REVIVE_INFO.reset_after_fork().flatten();
+    #[cfg(feature = "panic")]
+    bugsee_panic::reset_after_fork();
+
+    // No recorder (never launched, or its lock was held by a vanished thread):
+    // nothing to revive. Put back what we took and leave the child un-launched.
+    let (Some(mut recorder), Some(info)) = (old_recorder, info) else {
+        *REVIVE_INFO.lock() = info;
+        #[cfg(feature = "native")]
+        {
+            *NATIVE.lock() = old_native;
+        }
+        return;
+    };
+
+    #[cfg(feature = "telemetry")]
+    let sampler: Option<Box<dyn bugsee_core::runtime::TelemetrySampler>> = if info.system_telemetry
+    {
+        Some(Box::new(crate::telemetry::SysinfoSampler::new()))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "telemetry"))]
+    let sampler: Option<Box<dyn bugsee_core::runtime::TelemetrySampler>> = None;
+
+    if recorder.revive_after_fork(sampler).is_err() {
+        // Could not start a pipeline in the child. Dropping the recorder would try
+        // to join threads that do not exist; leave the child with no SDK instead.
+        std::mem::forget(recorder);
+        #[cfg(feature = "native")]
+        {
+            *NATIVE.lock() = old_native;
+        }
+        return;
+    }
+
+    // The crash handler and panic observer are process-global and were inherited
+    // pointing at the PARENT's session; retarget them at the child's own.
+    #[cfg(feature = "native")]
+    if let Some(handler) = old_native {
+        bugsee_native::rebind(recorder.crash_info_path());
+        *NATIVE.lock() = Some(handler);
+    }
+    #[cfg(feature = "panic")]
+    bugsee_panic::set_snapshot_path(recorder.panic_info_path());
+
+    *REVIVE_INFO.lock() = Some(info);
+    *RECORDER.lock() = Some(recorder);
 }
 
 /// Submit a populated deferred report (called by `Report::upload`).
