@@ -438,15 +438,22 @@ fn revive_after_fork() {
         return;
     };
 
-    #[cfg(feature = "telemetry")]
+    // Not on Apple platforms: `sysinfo` reaches into CoreFoundation/IOKit, which
+    // abort a process that has forked ("you MUST exec()") — taking the whole child
+    // down on the first sample. A forked child there reports without ongoing
+    // system telemetry.
+    #[cfg(all(feature = "telemetry", not(target_vendor = "apple")))]
     let sampler: Option<Box<dyn bugsee_core::runtime::TelemetrySampler>> = if info.system_telemetry
     {
         Some(Box::new(crate::telemetry::SysinfoSampler::new()))
     } else {
         None
     };
-    #[cfg(not(feature = "telemetry"))]
-    let sampler: Option<Box<dyn bugsee_core::runtime::TelemetrySampler>> = None;
+    #[cfg(not(all(feature = "telemetry", not(target_vendor = "apple"))))]
+    let sampler: Option<Box<dyn bugsee_core::runtime::TelemetrySampler>> = {
+        let _ = info.system_telemetry;
+        None
+    };
 
     if recorder.revive_after_fork(sampler).is_err() {
         // Could not start a pipeline in the child. Dropping the recorder would try
@@ -460,11 +467,17 @@ fn revive_after_fork() {
     }
 
     // The crash handler and panic observer are process-global and were inherited
-    // pointing at the PARENT's session; retarget them at the child's own.
+    // pointing at the PARENT's session. Native capture is reinstalled from scratch
+    // for the child rather than retargeted: on macOS the inherited handler is wired
+    // to threads and ports that exist only in the parent, so it cannot be reused.
+    // Dropping the inherited guard detaches it (best-effort: its parent-side
+    // resources are unreachable from here, which `detach` tolerates).
     #[cfg(feature = "native")]
-    if let Some(handler) = old_native {
-        bugsee_native::rebind(recorder.crash_info_path());
-        *NATIVE.lock() = Some(handler);
+    if old_native.is_some() {
+        drop(old_native);
+        if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
+            *NATIVE.lock() = Some(handler);
+        }
     }
     #[cfg(feature = "panic")]
     bugsee_panic::set_snapshot_path(recorder.panic_info_path());

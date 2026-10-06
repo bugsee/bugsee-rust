@@ -68,8 +68,8 @@ mod imp {
         std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
     /// In a `fork()` child the inherited marker path points into the PARENT's
-    /// session. Until the child rebinds to its own, a crash would write there and
-    /// be recovered as the parent's — so the hook clears the path (an atomic
+    /// session. Until the child installs its own handler, a crash would write there
+    /// and be recovered as the parent's — so the hook clears the path (an atomic
     /// store, the one thing a multithreaded child may safely do) and the handler
     /// then records nothing rather than something misattributed.
     #[cfg(unix)]
@@ -78,6 +78,11 @@ mod imp {
         ONCE.call_once(|| {
             extern "C" fn child() {
                 MARKER_PATH.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+                #[cfg(target_vendor = "apple")]
+                // SAFETY: Mach traps and `sigaction` are async-signal-safe.
+                unsafe {
+                    reset_inherited_exception_ports();
+                }
             }
             // SAFETY: registers a plain `extern "C"` fn that only does an atomic
             // store. Failure (ENOMEM) just leaves the hook uninstalled.
@@ -87,19 +92,58 @@ mod imp {
         });
     }
 
+    /// A `fork()` child inherits the parent's Mach exception PORTS, which route a
+    /// fault to the PARENT's handler thread. That thread then services an
+    /// exception raised by a different task and the child's faulting thread is
+    /// never resumed: the child HANGS instead of crashing. Restore the default
+    /// disposition (the fault becomes an ordinary signal and the child dies), and
+    /// do the same for `SIGABRT`, whose inherited handler also waits on the
+    /// parent's now-absent handler thread. The SDK reinstalls a proper handler for
+    /// the child when it next runs (see the facade's fork revival).
+    ///
+    /// Only async-signal-safe calls: this runs in the child between `fork` and
+    /// whatever the host does next.
+    #[cfg(target_vendor = "apple")]
+    unsafe fn reset_inherited_exception_ports() {
+        // The same set `crash-handler` registers for.
+        use mach2::exception_types::{
+            EXCEPTION_DEFAULT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION,
+            EXC_MASK_BREAKPOINT, EXC_MASK_CRASH, EXC_MASK_GUARD, EXC_MASK_RESOURCE,
+        };
+        extern "C" {
+            fn task_set_exception_ports(
+                task: u32,
+                exception_mask: u32,
+                new_port: u32,
+                behavior: i32,
+                new_flavor: i32,
+            ) -> i32;
+        }
+        const MACH_PORT_NULL: u32 = 0;
+        const THREAD_STATE_NONE: i32 = 5;
+        let mask = EXC_MASK_BAD_ACCESS
+            | EXC_MASK_BAD_INSTRUCTION
+            | EXC_MASK_ARITHMETIC
+            | EXC_MASK_BREAKPOINT
+            | EXC_MASK_CRASH
+            | EXC_MASK_RESOURCE
+            | EXC_MASK_GUARD;
+        // SAFETY: plain Mach trap on this task; MACH_PORT_NULL clears the port.
+        unsafe {
+            task_set_exception_ports(
+                mach2::traps::mach_task_self(),
+                mask,
+                MACH_PORT_NULL,
+                EXCEPTION_DEFAULT as i32,
+                THREAD_STATE_NONE,
+            );
+            libc::signal(libc::SIGABRT, libc::SIG_DFL);
+        }
+    }
+
     fn publish_marker_path(path: &std::path::Path) {
         let leaked = Box::into_raw(Box::new(path_to_cbytes(path)));
         MARKER_PATH.store(leaked, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Point the installed handler at a new session's marker, and re-snapshot the
-    /// module map beside it. Call from a normal (non-signal) context — e.g. in a
-    /// `fork()` child, whose session directory differs from the parent's.
-    pub fn rebind(crash_info_path: PathBuf) {
-        if let Some(dir) = crash_info_path.parent() {
-            write_modules_file(&dir.join(MODULES_NAME));
-        }
-        publish_marker_path(&crash_info_path);
     }
 
     /// Install the native crash handler, writing the marker to `crash_info_path` on
@@ -1984,9 +2028,6 @@ mod unsupported {
             "native crash capture is not implemented for this target",
         ))
     }
-
-    /// Nothing is installed on an unsupported target, so there is nothing to retarget.
-    pub fn rebind(_crash_info_path: PathBuf) {}
 
     /// No modules are enumerated on an unsupported target.
     #[doc(hidden)]
