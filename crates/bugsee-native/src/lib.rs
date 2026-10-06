@@ -59,10 +59,99 @@ mod imp {
         _handler: CrashHandler,
     }
 
+    /// The marker path the handler writes to, behind an atomic so [`rebind`] can
+    /// retarget a live handler (a fork child must not write into its parent's
+    /// session). A load is async-signal-safe; the buffers are leaked on purpose,
+    /// because a handler running on another thread may still be reading the old
+    /// one, and a path is a few dozen bytes.
+    static MARKER_PATH: std::sync::atomic::AtomicPtr<Vec<PathChar>> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+    /// In a `fork()` child the inherited marker path points into the PARENT's
+    /// session. Until the child installs its own handler, a crash would write there
+    /// and be recovered as the parent's — so the hook clears the path (an atomic
+    /// store, the one thing a multithreaded child may safely do) and the handler
+    /// then records nothing rather than something misattributed.
+    #[cfg(unix)]
+    fn install_fork_hook() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            extern "C" fn child() {
+                MARKER_PATH.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+                #[cfg(target_vendor = "apple")]
+                // SAFETY: Mach traps and `sigaction` are async-signal-safe.
+                unsafe {
+                    reset_inherited_exception_ports();
+                }
+            }
+            // SAFETY: registers a plain `extern "C"` fn that only does an atomic
+            // store. Failure (ENOMEM) just leaves the hook uninstalled.
+            unsafe {
+                libc::pthread_atfork(None, None, Some(child));
+            }
+        });
+    }
+
+    /// A `fork()` child inherits the parent's Mach exception PORTS, which route a
+    /// fault to the PARENT's handler thread. That thread then services an
+    /// exception raised by a different task and the child's faulting thread is
+    /// never resumed: the child HANGS instead of crashing. Restore the default
+    /// disposition (the fault becomes an ordinary signal and the child dies), and
+    /// do the same for `SIGABRT`, whose inherited handler also waits on the
+    /// parent's now-absent handler thread. The SDK reinstalls a proper handler for
+    /// the child when it next runs (see the facade's fork revival).
+    ///
+    /// Only async-signal-safe calls: this runs in the child between `fork` and
+    /// whatever the host does next.
+    #[cfg(target_vendor = "apple")]
+    unsafe fn reset_inherited_exception_ports() {
+        // The same set `crash-handler` registers for.
+        use mach2::exception_types::{
+            EXCEPTION_DEFAULT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION,
+            EXC_MASK_BREAKPOINT, EXC_MASK_CRASH, EXC_MASK_GUARD, EXC_MASK_RESOURCE,
+        };
+        extern "C" {
+            fn task_set_exception_ports(
+                task: u32,
+                exception_mask: u32,
+                new_port: u32,
+                behavior: i32,
+                new_flavor: i32,
+            ) -> i32;
+        }
+        const MACH_PORT_NULL: u32 = 0;
+        const THREAD_STATE_NONE: i32 = 5;
+        let mask = EXC_MASK_BAD_ACCESS
+            | EXC_MASK_BAD_INSTRUCTION
+            | EXC_MASK_ARITHMETIC
+            | EXC_MASK_BREAKPOINT
+            | EXC_MASK_CRASH
+            | EXC_MASK_RESOURCE
+            | EXC_MASK_GUARD;
+        // SAFETY: plain Mach trap on this task; MACH_PORT_NULL clears the port.
+        unsafe {
+            task_set_exception_ports(
+                mach2::traps::mach_task_self(),
+                mask,
+                MACH_PORT_NULL,
+                EXCEPTION_DEFAULT as i32,
+                THREAD_STATE_NONE,
+            );
+            libc::signal(libc::SIGABRT, libc::SIG_DFL);
+        }
+    }
+
+    fn publish_marker_path(path: &std::path::Path) {
+        let leaked = Box::into_raw(Box::new(path_to_cbytes(path)));
+        MARKER_PATH.store(leaked, std::sync::atomic::Ordering::Release);
+    }
+
     /// Install the native crash handler, writing the marker to `crash_info_path` on
     /// a fatal crash. Keep the returned guard alive for the handler to stay active.
     pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
-        let path_bytes = path_to_cbytes(&crash_info_path);
+        #[cfg(unix)]
+        install_fork_hook();
+        publish_marker_path(&crash_info_path);
 
         // The deadline thread must exist BEFORE a crash: creating a thread inside an
         // exception handler can deadlock on the loader lock.
@@ -80,7 +169,12 @@ mod imp {
             crash_handler::make_crash_event(move |cc: &CrashContext| {
                 #[cfg(any(unix, windows))]
                 let watchdog = Watchdog::arm();
-                on_crash(&path_bytes, cc);
+                let path = MARKER_PATH.load(std::sync::atomic::Ordering::Acquire);
+                if !path.is_null() {
+                    // Only ever a leaked `Box<Vec<_>>`, never freed (this closure is
+                    // already inside the `unsafe` block that builds the handler).
+                    on_crash(&*path, cc);
+                }
                 #[cfg(any(unix, windows))]
                 watchdog.disarm();
                 // Continue to the previous/default handler so the process terminates

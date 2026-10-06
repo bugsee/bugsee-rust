@@ -39,3 +39,6 @@ telemetry = ["dep:sysinfo"]
 name = "crash_e2e_matrix"
 harness = false
 required-features = ["native"]
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

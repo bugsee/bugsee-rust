@@ -156,6 +156,7 @@ dependencies = [
  "bugsee-core",
  "bugsee-native",
  "bugsee-panic",
+ "libc",
  "serde_json",
  "sysinfo",
  "ureq",

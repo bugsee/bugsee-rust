@@ -28,13 +28,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
+use crate::fork::{ForkLock, ForkLockable};
 use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
 use crate::model::environment::Environment;
@@ -99,12 +100,6 @@ pub type OnReportDropped = Box<dyn Fn(DropReason) + Send + Sync>;
 /// A callback run on every breadcrumb before it is captured. Return the
 /// (possibly-mutated) breadcrumb to keep it, or `None` to drop it.
 pub type BeforeBreadcrumb = Box<dyn Fn(Breadcrumb) -> Option<Breadcrumb> + Send + Sync>;
-
-/// Lock a mutex, recovering the guard if it was poisoned by a panic. Library
-/// code must never propagate a poisoned-lock panic onto a host thread.
-fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Produces system/process telemetry samples appended as `traces.system` on
 /// each rotation tick. Implemented by the host layer (e.g. via `sysinfo`).
@@ -185,11 +180,11 @@ impl Drop for SnapshotHandle {
 
 /// State shared between the facade, the capture worker, and the uploader.
 struct Shared {
-    scope: Mutex<Scope>,
+    scope: ForkLock<Scope>,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
-    session: Mutex<Option<String>>,
+    session: ForkLock<Option<String>>,
     transport: Arc<dyn Transport>,
     before_send: Option<BeforeSend>,
     on_report_dropped: Option<OnReportDropped>,
@@ -204,6 +199,20 @@ struct Shared {
     max_report_queued: usize,
     /// Whether telemetry sampling is paused (mirrors the facade's pause state).
     paused: AtomicBool,
+}
+
+/// The recorder's own locks join the `fork()` lock protocol, so a forked child
+/// never inherits the scope or the cached access token locked by a thread (the
+/// capture worker merges the scope into every report) that did not survive.
+impl ForkLockable for Shared {
+    fn fork_lock(&self) {
+        self.scope.fork_lock();
+        self.session.fork_lock();
+    }
+    fn fork_unlock(&self) {
+        self.session.fork_unlock();
+        self.scope.fork_unlock();
+    }
 }
 
 enum Msg {
@@ -245,8 +254,18 @@ pub struct Recorder {
     caps: WindowCaps,
     data_dir: PathBuf,
     session: Session,
+    rotate_interval: Duration,
+    backoff_base: Duration,
     worker: Option<JoinHandle<()>>,
     uploader: Option<JoinHandle<()>>,
+}
+
+/// The two pipeline threads and the channels that feed them.
+struct Pipeline {
+    tx: Sender<Msg>,
+    upload_tx: Sender<UploadMsg>,
+    worker: JoinHandle<()>,
+    uploader: JoinHandle<()>,
 }
 
 impl Recorder {
@@ -260,11 +279,11 @@ impl Recorder {
         );
         let environment_json = serde_json::to_vec(&env).unwrap_or_default();
         let shared = Arc::new(Shared {
-            scope: Mutex::new(Scope::default()),
+            scope: ForkLock::new(Scope::default()),
             env,
             environment_json,
             app_token: config.app_token.clone(),
-            session: Mutex::new(None),
+            session: ForkLock::new(None),
             transport,
             before_send: config.before_send,
             on_report_dropped: config.on_report_dropped,
@@ -277,66 +296,93 @@ impl Recorder {
             paused: AtomicBool::new(false),
         });
 
+        crate::fork::install_fork_hook();
+        crate::fork::register_weak(&shared);
+
         let session = Session::begin(&config.data_dir)?;
-        let generation = session.generation();
         let data_dir = config.data_dir.clone();
-
-        // Uploader thread: drains the durable queue with retry.
-        let (upload_tx, upload_rx) = channel();
-        let uploader_shared = Arc::clone(&shared);
-        let uploader_data_dir = data_dir.clone();
-        let backoff_base = config.upload_backoff_base;
-        let uploader = std::thread::Builder::new()
-            .name("bugsee-uploader".into())
-            .spawn(move || {
-                uploader_loop(upload_rx, uploader_shared, uploader_data_dir, backoff_base)
-            })?;
-
-        // Capture worker: owns the part store; enqueues reports.
-        let (tx, rx) = channel();
-        let store = PartStore::new(&config.data_dir, generation, config.caps)?;
-        let worker_shared = Arc::clone(&shared);
-        let rotate_interval = config.rotate_interval;
-        let worker_data_dir = data_dir.clone();
-        let caps = config.caps;
-        let sampler = config.sampler;
-        let worker_upload_tx = upload_tx.clone();
-
-        let worker = std::thread::Builder::new()
-            .name("bugsee-capture".into())
-            .spawn(move || {
-                // Queue any crashed prior session before capturing this one.
-                // Contained: a panic here (e.g. a host before_send on a recovered
-                // crash) must not abort the thread before worker_loop starts.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Reap orphaned queue sidecars from a prior killed enqueue/
-                    // remove first (runs before this session enqueues anything).
-                    queue::gc_orphans(&worker_data_dir);
-                    run_recovery(&worker_shared, &worker_data_dir, generation);
-                }));
-                let _ = worker_upload_tx.send(UploadMsg::Wake);
-                worker_loop(
-                    rx,
-                    store,
-                    worker_shared,
-                    rotate_interval,
-                    worker_data_dir,
-                    caps,
-                    sampler,
-                    worker_upload_tx,
-                );
-            })?;
+        let pipeline = spawn_pipeline(
+            &shared,
+            &data_dir,
+            session.generation(),
+            config.caps,
+            config.rotate_interval,
+            config.upload_backoff_base,
+            config.sampler,
+            true,
+        )?;
 
         Ok(Recorder {
-            tx,
-            upload_tx,
+            tx: pipeline.tx,
+            upload_tx: pipeline.upload_tx,
             shared,
-            caps,
+            caps: config.caps,
             data_dir,
             session,
-            worker: Some(worker),
-            uploader: Some(uploader),
+            rotate_interval: config.rotate_interval,
+            backoff_base: config.upload_backoff_base,
+            worker: Some(pipeline.worker),
+            uploader: Some(pipeline.uploader),
         })
+    }
+
+    /// Bring a recorder back to life in a **fork child**.
+    ///
+    /// `fork()` copies this struct but not its threads: the capture worker and
+    /// the uploader do not exist in the child, so every channel send would
+    /// succeed into a queue nobody reads and the child would silently stop
+    /// reporting. This abandons the dead pipeline (never joined — there is
+    /// nothing to join) and starts a fresh one, keeping everything that makes the
+    /// recorder *this app's* recorder: hooks, scope, transport, environment.
+    ///
+    /// The child gets its **own session generation and liveness marker**, so a
+    /// crash in the child is recovered as the child's, and it never touches the
+    /// parent's capture parts. It does recover sessions that died after the parent
+    /// launched (a sibling worker that crashed), guarded by claims so siblings do
+    /// not both do it; it does not force-drain the shared queue (the parent's
+    /// uploader is already on it) or reap queue sidecars (the parent may be
+    /// mid-enqueue).
+    ///
+    /// `sampler` replaces the telemetry sampler, which died with the worker.
+    pub fn revive_after_fork(
+        &mut self,
+        sampler: Option<Box<dyn TelemetrySampler>>,
+    ) -> std::io::Result<()> {
+        // The parent's threads are not ours to join; drop their handles without
+        // running anything.
+        std::mem::forget(self.worker.take());
+        std::mem::forget(self.uploader.take());
+
+        // Entries queued to the dead worker will never be processed, so the
+        // back-pressure counters they incremented would stay high forever and
+        // eventually drop everything.
+        self.shared.queued.store(0, Ordering::SeqCst);
+        self.shared.report_queued.store(0, Ordering::SeqCst);
+
+        let session = Session::begin(&self.data_dir)?;
+        let pipeline = spawn_pipeline(
+            &self.shared,
+            &self.data_dir,
+            session.generation(),
+            self.caps,
+            self.rotate_interval,
+            self.backoff_base,
+            sampler,
+            false,
+        )?;
+
+        // The parent's session is still the parent's: leave its marker alone.
+        std::mem::forget(std::mem::replace(&mut self.session, session));
+        // The old channel senders must be LEAKED, never dropped. Dropping the last
+        // sender disconnects the channel, which wakes the (nonexistent) receiver
+        // thread through its parker — on macOS a libdispatch semaphore inherited
+        // from the parent, which libdispatch refuses to signal in a forked process
+        // (it traps, killing the child). Nothing here will ever read them again.
+        std::mem::forget(std::mem::replace(&mut self.tx, pipeline.tx));
+        std::mem::forget(std::mem::replace(&mut self.upload_tx, pipeline.upload_tx));
+        self.worker = Some(pipeline.worker);
+        self.uploader = Some(pipeline.uploader);
+        Ok(())
     }
 
     /// Enqueue an entry. Never blocks; drops (newest) under back-pressure or if
@@ -374,7 +420,7 @@ impl Recorder {
 
     /// Mutate the ambient scope (email / labels / attributes).
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = lock_recover(&self.shared.scope);
+        let mut guard = self.shared.scope.lock();
         f(&mut guard)
     }
 
@@ -508,7 +554,7 @@ impl RecorderHandle {
 
     /// Mutate the ambient scope.
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = lock_recover(&self.shared.scope);
+        let mut guard = self.shared.scope.lock();
         f(&mut guard)
     }
 
@@ -617,8 +663,94 @@ fn report_into(
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
 /// The crashed session's state is discarded ONLY after the report is durably
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
+/// Start the uploader and the capture worker for `generation`.
+///
+/// `fresh_launch` is true for a process's first pipeline and false for one
+/// revived in a fork child: only a fresh launch recovers crashed prior sessions
+/// and force-drains the durable queue.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pipeline(
+    shared: &Arc<Shared>,
+    data_dir: &Path,
+    generation: u64,
+    caps: WindowCaps,
+    rotate_interval: Duration,
+    backoff_base: Duration,
+    sampler: Option<Box<dyn TelemetrySampler>>,
+    fresh_launch: bool,
+) -> std::io::Result<Pipeline> {
+    // Uploader thread: drains the durable queue with retry.
+    let (upload_tx, upload_rx) = channel();
+    let uploader_shared = Arc::clone(shared);
+    let uploader_data_dir = data_dir.to_path_buf();
+    let uploader = std::thread::Builder::new()
+        .name("bugsee-uploader".into())
+        .spawn(move || {
+            uploader_loop(
+                upload_rx,
+                uploader_shared,
+                uploader_data_dir,
+                backoff_base,
+                fresh_launch,
+            )
+        })?;
+
+    // Capture worker: owns the part store; enqueues reports.
+    let (tx, rx) = channel();
+    let store = PartStore::new(data_dir, generation, caps)?;
+    let worker_shared = Arc::clone(shared);
+    let worker_data_dir = data_dir.to_path_buf();
+    let worker_upload_tx = upload_tx.clone();
+
+    let worker = std::thread::Builder::new()
+        .name("bugsee-capture".into())
+        .spawn(move || {
+            // Queue any crashed prior session before capturing this one.
+            // Contained: a panic here (e.g. a host before_send on a recovered
+            // crash) must not abort the thread before worker_loop starts.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Reap orphaned queue sidecars from a prior killed enqueue/remove
+                // first (runs before this session enqueues anything). Only a fresh
+                // launch: a fork child's parent may be mid-enqueue right now, and
+                // its in-flight sidecars would look orphaned.
+                if fresh_launch {
+                    queue::gc_orphans(&worker_data_dir);
+                }
+                // A fork child recovers too. A prefork master recovers only at ITS
+                // launch, and its own generation is the lowest, so it can never
+                // recover a worker that died later; the next worker started from
+                // it must, or that crash waits for the master to restart. Claims
+                // keep siblings from recovering the same session twice.
+                run_recovery(&worker_shared, &worker_data_dir, generation);
+            }));
+            let _ = worker_upload_tx.send(UploadMsg::Wake);
+            worker_loop(
+                rx,
+                store,
+                worker_shared,
+                rotate_interval,
+                worker_data_dir,
+                caps,
+                sampler,
+                worker_upload_tx,
+            );
+        })?;
+
+    Ok(Pipeline {
+        tx,
+        upload_tx,
+        worker,
+        uploader,
+    })
+}
+
 fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
     for pending in recovery::find_pending(data_dir, current_generation) {
+        // Several processes share this directory (a prefork master and its
+        // workers, above all): exactly one recovers a given session.
+        let Some(_claim) = recovery::claim_pending(data_dir, &pending) else {
+            continue;
+        };
         // Count the attempt *before* processing: a corrupt session that panics
         // the build/assemble path is a poison pill that would otherwise re-run —
         // and abort the whole loop — on every launch. After the cap, abandon it.
@@ -678,7 +810,7 @@ fn recover_one(shared: &Shared, data_dir: &Path, pending: &recovery::PendingSess
 
 /// Merge ambient scope (email / labels / attributes) into a report's metadata.
 fn merge_scope(shared: &Shared, meta: &mut ReportMeta) {
-    let scope = lock_recover(&shared.scope);
+    let scope = shared.scope.lock();
     if meta.email.is_none() {
         meta.email = scope.email.clone();
     }
@@ -934,14 +1066,18 @@ fn uploader_loop(
     shared: Arc<Shared>,
     data_dir: PathBuf,
     backoff_base: Duration,
+    fresh_launch: bool,
 ) {
     let poll = Duration::from_secs(5);
     // A fresh launch retries any queued report immediately (force), ignoring
-    // backoff scheduled by the prior session. Guarded so a panicking Transport
-    // impl can't kill the uploader.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drain(&shared, &data_dir, backoff_base, true)
-    }));
+    // backoff scheduled by the prior session. A fork child skips this: the
+    // parent's uploader is already working the shared queue. Guarded so a
+    // panicking Transport impl can't kill the uploader.
+    if fresh_launch {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain(&shared, &data_dir, backoff_base, true)
+        }));
+    }
     loop {
         match rx.recv_timeout(poll) {
             Ok(UploadMsg::Wake) => {
@@ -977,6 +1113,10 @@ fn drain(shared: &Shared, data_dir: &Path, backoff_base: Duration, force: bool) 
     let now = epoch_ms();
     let mut attempted = false;
     for report in queue::list_pending(data_dir) {
+        // Another process sharing the queue may be delivering this one.
+        let Some(_claim) = queue::try_claim(&report) else {
+            continue;
+        };
         let Ok((zip, request_json, retry, next_attempt)) = queue::load(&report) else {
             continue;
         };
@@ -1128,6 +1268,9 @@ fn drain_until_empty(
     loop {
         let now = epoch_ms();
         for report in queue::list_pending(data_dir) {
+            let Some(_claim) = queue::try_claim(&report) else {
+                continue; // a peer is delivering it; the loop below waits it out
+            };
             let Ok((zip, request_json, retry, _next)) = queue::load(&report) else {
                 continue;
             };
