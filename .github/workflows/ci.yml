@@ -80,3 +80,71 @@ jobs:
       # MSRV failure unrelated to what downstreams actually compile.
       - name: Build (MSRV)
         run: cargo build --workspace --locked
+
+  # The mobile targets have a different libc (bionic) and a different Apple
+  # sandbox than their desktop cousins, and the crash handler is cfg'd per
+  # platform, so "it builds for Linux/macOS" says nothing about them. These jobs
+  # can only compile and lint (no device to run on), which is enough to catch the
+  # cfg and API drift that otherwise lands unnoticed. Scope is the crash path
+  # (core + native) and the C ABI that ships to apps (ffi).
+  android:
+    name: build · lint (android aarch64)
+    runs-on: ubuntu-latest
+    env:
+      TARGET: aarch64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      # The runner image ships an NDK; point cc-rs and the linker at its clang.
+      - name: Configure NDK toolchain
+        run: |
+          BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
+      - name: Clippy (core, native, ffi)
+        run: cargo clippy --target "$TARGET" -p bugsee-core -p bugsee-native -p bugsee-ffi --all-targets -- -D warnings
+
+      # Linking the cdylib proves the whole dependency graph (including the C
+      # code in zstd-sys) cross-compiles, which clippy alone does not.
+      - name: Build C ABI (cdylib/staticlib)
+        run: cargo build --release --target "$TARGET" -p bugsee-ffi
+
+  ios:
+    name: build · lint (ios aarch64)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-ios, aarch64-apple-ios-sim]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-${{ matrix.target }}
+
+      - name: Clippy (core, native, ffi)
+        run: cargo clippy --target ${{ matrix.target }} -p bugsee-core -p bugsee-native -p bugsee-ffi --all-targets -- -D warnings
+
+      - name: Build C ABI (staticlib)
+        run: cargo build --release --target ${{ matrix.target }} -p bugsee-ffi
