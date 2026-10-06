@@ -1712,7 +1712,7 @@ mod imp {
         (pc != 0).then_some(pc)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(unix)]
     /// The Unix signal path (Linux, Android, macOS).
     ///
     /// Written here rather than taken from `crash-handler` because that crate's
