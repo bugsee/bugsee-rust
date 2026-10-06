@@ -105,15 +105,19 @@ mod imp {
     const HANDLER_BUDGET_SECS: u32 = 5;
 
     /// A `SIGALRM`-based deadline for the crash handler. Only async-signal-safe
-    /// calls (`sigaction`, `pthread_sigmask`, `alarm`) are used.
+    /// calls (`sigaction`, `sigprocmask`, `sigpending`, `sigwait`, `alarm`) are
+    /// used.
     ///
-    /// The host's own `SIGALRM` disposition is saved and restored by
-    /// [`Watchdog::disarm`], because the handler can return and the process can go
-    /// on living (a signal that was *sent* rather than faulted, swallowed by a
-    /// previous handler) — the host's timers must survive that.
+    /// The host's own `SIGALRM` disposition, thread signal mask and remaining
+    /// `alarm` time are saved and restored by [`Watchdog::disarm`], because the
+    /// handler can return and the process can go on living (a signal that was
+    /// *sent* rather than faulted, swallowed by a previous handler) — the host's
+    /// timers must survive that.
     #[cfg(unix)]
     struct Watchdog {
         previous: libc::sigaction,
+        old_mask: libc::sigset_t,
+        leftover: libc::c_uint,
     }
 
     #[cfg(unix)]
@@ -125,15 +129,39 @@ mod imp {
                 let mut dfl: libc::sigaction = core::mem::zeroed();
                 dfl.sa_sigaction = libc::SIG_DFL;
                 libc::sigemptyset(&mut dfl.sa_mask);
-                libc::sigaction(libc::SIGALRM, &dfl, &mut previous);
-                // SIGALRM may be blocked on this thread; the default action only
-                // fires if some thread can take it.
                 let mut set: libc::sigset_t = core::mem::zeroed();
                 libc::sigemptyset(&mut set);
                 libc::sigaddset(&mut set, libc::SIGALRM);
-                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
-                libc::alarm(HANDLER_BUDGET_SECS);
-                Watchdog { previous }
+                let mut old_mask: libc::sigset_t = core::mem::zeroed();
+                // Block SIGALRM first so nothing can be delivered while the
+                // disposition is switched to the default (terminate) action.
+                libc::sigprocmask(libc::SIG_BLOCK, &set, &mut old_mask);
+                libc::sigaction(libc::SIGALRM, &dfl, &mut previous);
+                // A host SIGALRM that already expired is pending: consume it, or
+                // unblocking below would kill the process before the marker is
+                // written.
+                loop {
+                    let mut pending: libc::sigset_t = core::mem::zeroed();
+                    libc::sigemptyset(&mut pending);
+                    if libc::sigpending(&mut pending) != 0
+                        || libc::sigismember(&pending, libc::SIGALRM) != 1
+                    {
+                        break;
+                    }
+                    let mut sig: libc::c_int = 0;
+                    if libc::sigwait(&set, &mut sig) != 0 {
+                        break;
+                    }
+                }
+                // Start the deadline, then let it be delivered (the default
+                // action only fires if some thread can take it).
+                let leftover = libc::alarm(HANDLER_BUDGET_SECS);
+                libc::sigprocmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
+                Watchdog {
+                    previous,
+                    old_mask,
+                    leftover,
+                }
             }
         }
 
@@ -142,6 +170,10 @@ mod imp {
             unsafe {
                 libc::alarm(0);
                 libc::sigaction(libc::SIGALRM, &self.previous, core::ptr::null_mut());
+                if self.leftover != 0 {
+                    libc::alarm(self.leftover);
+                }
+                libc::sigprocmask(libc::SIG_SETMASK, &self.old_mask, core::ptr::null_mut());
             }
         }
     }
@@ -1603,12 +1635,23 @@ mod imp {
         let pc = context_pc(cc);
         match select_crash_frames(&raw[..n], pc, out) {
             Some(k) => k,
-            // The unwinder never reached the interrupted PC: record the PC itself,
-            // which is exact, instead of a handler-only stack.
+            // The unwinder never reached the interrupted PC: keep the exact PC
+            // first, then whatever the walk produced (as on Windows), so callers
+            // are not lost from the report and the signature.
             None => match pc {
                 Some(pc) => {
                     out[0] = pc;
-                    1
+                    let mut k = 1;
+                    for &f in &raw[..n] {
+                        if k == MAX_FRAMES {
+                            break;
+                        }
+                        if f != pc && f != 0 {
+                            out[k] = f;
+                            k += 1;
+                        }
+                    }
+                    k
                 }
                 None => {
                     let k = n.min(MAX_FRAMES);
@@ -1625,12 +1668,18 @@ mod imp {
     const HANDLER_FRAME_SLACK: usize = 24;
 
     /// Cut an unwind that began inside the handler down to the interrupted code:
-    /// copy `raw` from the first frame equal to `pc` (the faulting instruction).
+    /// copy `raw` from the first frame equal (or within one byte) to `pc` (the
+    /// faulting instruction).
     /// `None` when `pc` is unknown or never appears — the caller picks a fallback.
     #[cfg(any(windows, target_os = "linux", target_os = "android", test))]
     fn select_crash_frames(raw: &[usize], pc: Option<usize>, out: &mut [usize]) -> Option<usize> {
         let pc = pc.filter(|&p| p != 0)?;
-        let start = raw.iter().position(|&f| f == pc)?;
+        // Allow for the unwinder reporting the return-address-adjusted IP (pc - 1)
+        // and for the Thumb/low bit, but prefer an exact hit.
+        let start = raw.iter().position(|&f| f == pc).or_else(|| {
+            raw.iter()
+                .position(|&f| f.abs_diff(pc) <= 1 || (f & !1) == (pc & !1))
+        })?;
         let n = (raw.len() - start).min(out.len());
         out[..n].copy_from_slice(&raw[start..start + n]);
         Some(n)
@@ -1841,6 +1890,14 @@ mod imp {
             assert!(select_crash_frames(&[1, 2, 3], Some(9), &mut out).is_none());
             assert!(select_crash_frames(&[], Some(9), &mut out).is_none());
         }
+
+        #[test]
+        fn off_by_one_pc_still_selects() {
+            let raw = [0x10, 0x11, 0xAAB, 0xBBB];
+            let mut out = [0usize; 8];
+            let n = select_crash_frames(&raw, Some(0xAAA), &mut out).unwrap();
+            assert_eq!(&out[..n], &[0xAAB, 0xBBB]);
+        }
     }
 }
 
@@ -1863,6 +1920,12 @@ mod unsupported {
 
     /// Placeholder: there is no native handler on this target.
     pub struct NativeHandler;
+
+    // Matches the real handler's Drop contract, so callers' deliberate
+    // `drop(handler)` is not `clippy::drop_non_drop` on this target.
+    impl Drop for NativeHandler {
+        fn drop(&mut self) {}
+    }
 
     /// Always fails: no native crash handler exists for this target.
     pub fn install(_crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
