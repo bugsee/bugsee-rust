@@ -23,7 +23,7 @@
 //! Runtimes embedding the SDK (CLR, JVM, V8, Dart, Ruby…) fault on purpose and
 //! recover. The guarantees, per platform:
 //!
-//! * **Linux/Android** — the SDK installs *over* the existing handlers and calls
+//! * **Linux/Android/macOS** — the SDK installs *over* the existing handlers and calls
 //!   the previous one itself. The crash marker is written first and **deleted**
 //!   if that handler returns without restoring the default action (or the signal
 //!   was only sent), so a recovered fault leaves no report and the SDK stays
@@ -53,7 +53,7 @@
 mod imp {
     use std::path::PathBuf;
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
     use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 
     /// Max crashing-thread frames captured for the dedup signature.
@@ -73,19 +73,19 @@ mod imp {
     const MODULES_NAME: &str = "crash.modules";
 
     /// Keeps the native crash handler installed for its lifetime.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
     pub struct NativeHandler {
         _handler: CrashHandler,
     }
 
     /// Keeps the native crash handler installed for its lifetime (dropping it puts
     /// the previously installed handlers back).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(unix)]
     pub struct NativeHandler {
         _private: (),
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(unix)]
     impl Drop for NativeHandler {
         fn drop(&mut self) {
             posix::uninstall();
@@ -111,11 +111,6 @@ mod imp {
         ONCE.call_once(|| {
             extern "C" fn child() {
                 MARKER_PATH.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
-                #[cfg(target_vendor = "apple")]
-                // SAFETY: Mach traps and `sigaction` are async-signal-safe.
-                unsafe {
-                    reset_inherited_exception_ports();
-                }
             }
             // SAFETY: registers a plain `extern "C"` fn that only does an atomic
             // store. Failure (ENOMEM) just leaves the hook uninstalled.
@@ -123,55 +118,6 @@ mod imp {
                 libc::pthread_atfork(None, None, Some(child));
             }
         });
-    }
-
-    /// A `fork()` child inherits the parent's Mach exception PORTS, which route a
-    /// fault to the PARENT's handler thread. That thread then services an
-    /// exception raised by a different task and the child's faulting thread is
-    /// never resumed: the child HANGS instead of crashing. Restore the default
-    /// disposition (the fault becomes an ordinary signal and the child dies), and
-    /// do the same for `SIGABRT`, whose inherited handler also waits on the
-    /// parent's now-absent handler thread. The SDK reinstalls a proper handler for
-    /// the child when it next runs (see the facade's fork revival).
-    ///
-    /// Only async-signal-safe calls: this runs in the child between `fork` and
-    /// whatever the host does next.
-    #[cfg(target_vendor = "apple")]
-    unsafe fn reset_inherited_exception_ports() {
-        // The same set `crash-handler` registers for.
-        use mach2::exception_types::{
-            EXCEPTION_DEFAULT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION,
-            EXC_MASK_BREAKPOINT, EXC_MASK_CRASH, EXC_MASK_GUARD, EXC_MASK_RESOURCE,
-        };
-        extern "C" {
-            fn task_set_exception_ports(
-                task: u32,
-                exception_mask: u32,
-                new_port: u32,
-                behavior: i32,
-                new_flavor: i32,
-            ) -> i32;
-        }
-        const MACH_PORT_NULL: u32 = 0;
-        const THREAD_STATE_NONE: i32 = 5;
-        let mask = EXC_MASK_BAD_ACCESS
-            | EXC_MASK_BAD_INSTRUCTION
-            | EXC_MASK_ARITHMETIC
-            | EXC_MASK_BREAKPOINT
-            | EXC_MASK_CRASH
-            | EXC_MASK_RESOURCE
-            | EXC_MASK_GUARD;
-        // SAFETY: plain Mach trap on this task; MACH_PORT_NULL clears the port.
-        unsafe {
-            task_set_exception_ports(
-                mach2::traps::mach_task_self(),
-                mask,
-                MACH_PORT_NULL,
-                EXCEPTION_DEFAULT as i32,
-                THREAD_STATE_NONE,
-            );
-            libc::signal(libc::SIGABRT, libc::SIG_DFL);
-        }
     }
 
     fn publish_marker_path(path: &std::path::Path) {
@@ -198,12 +144,12 @@ mod imp {
             write_modules_file(&dir.join(MODULES_NAME));
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(unix)]
         {
             posix::install()?;
             Ok(NativeHandler { _private: () })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(windows)]
         {
             let handler = CrashHandler::attach(unsafe {
                 crash_handler::make_crash_event(move |cc: &CrashContext| {
@@ -464,9 +410,16 @@ mod imp {
         bytes
     }
 
-    // Linux/Android deliver a POSIX signal; `posix::handler` decodes it and calls this.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn on_crash(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize, pc: Option<usize>) {
+    // Unix platforms deliver a POSIX signal; `posix::handler` decodes it and calls
+    // this with the kernel's `ucontext`.
+    #[cfg(unix)]
+    fn on_crash(
+        path_cbytes: &[PathChar],
+        signo: i32,
+        code: i32,
+        addr: usize,
+        uc: *const libc::c_void,
+    ) {
         // F29: persist the GUARANTEED marker (signal/code/addr) FIRST, THEN capture
         // frames. Linux frame capture runs `backtrace::trace_unsynchronized` on the
         // crashing thread, which is NOT async-signal-safe (it may lock / re-fault);
@@ -476,7 +429,16 @@ mod imp {
             write_marker(path_cbytes, signo, code, addr);
         }
         let mut frames = [0usize; MAX_FRAMES];
-        let n = capture_frames(pc, &mut frames);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let n = capture_frames(
+            unsafe { context_pc(uc as *const libc::ucontext_t) },
+            &mut frames,
+        );
+        #[cfg(target_vendor = "apple")]
+        let n = unsafe {
+            let (pc, fp) = context_regs(uc as *const DarwinUcontext);
+            capture_frames(pc, fp, &mut frames)
+        };
         unsafe {
             append_frames(path_cbytes, &frames[..n]);
         }
@@ -484,91 +446,18 @@ mod imp {
 
     /// The fault address for a signal that carries one (SIGSEGV/SIGBUS/SIGILL/
     /// SIGFPE/SIGTRAP); `0` otherwise.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(unix)]
     unsafe fn fault_address(si: *const libc::siginfo_t, signo: i32) -> usize {
-        const SIGILL: i32 = 4;
-        const SIGTRAP: i32 = 5;
-        const SIGBUS: i32 = 7;
-        const SIGFPE: i32 = 8;
-        const SIGSEGV: i32 = 11;
-        if !matches!(signo, SIGILL | SIGTRAP | SIGBUS | SIGFPE | SIGSEGV) {
+        // `libc` constants: SIGBUS differs between Linux (7) and BSD/Apple (10).
+        if !matches!(
+            signo,
+            libc::SIGILL | libc::SIGTRAP | libc::SIGBUS | libc::SIGFPE | libc::SIGSEGV
+        ) {
             return 0;
         }
         // SAFETY: `si` is the kernel-provided `siginfo_t` of a fault signal, whose
         // `_sigfault` union member holds the address.
         unsafe { (*si).si_addr() as usize }
-    }
-
-    // Apple platforms deliver a Mach exception — map it to the closest signal.
-    #[cfg(target_vendor = "apple")]
-    fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
-        // Mach exception kinds + codes we special-case (mach/exception_types.h).
-        const EXC_BAD_ACCESS: u32 = 1;
-        const EXC_SOFTWARE: u32 = 5;
-        // EXC_SOFTWARE code[0] marking a delivered Unix signal; the subcode (code[1])
-        // then holds the *signal number*, NOT a fault address.
-        const EXC_SOFT_SIGNAL: i64 = 0x10003;
-        const SIGSEGV: i32 = 11;
-        const SIGABRT: i32 = 6;
-
-        let (signo, code, addr) = match &cc.exception {
-            Some(e) => {
-                if e.kind == EXC_SOFTWARE && e.code as i64 == EXC_SOFT_SIGNAL {
-                    // A Unix signal delivered as a Mach exception (e.g. SIGABRT from a
-                    // Swift fatalError / uncaught NSException): the real signal is in
-                    // the subcode, and there is no fault address.
-                    (
-                        e.subcode.map(|s| s as i32).unwrap_or(SIGABRT),
-                        e.code as i32,
-                        0,
-                    )
-                } else if e.kind == EXC_BAD_ACCESS {
-                    // Only EXC_BAD_ACCESS carries a fault address in the subcode.
-                    (SIGSEGV, e.code as i32, e.subcode.unwrap_or(0) as usize)
-                } else {
-                    // Other exceptions: map kind→signal; the subcode is not a reliable
-                    // address for these, so don't record it as one.
-                    (mach_to_signal(e.kind), e.code as i32, 0)
-                }
-            }
-            None => (0, 0, 0),
-        };
-        unsafe {
-            write_marker(path_cbytes, signo, code, addr);
-        }
-        let mut frames = [0usize; MAX_FRAMES];
-        let n = unsafe { capture_frames(cc, &mut frames) };
-        unsafe {
-            append_frames(path_cbytes, &frames[..n]);
-        }
-    }
-
-    /// Map a Mach exception kind to the closest POSIX signal number (BSD values).
-    /// `EXC_BAD_ACCESS`/`EXC_SOFTWARE` are handled by the caller; an unknown kind
-    /// maps to `0` (UNKNOWN) rather than masquerading as `SIGABRT` — which would make
-    /// it spuriously eligible for panic↔SIGABRT correlation on the next launch.
-    #[cfg(target_vendor = "apple")]
-    fn mach_to_signal(kind: u32) -> i32 {
-        match kind {
-            1 => 11, // EXC_BAD_ACCESS      -> SIGSEGV
-            2 => 4,  // EXC_BAD_INSTRUCTION -> SIGILL
-            3 => 8,  // EXC_ARITHMETIC      -> SIGFPE
-            6 => 5,  // EXC_BREAKPOINT      -> SIGTRAP
-            _ => 0,  // EXC_CRASH/RESOURCE/GUARD/… -> UNKNOWN (not SIGABRT)
-        }
-    }
-
-    // Other Unixes / Windows: record that a crash occurred; details vary per OS.
-    #[cfg(not(any(
-        windows,
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple"
-    )))]
-    fn on_crash(path_cbytes: &[PathChar], _cc: &CrashContext) {
-        unsafe {
-            write_marker(path_cbytes, 0, 0, 0);
-        }
     }
 
     /// A small stack-only formatter — no heap, no locks (async-signal-safe).
@@ -1625,64 +1514,21 @@ mod imp {
     /// Capture up to [`MAX_FRAMES`] absolute PCs of the crashing thread into `out`,
     /// returning the count. Must be async-signal-safe.
     ///
-    /// Apple: the handler runs on a *separate* thread, so read the crashed thread's
-    /// registers via `thread_get_state` and walk its frame-pointer chain with the
-    /// fault-safe `mach_vm_read_overwrite`.
+    /// Apple: start from the interrupted `pc`/`fp` in the signal's context and walk
+    /// the frame-pointer chain with the fault-safe `mach_vm_read_overwrite`.
     #[cfg(target_vendor = "apple")]
-    unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
-        use mach2::kern_return::KERN_SUCCESS;
-        use mach2::thread_act::thread_get_state;
-        use mach2::thread_status::thread_state_t;
-
-        #[cfg(target_arch = "aarch64")]
-        let (pc, mut fp) = {
-            use mach2::structs::arm_thread_state64_t;
-            use mach2::thread_status::ARM_THREAD_STATE64;
-            let mut state = arm_thread_state64_t::new();
-            let mut count = arm_thread_state64_t::count();
-            let kr = unsafe {
-                thread_get_state(
-                    cc.thread,
-                    ARM_THREAD_STATE64,
-                    &mut state as *mut _ as thread_state_t,
-                    &mut count,
-                )
-            };
-            if kr != KERN_SUCCESS {
-                return 0;
-            }
-            (state.__pc as usize, state.__fp as usize)
-        };
-        #[cfg(target_arch = "x86_64")]
-        let (pc, mut fp) = {
-            use mach2::structs::x86_thread_state64_t;
-            use mach2::thread_status::x86_THREAD_STATE64;
-            let mut state = x86_thread_state64_t::new();
-            let mut count = x86_thread_state64_t::count();
-            let kr = unsafe {
-                thread_get_state(
-                    cc.thread,
-                    x86_THREAD_STATE64,
-                    &mut state as *mut _ as thread_state_t,
-                    &mut count,
-                )
-            };
-            if kr != KERN_SUCCESS {
-                return 0;
-            }
-            (state.__rip as usize, state.__rbp as usize)
-        };
-
+    unsafe fn capture_frames(pc: usize, mut fp: usize, out: &mut [usize; MAX_FRAMES]) -> usize {
+        let task = mach2::traps::mach_task_self();
         let mut n = 0;
         if pc != 0 {
-            out[n] = pc;
+            out[n] = strip_pac(pc);
             n += 1;
         }
         // Frame-pointer chain: [fp] = caller's fp, [fp + word] = return address
         // (same layout on arm64 and x86_64).
         while n < out.len() && fp >= 0x1000 {
             let mut slot = [0usize; 2];
-            if !unsafe { read_task_mem(cc.task, fp, &mut slot) } {
+            if !unsafe { read_task_mem(task, fp, &mut slot) } {
                 break;
             }
             // On arm64e a return address on the stack is PAC-signed; strip the
@@ -1702,6 +1548,42 @@ mod imp {
             fp = next_fp;
         }
         n
+    }
+
+    /// The interrupted `(pc, fp)` from the signal's saved register state.
+    #[cfg(target_vendor = "apple")]
+    unsafe fn context_regs(uc: *const DarwinUcontext) -> (usize, usize) {
+        // SAFETY: `uc` and its `uc_mcontext` come from the kernel for this signal.
+        unsafe {
+            let ss = &(*(*uc).uc_mcontext).ss;
+            #[cfg(target_arch = "aarch64")]
+            return (ss.__pc as usize, ss.__fp as usize);
+            #[cfg(target_arch = "x86_64")]
+            return (ss.__rip as usize, ss.__rbp as usize);
+        }
+    }
+
+    /// `ucontext_t` as laid out by Darwin (`libc` does not expose it): the mcontext
+    /// is `{exception state (16 bytes on both arm64 and x86_64), thread state}`.
+    #[cfg(target_vendor = "apple")]
+    #[repr(C)]
+    struct DarwinUcontext {
+        uc_onstack: i32,
+        uc_sigmask: u32,
+        uc_stack: libc::stack_t,
+        uc_link: *mut DarwinUcontext,
+        uc_mcsize: usize,
+        uc_mcontext: *mut DarwinMcontext,
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[repr(C)]
+    struct DarwinMcontext {
+        es: [u8; 16],
+        #[cfg(target_arch = "aarch64")]
+        ss: mach2::structs::arm_thread_state64_t,
+        #[cfg(target_arch = "x86_64")]
+        ss: mach2::structs::x86_thread_state64_t,
     }
 
     /// Fault-safe read of two words at `addr` from `task` (returns false on bad
@@ -1831,7 +1713,7 @@ mod imp {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    /// The Linux/Android signal path.
+    /// The Unix signal path (Linux, Android, macOS).
     ///
     /// Written here rather than taken from `crash-handler` because that crate's
     /// handler cannot coexist with a host that recovers from faults: after ONE
@@ -1890,8 +1772,17 @@ mod imp {
         static CHAINING: AtomicI32 = AtomicI32::new(0);
 
         fn gettid() -> i32 {
-            // SAFETY: plain syscall.
-            unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+            // SAFETY: plain syscall / libc call.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                libc::syscall(libc::SYS_gettid) as i32
+            }
+            #[cfg(target_vendor = "apple")]
+            unsafe {
+                let mut id = 0u64;
+                libc::pthread_threadid_np(0, &mut id);
+                id as i32
+            }
         }
 
         /// A handler needs somewhere to run when the faulting thread's own stack is
@@ -1979,8 +1870,14 @@ mod imp {
                 libc::sigemptyset(&mut dfl.sa_mask);
                 libc::sigaction(sig, &dfl, core::ptr::null_mut());
                 if (*info).si_code <= 0 || sig == libc::SIGABRT {
-                    let tid = libc::syscall(libc::SYS_gettid) as i32;
-                    if libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, sig) < 0 {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let failed = {
+                        let tid = libc::syscall(libc::SYS_gettid) as i32;
+                        libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, sig) < 0
+                    };
+                    #[cfg(target_vendor = "apple")]
+                    let failed = libc::pthread_kill(libc::pthread_self(), sig) != 0;
+                    if failed {
                         libc::_exit(1);
                     }
                 }
@@ -2043,8 +1940,7 @@ mod imp {
                 // SAFETY: `info`/`uc` come from the kernel; the path is a leaked box.
                 unsafe {
                     let addr = fault_address(info, sig);
-                    let pc = context_pc(uc as *const libc::ucontext_t);
-                    on_crash(&*path, sig, (*info).si_code, addr, pc);
+                    on_crash(&*path, sig, (*info).si_code, addr, uc);
                 }
                 watchdog.disarm();
                 wrote = true;
