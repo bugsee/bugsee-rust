@@ -45,6 +45,14 @@ extern "C" fn swallowing_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mu
         // A fault has a small positive code; a *sent* signal is <= 0 on Linux and
         // 0x10001+ (SI_USER…) on macOS.
         let code = (*info).si_code;
+        // Visible in the test output: what the OS reports as `si_code` here is
+        // exactly what the SDK's sent-vs-fault decision hinges on.
+        let mut buf = *b"HOST_SAW_CODE=0x00000000\n";
+        for i in 0..8 {
+            let nib = ((code as u32) >> (28 - 4 * i)) & 0xF;
+            buf[14 + i] = b"0123456789abcdef"[nib as usize];
+        }
+        libc::write(1, buf.as_ptr().cast(), buf.len());
         if code > 0 && code < 0x10001 {
             let mut dfl: libc::sigaction = std::mem::zeroed();
             dfl.sa_sigaction = libc::SIG_DFL;
