@@ -32,9 +32,45 @@ fn fault_null() {
     unsafe { std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1) }
 }
 
-#[allow(unconditional_recursion)]
+/// A real illegal-instruction fault. (Not `raise(SIGILL)`: on Apple a signal
+/// sent by the process never becomes a Mach exception, so the handler — which
+/// is driven by Mach exceptions there — rightly never sees it.)
+#[inline(never)]
+fn fault_illegal_instruction() {
+    // SAFETY: deliberately faulting.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("ud2");
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("udf #0");
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        libc::raise(libc::SIGILL);
+    }
+}
+
+/// A real integer divide-by-zero. Only x86 traps on it; aarch64 returns 0.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn fault_divide_by_zero() {
+    // SAFETY: deliberately faulting.
+    unsafe {
+        std::arch::asm!(
+            "xor edx, edx",
+            "xor ecx, ecx",
+            "mov eax, 1",
+            "div ecx",
+            out("eax") _, out("ecx") _, out("edx") _,
+        );
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn fault_divide_by_zero() {
+    unreachable!("no trapping integer divide on this architecture");
+}
+
 /// Unbounded recursion with a frame big enough to exhaust the stack quickly.
 #[inline(never)]
+#[allow(unconditional_recursion)]
 fn recurse(n: u64) -> u64 {
     let pad = [n as u8; 256];
     std::hint::black_box(&pad);
@@ -76,12 +112,8 @@ fn run_as_child_if_requested() {
             .unwrap();
         }
         "abort" => std::process::abort(),
-        "fpe" => unsafe {
-            libc::raise(libc::SIGFPE);
-        },
-        "ill" => unsafe {
-            libc::raise(libc::SIGILL);
-        },
+        "fpe" => fault_divide_by_zero(),
+        "ill" => fault_illegal_instruction(),
         "bus" => unsafe {
             // A REAL bus error: touch a mapped page that lies beyond the end of
             // its backing file. (A `raise(SIGBUS)` is not equivalent — the Rust
@@ -168,18 +200,23 @@ fn crash_matrix() {
     run_as_child_if_requested();
 
     // (kind, signal the marker must record)
-    let cases: &[(&str, i32)] = &[
+    let mut cases: Vec<(&str, i32)> = vec![
         ("segv", libc::SIGSEGV),
         ("segv_thread", libc::SIGSEGV),
         ("stack_overflow", libc::SIGSEGV),
         ("stack_overflow_thread", libc::SIGSEGV),
         ("abort", libc::SIGABRT),
-        ("fpe", libc::SIGFPE),
         ("ill", libc::SIGILL),
-        ("bus", libc::SIGBUS),
     ];
+    // Only x86 has a trapping integer divide.
+    #[cfg(target_arch = "x86_64")]
+    cases.push(("fpe", libc::SIGFPE));
+    // Apple reports every EXC_BAD_ACCESS as SIGSEGV (including the kernel's
+    // bus-error flavour), so the real-SIGBUS case is only meaningful elsewhere.
+    #[cfg(not(target_vendor = "apple"))]
+    cases.push(("bus", libc::SIGBUS));
 
-    for &(kind, want_signal) in cases {
+    for (kind, want_signal) in cases {
         let c = crash(kind);
         assert_eq!(
             recorded_signal(&c.marker),
