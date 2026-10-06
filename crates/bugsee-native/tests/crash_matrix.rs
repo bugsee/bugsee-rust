@@ -239,6 +239,8 @@ fn crash_matrix() {
     run_as_child_if_requested();
 
     // (kind, signal the marker must record)
+    // `mut` is only needed on targets where one of the cfg-gated pushes below exists.
+    #[allow(unused_mut)]
     let mut cases: Vec<(&str, i32)> = vec![
         ("segv", libc::SIGSEGV),
         ("segv_thread", libc::SIGSEGV),
