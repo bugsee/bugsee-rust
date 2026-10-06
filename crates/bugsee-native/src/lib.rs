@@ -30,7 +30,9 @@
 //!   armed. A handler installed *after* the SDK sits in front of it and the SDK
 //!   never sees what it handles. `SIGABRT` is always treated as fatal, and a host
 //!   that leaves its handler by `siglongjmp` keeps the marker (it is discarded
-//!   if the session ends cleanly).
+//!   if the session ends cleanly). On macOS a signal that was merely *sent*
+//!   looks like a fault, so a host that swallows one by resetting the default
+//!   action leaves a marker too (same cleanup).
 //! * **Windows** — reporting happens in the unhandled-exception filter, which
 //!   runs only after every vectored/structured handler declined, so a fault a
 //!   host recovers from never reaches it, whichever was installed first.
@@ -1772,20 +1774,13 @@ mod imp {
         static CHAINING: AtomicI32 = AtomicI32::new(0);
 
         /// Whether `si_code` says the signal was *sent* (`kill`, `raise`, …) rather
-        /// than raised by a fault. Linux encodes that as `<= 0`. macOS reports a
-        /// signal sent with `raise`/`pthread_kill` with a LARGE positive code
-        /// (observed `0x200`; the `SI_USER` family is `0x10001..`), whereas every
-        /// fault code (`SEGV_*`, `BUS_*`, `ILL_*`, `FPE_*`, `TRAP_*`) is a small
-        /// positive number.
+        /// than raised by a fault: `<= 0` on Linux. macOS cannot tell — it delivers
+        /// a signal sent with `raise`/`pthread_kill` with a fault-like code
+        /// (`SEGV_ACCERR`), so there a *sent* signal that the host swallows by
+        /// resetting the default action keeps its marker (it is discarded if the
+        /// session ends cleanly).
         fn is_sent(si_code: i32) -> bool {
-            #[cfg(target_vendor = "apple")]
-            {
-                !(1..=15).contains(&si_code)
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                si_code <= 0
-            }
+            si_code <= 0
         }
 
         fn gettid() -> i32 {

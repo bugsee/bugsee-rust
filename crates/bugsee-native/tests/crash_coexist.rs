@@ -37,28 +37,22 @@ extern "C" fn recovering_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mu
     }
 }
 
-/// A runtime that swallows a *sent* signal and returns, but does not own real
-/// faults (returning from those without fixing anything would loop forever).
-extern "C" fn swallowing_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+static SWALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A runtime that swallows ONE signal (the one the test sends) and returns, and
+/// declines everything after (returning from a real fault without fixing it would
+/// loop forever). It cannot use `si_code` to tell the two apart: macOS delivers a
+/// sent `SIGSEGV` with a fault-like code.
+extern "C" fn swallowing_host(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    if !SWALLOWED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     // SAFETY: async-signal-safe calls only.
     unsafe {
-        // A fault has a small positive code (1..=15); a *sent* signal is <= 0 on
-        // Linux and a large positive code on macOS (observed 0x200).
-        let code = (*info).si_code;
-        // Visible in the test output: what the OS reports as `si_code` here is
-        // exactly what the SDK's sent-vs-fault decision hinges on.
-        let mut buf = *b"HOST_SAW_CODE=0x00000000\n";
-        for i in 0..8 {
-            let nib = ((code as u32) >> (28 - 4 * i)) & 0xF;
-            buf[14 + i] = b"0123456789abcdef"[nib as usize];
-        }
-        libc::write(1, buf.as_ptr().cast(), buf.len());
-        if (1..=15).contains(&code) {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            dfl.sa_sigaction = libc::SIG_DFL;
-            libc::sigaction(libc::SIGSEGV, &dfl, std::ptr::null_mut());
-            libc::sigaction(libc::SIGBUS, &dfl, std::ptr::null_mut());
-        }
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGSEGV, &dfl, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &dfl, std::ptr::null_mut());
     }
 }
 
