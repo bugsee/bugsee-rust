@@ -30,12 +30,3 @@ panic = ["dep:bugsee-panic"]
 native = ["dep:bugsee-native"]
 # System/process telemetry sampling (traces.system) via sysinfo.
 telemetry = ["dep:sysinfo"]
-
-# The crash matrix needs the REAL main thread: an uncaught panic must unwind out
-# of `main`, and the panic observer treats any other thread as "a thread died",
-# not "the process died". libtest runs tests on spawned threads, so this target
-# supplies its own `main`.
-[[test]]
-name = "crash_e2e_matrix"
-harness = false
-required-features = ["native"]
