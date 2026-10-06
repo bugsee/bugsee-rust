@@ -48,6 +48,11 @@ pub struct NativeHandler {
 pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
     let path_bytes = path_to_cbytes(&crash_info_path);
 
+    // The deadline thread must exist BEFORE a crash: creating a thread inside an
+    // exception handler can deadlock on the loader lock.
+    #[cfg(windows)]
+    Watchdog::start();
+
     // Snapshot the loaded module map NOW: `dyld`/`dl_iterate_phdr` are not
     // async-signal-safe, so this cannot run at crash time. Recovery joins these
     // bases with the crash-time frame PCs to derive ASLR-invariant offsets.
@@ -57,10 +62,10 @@ pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
 
     let handler = CrashHandler::attach(unsafe {
         crash_handler::make_crash_event(move |cc: &CrashContext| {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             let watchdog = Watchdog::arm();
             on_crash(&path_bytes, cc);
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             watchdog.disarm();
             // Continue to the previous/default handler so the process terminates
             // with the original signal (and any host reporter also sees it).
@@ -80,7 +85,7 @@ pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
 /// fault with a *different* signal than the one it is handling. A crashed
 /// process that never exits holds its resources, blocks a supervisor's restart
 /// and — for a service — is strictly worse than the crash it hides.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const HANDLER_BUDGET_SECS: u32 = 5;
 
 /// A `SIGALRM`-based deadline for the crash handler. Only async-signal-safe
@@ -121,6 +126,102 @@ impl Watchdog {
         unsafe {
             libc::alarm(0);
             libc::sigaction(libc::SIGALRM, &self.previous, core::ptr::null_mut());
+        }
+    }
+}
+
+/// Windows counterpart of the unix `SIGALRM` watchdog. There is no async-signal
+/// equivalent of `alarm`, so a dedicated thread is created at install time and
+/// parked on an event; the handler signals it on entry and again on exit. If the
+/// exit signal does not arrive within the budget the thread ends the process
+/// with `TerminateProcess` — which, unlike anything the wedged thread could do,
+/// does not depend on the state the handler is stuck in.
+#[cfg(windows)]
+struct Watchdog;
+
+#[cfg(windows)]
+static WD_ARM: core::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+#[cfg(windows)]
+static WD_DONE: core::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Exit status the watchdog ends a wedged process with ("BUGS").
+#[cfg(windows)]
+#[doc(hidden)]
+pub const WATCHDOG_EXIT_CODE: u32 = 0x4255_4753;
+
+/// Test hook: when set, the handler wedges itself, standing in for a blocked
+/// filesystem or a deadlock so the watchdog can be exercised on Windows (which
+/// has no FIFO to block an `open` on).
+#[cfg(windows)]
+static TEST_WEDGE_HANDLER: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Make the next crash handler wedge itself. Tests only.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn wedge_handler_for_test() {
+    TEST_WEDGE_HANDLER.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn watchdog_thread(_: *mut core::ffi::c_void) -> u32 {
+    use core::sync::atomic::Ordering::SeqCst;
+    const WAIT_TIMEOUT: u32 = 0x102;
+    loop {
+        let arm = WD_ARM.load(SeqCst);
+        let done = WD_DONE.load(SeqCst);
+        unsafe {
+            win32::WaitForSingleObject(arm, u32::MAX);
+            if win32::WaitForSingleObject(done, HANDLER_BUDGET_SECS * 1000) == WAIT_TIMEOUT {
+                win32::TerminateProcess(win32::GetCurrentProcess(), WATCHDOG_EXIT_CODE);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Watchdog {
+    /// Create the events and the parked thread. Idempotent; on any failure the
+    /// watchdog is simply absent (the handler still works, just unbounded).
+    fn start() {
+        use core::sync::atomic::Ordering::SeqCst;
+        if !WD_ARM.load(SeqCst).is_null() {
+            return;
+        }
+        unsafe {
+            let null = core::ptr::null_mut();
+            let arm = win32::CreateEventW(null, 0, 0, core::ptr::null());
+            let done = win32::CreateEventW(null, 0, 0, core::ptr::null());
+            if arm.is_null() || done.is_null() {
+                return;
+            }
+            WD_DONE.store(done, SeqCst);
+            WD_ARM.store(arm, SeqCst);
+            let th = win32::CreateThread(null, 0, Some(watchdog_thread), null, 0, null.cast());
+            if th.is_null() {
+                WD_ARM.store(core::ptr::null_mut(), SeqCst);
+                return;
+            }
+            win32::CloseHandle(th);
+        }
+    }
+
+    fn arm() -> Self {
+        use core::sync::atomic::Ordering::SeqCst;
+        let arm = WD_ARM.load(SeqCst);
+        if !arm.is_null() {
+            unsafe { win32::SetEvent(arm) };
+        }
+        Watchdog
+    }
+
+    fn disarm(self) {
+        use core::sync::atomic::Ordering::SeqCst;
+        let done = WD_DONE.load(SeqCst);
+        if !done.is_null() {
+            unsafe { win32::SetEvent(done) };
         }
     }
 }
@@ -594,6 +695,11 @@ unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> us
 
 #[cfg(windows)]
 fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
+    if TEST_WEDGE_HANDLER.load(core::sync::atomic::Ordering::SeqCst) {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     let signo = exception_to_signal(cc.exception_code);
     let addr = unsafe { fault_address(cc) };
     // `code` stays 0: it mirrors POSIX `si_code`, and Windows has no equivalent
@@ -1169,6 +1275,23 @@ mod win32 {
 
     unsafe extern "system" {
         pub fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        pub fn TerminateProcess(process: *mut core::ffi::c_void, exit_code: u32) -> i32;
+        pub fn CreateEventW(
+            attrs: *mut core::ffi::c_void,
+            manual_reset: i32,
+            initial: i32,
+            name: *const u16,
+        ) -> *mut core::ffi::c_void;
+        pub fn SetEvent(event: *mut core::ffi::c_void) -> i32;
+        pub fn WaitForSingleObject(handle: *mut core::ffi::c_void, millis: u32) -> u32;
+        pub fn CreateThread(
+            attrs: *mut core::ffi::c_void,
+            stack: usize,
+            start: Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>,
+            param: *mut core::ffi::c_void,
+            flags: u32,
+            thread_id: *mut u32,
+        ) -> *mut core::ffi::c_void;
         pub fn CreateFileW(
             name: *const u16,
             access: u32,
