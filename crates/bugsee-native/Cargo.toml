@@ -10,6 +10,11 @@ description = "Native fatal-crash handler (signal/exception) for the Bugsee Rust
 
 [dependencies]
 bugsee-core = { workspace = true }
+
+# `crash-handler` has no iOS/tvOS/watchOS backend (its `CrashContext` does not
+# exist there), so it is only pulled in where it can compile; every other target
+# gets the stub in `lib.rs`.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))'.dependencies]
 crash-handler = "0.8"
 
 [target.'cfg(unix)'.dependencies]
