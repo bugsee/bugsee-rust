@@ -130,6 +130,10 @@ fn child() {
             // SAFETY: raises a signal at ourselves.
             unsafe { libc::raise(libc::SIGSEGV) };
             say(&format!("SURVIVED marker_present={}", marker.exists()));
+            // On a failure, which invocation left it (its `code=` tells).
+            if let Ok(left) = std::fs::read_to_string(&marker) {
+                say(&format!("LEFTOVER_MARKER {}", left.replace('\n', " | ")));
+            }
             // And the SDK is still armed afterwards.
             // SAFETY: deliberate null write.
             unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
