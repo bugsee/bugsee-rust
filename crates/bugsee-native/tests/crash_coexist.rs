@@ -42,7 +42,10 @@ extern "C" fn recovering_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mu
 extern "C" fn swallowing_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
     // SAFETY: async-signal-safe calls only.
     unsafe {
-        if (*info).si_code > 0 {
+        // A fault has a small positive code; a *sent* signal is <= 0 on Linux and
+        // 0x10001+ (SI_USER…) on macOS.
+        let code = (*info).si_code;
+        if code > 0 && code < 0x10001 {
             let mut dfl: libc::sigaction = std::mem::zeroed();
             dfl.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(libc::SIGSEGV, &dfl, std::ptr::null_mut());

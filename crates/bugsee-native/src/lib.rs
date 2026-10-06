@@ -1771,6 +1771,21 @@ mod imp {
         /// Thread currently inside a host handler we are chaining to (0 = none).
         static CHAINING: AtomicI32 = AtomicI32::new(0);
 
+        /// Whether `si_code` says the signal was *sent* (`kill`, `raise`, …) rather
+        /// than raised by a fault. Linux encodes that as `<= 0`; BSD/Apple use the
+        /// positive `SI_USER` family (`0x10001..`) and keep small positive codes for
+        /// faults.
+        fn is_sent(si_code: i32) -> bool {
+            #[cfg(target_vendor = "apple")]
+            {
+                si_code <= 0 || si_code >= 0x10001
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                si_code <= 0
+            }
+        }
+
         fn gettid() -> i32 {
             // SAFETY: plain syscall / libc call.
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1869,7 +1884,7 @@ mod imp {
                 dfl.sa_sigaction = libc::SIG_DFL;
                 libc::sigemptyset(&mut dfl.sa_mask);
                 libc::sigaction(sig, &dfl, core::ptr::null_mut());
-                if (*info).si_code <= 0 || sig == libc::SIGABRT {
+                if is_sent((*info).si_code) || sig == libc::SIGABRT {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let failed = {
                         let tid = libc::syscall(libc::SYS_gettid) as i32;
@@ -1940,7 +1955,18 @@ mod imp {
                 // SAFETY: `info`/`uc` come from the kernel; the path is a leaked box.
                 unsafe {
                     let addr = fault_address(info, sig);
-                    on_crash(&*path, sig, (*info).si_code, addr, uc);
+                    // Apple reports a stack overflow (and other protection faults)
+                    // as SIGBUS; the Mach path this replaced called every
+                    // EXC_BAD_ACCESS SIGSEGV and consumers rely on that.
+                    #[cfg(target_vendor = "apple")]
+                    let recorded = if sig == libc::SIGBUS {
+                        libc::SIGSEGV
+                    } else {
+                        sig
+                    };
+                    #[cfg(not(target_vendor = "apple"))]
+                    let recorded = sig;
+                    on_crash(&*path, recorded, (*info).si_code, addr, uc);
                 }
                 watchdog.disarm();
                 wrote = true;
@@ -1948,7 +1974,7 @@ mod imp {
             WRITING.store(0, Ordering::Release);
 
             let h = prev.sa_sigaction;
-            if h == libc::SIG_DFL || (h == libc::SIG_IGN && (unsafe { (*info).si_code } > 0)) {
+            if h == libc::SIG_DFL || (h == libc::SIG_IGN && !is_sent(unsafe { (*info).si_code })) {
                 // Nobody else handles it: the marker stands, the process dies.
                 // SAFETY: as in `die_of`.
                 unsafe { die_of(sig, info) };
@@ -1980,7 +2006,7 @@ mod imp {
                 // SAFETY: reads the current disposition.
                 let mut cur: libc::sigaction = unsafe { core::mem::zeroed() };
                 let ok = unsafe { libc::sigaction(sig, core::ptr::null(), &mut cur) } == 0;
-                let sent = unsafe { (*info).si_code } <= 0;
+                let sent = is_sent(unsafe { (*info).si_code });
                 ok && cur.sa_sigaction == libc::SIG_DFL && !sent
             };
             if !declined && wrote {
