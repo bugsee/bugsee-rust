@@ -92,6 +92,10 @@ fn run_as_child_if_requested() {
         return;
     };
     let marker = std::env::var(PATH_ENV).expect("marker path");
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if kind == "host_handler" {
+        install_host_segv_handler();
+    }
     let _handler = bugsee_native::install(PathBuf::from(marker)).expect("install handler");
     if let Some(f) = crash_fn(&kind) {
         println!("CRASH_FN={f:#x}");
@@ -132,10 +136,37 @@ fn run_as_child_if_requested() {
             assert_ne!(p, libc::MAP_FAILED, "mmap");
             std::ptr::write_volatile(p as *mut u8, 1);
         },
+        // The marker path is a FIFO nobody reads, so the handler's `open` blocks
+        // forever: the watchdog must kill the process instead of leaving it hung.
+        "hung_handler" => fault_null(),
+        // A host crash handler installed BEFORE ours must still run afterwards.
+        "host_handler" => fault_null(),
         other => panic!("unknown crash kind {other}"),
     }
     // A handled-and-returned signal must still not let the process carry on.
     std::process::exit(0);
+}
+
+/// Stand-in for a host application's (or another reporter's) own `SIGSEGV`
+/// handler, installed before the SDK. It announces itself and exits 77.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn install_host_segv_handler() {
+    extern "C" fn host(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        const MSG: &[u8] = b"HOST_HANDLER_RAN\n";
+        // SAFETY: async-signal-safe calls only.
+        unsafe {
+            libc::write(1, MSG.as_ptr().cast(), MSG.len());
+            libc::_exit(77);
+        }
+    }
+    // SAFETY: installing a handler with a zeroed, then filled-in, sigaction.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = host as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+    }
 }
 
 struct Crashed {
@@ -144,18 +175,26 @@ struct Crashed {
     status: std::process::ExitStatus,
 }
 
-fn crash(kind: &str) -> Crashed {
+fn spawn_child(kind: &str, marker: &std::path::Path) -> std::process::Output {
+    Command::new(std::env::current_exe().unwrap())
+        .args(["crash_matrix", "--exact", "--nocapture"])
+        .env(KIND_ENV, kind)
+        .env(PATH_ENV, marker)
+        .output()
+        .expect("spawn child")
+}
+
+fn scratch_dir(kind: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bugsee-matrix-{}-{kind}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let marker = dir.join("crash.info");
+    dir
+}
 
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["crash_matrix", "--exact", "--nocapture"])
-        .env(KIND_ENV, kind)
-        .env(PATH_ENV, &marker)
-        .output()
-        .expect("spawn child");
+fn crash(kind: &str) -> Crashed {
+    let dir = scratch_dir(kind);
+    let marker = dir.join("crash.info");
+    let output = spawn_child(kind, &marker);
 
     let c = Crashed {
         marker: std::fs::read_to_string(&marker).unwrap_or_default(),
@@ -259,4 +298,56 @@ fn crash_matrix() {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = crash_fn_from(&c.stdout);
     }
+}
+
+/// A handler that can block (here: on a FIFO with no reader, standing in for a
+/// dead network mount) must not turn a crash into a hang. The watchdog kills the
+/// process with `SIGALRM` once the handler's budget is spent.
+#[test]
+fn a_hung_handler_is_killed_instead_of_hanging() {
+    let dir = scratch_dir("hung");
+    let marker = dir.join("crash.info");
+    let c_path = std::ffi::CString::new(marker.to_str().unwrap()).unwrap();
+    // SAFETY: valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    let started = std::time::Instant::now();
+    let output = spawn_child("hung_handler", &marker);
+    let took = started.elapsed();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGALRM),
+        "a wedged handler must be ended by the watchdog, got {:?}",
+        output.status
+    );
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "the watchdog took {took:?}"
+    );
+}
+
+/// The SDK must not swallow a crash another handler installed earlier wants to
+/// see: after recording its marker, the previous handler still runs.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_previously_installed_handler_still_runs_after_ours() {
+    let dir = scratch_dir("host");
+    let marker = dir.join("crash.info");
+    let output = spawn_child("host_handler", &marker);
+    let written = std::fs::read_to_string(&marker).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        written.contains("signal=11"),
+        "our marker is written first: {written:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "the host's handler must run and decide the exit; got {:?}",
+        output.status
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("HOST_HANDLER_RAN"));
 }

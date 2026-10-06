@@ -57,7 +57,11 @@ pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
 
     let handler = CrashHandler::attach(unsafe {
         crash_handler::make_crash_event(move |cc: &CrashContext| {
+            #[cfg(unix)]
+            let watchdog = Watchdog::arm();
             on_crash(&path_bytes, cc);
+            #[cfg(unix)]
+            watchdog.disarm();
             // Continue to the previous/default handler so the process terminates
             // with the original signal (and any host reporter also sees it).
             CrashEventResult::Handled(false)
@@ -66,6 +70,59 @@ pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
     .map_err(|e| std::io::Error::other(format!("crash handler attach failed: {e}")))?;
 
     Ok(NativeHandler { _handler: handler })
+}
+
+/// How long the crash handler may run before the process is killed outright.
+///
+/// The handler must never be able to turn a crash into a HANG: it takes locks
+/// (`crash-handler`'s own, the allocator inside the unwinder), writes to the
+/// filesystem (which can block forever on a dead network mount), and can itself
+/// fault with a *different* signal than the one it is handling. A crashed
+/// process that never exits holds its resources, blocks a supervisor's restart
+/// and — for a service — is strictly worse than the crash it hides.
+#[cfg(unix)]
+const HANDLER_BUDGET_SECS: u32 = 5;
+
+/// A `SIGALRM`-based deadline for the crash handler. Only async-signal-safe
+/// calls (`sigaction`, `pthread_sigmask`, `alarm`) are used.
+///
+/// The host's own `SIGALRM` disposition is saved and restored by
+/// [`Watchdog::disarm`], because the handler can return and the process can go
+/// on living (a signal that was *sent* rather than faulted, swallowed by a
+/// previous handler) — the host's timers must survive that.
+#[cfg(unix)]
+struct Watchdog {
+    previous: libc::sigaction,
+}
+
+#[cfg(unix)]
+impl Watchdog {
+    fn arm() -> Self {
+        // SAFETY: plain async-signal-safe libc calls on stack data.
+        unsafe {
+            let mut previous: libc::sigaction = core::mem::zeroed();
+            let mut dfl: libc::sigaction = core::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut dfl.sa_mask);
+            libc::sigaction(libc::SIGALRM, &dfl, &mut previous);
+            // SIGALRM may be blocked on this thread; the default action only
+            // fires if some thread can take it.
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGALRM);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
+            libc::alarm(HANDLER_BUDGET_SECS);
+            Watchdog { previous }
+        }
+    }
+
+    fn disarm(self) {
+        // SAFETY: as in `arm`.
+        unsafe {
+            libc::alarm(0);
+            libc::sigaction(libc::SIGALRM, &self.previous, core::ptr::null_mut());
+        }
+    }
 }
 
 /// The element type of the prepared path: bytes for the POSIX `open`, UTF-16
