@@ -1480,7 +1480,7 @@ fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
 
 /// How many extra raw frames to unwind so that discarding the handler's own
 /// frames still leaves a full `MAX_FRAMES` of the interrupted stack.
-#[cfg(any(windows, target_os = "linux", target_os = "android", test))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 const HANDLER_FRAME_SLACK: usize = 24;
 
 /// Cut an unwind that began inside the handler down to the interrupted code:
