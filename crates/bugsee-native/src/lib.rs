@@ -18,6 +18,23 @@
 //!
 //! See `DESIGN.md` §5, §15.
 
+//! # Coexisting with a host runtime
+//!
+//! Runtimes embedding the SDK (CLR, JVM, V8, Dart, Ruby…) fault on purpose and
+//! recover. The guarantees, per platform:
+//!
+//! * **Linux/Android** — the SDK installs *over* the existing handlers and calls
+//!   the previous one itself. The crash marker is written first and **deleted**
+//!   if that handler returns without restoring the default action (or the signal
+//!   was only sent), so a recovered fault leaves no report and the SDK stays
+//!   armed. A handler installed *after* the SDK sits in front of it and the SDK
+//!   never sees what it handles. `SIGABRT` is always treated as fatal, and a host
+//!   that leaves its handler by `siglongjmp` keeps the marker (it is discarded
+//!   if the session ends cleanly).
+//! * **Windows** — reporting happens in the unhandled-exception filter, which
+//!   runs only after every vectored/structured handler declined, so a fault a
+//!   host recovers from never reaches it, whichever was installed first.
+//!
 //! # Supported platforms
 //!
 //! Linux, Android, macOS and Windows. The handler is built on the
