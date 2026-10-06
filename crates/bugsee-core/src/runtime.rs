@@ -359,8 +359,13 @@ impl Recorder {
 
         // The parent's session is still the parent's: leave its marker alone.
         std::mem::forget(std::mem::replace(&mut self.session, session));
-        self.tx = pipeline.tx;
-        self.upload_tx = pipeline.upload_tx;
+        // The old channel senders must be LEAKED, never dropped. Dropping the last
+        // sender disconnects the channel, which wakes the (nonexistent) receiver
+        // thread through its parker — on macOS a libdispatch semaphore inherited
+        // from the parent, which libdispatch refuses to signal in a forked process
+        // (it traps, killing the child). Nothing here will ever read them again.
+        std::mem::forget(std::mem::replace(&mut self.tx, pipeline.tx));
+        std::mem::forget(std::mem::replace(&mut self.upload_tx, pipeline.upload_tx));
         self.worker = Some(pipeline.worker);
         self.uploader = Some(pipeline.uploader);
         Ok(())
