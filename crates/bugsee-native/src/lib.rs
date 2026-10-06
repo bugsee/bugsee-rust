@@ -916,9 +916,14 @@ fn snapshot_modules() -> Vec<(usize, usize, String, String)> {
                     .to_string_lossy()
                     .into_owned()
             };
-            // The main executable reports an empty name.
+            // The main executable reports an empty name; recover its real file
+            // name (as Apple and Windows do) so the module is identifiable.
+            // Allocates, which is fine: this runs at install, not in a handler.
             let name = if name.is_empty() {
-                "main".to_string()
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "main".to_string())
             } else {
                 basename(&name)
             };
