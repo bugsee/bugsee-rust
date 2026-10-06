@@ -1772,13 +1772,15 @@ mod imp {
         static CHAINING: AtomicI32 = AtomicI32::new(0);
 
         /// Whether `si_code` says the signal was *sent* (`kill`, `raise`, …) rather
-        /// than raised by a fault. Linux encodes that as `<= 0`; BSD/Apple use the
-        /// positive `SI_USER` family (`0x10001..`) and keep small positive codes for
-        /// faults.
+        /// than raised by a fault. Linux encodes that as `<= 0`. macOS reports a
+        /// signal sent with `raise`/`pthread_kill` with a LARGE positive code
+        /// (observed `0x200`; the `SI_USER` family is `0x10001..`), whereas every
+        /// fault code (`SEGV_*`, `BUS_*`, `ILL_*`, `FPE_*`, `TRAP_*`) is a small
+        /// positive number.
         fn is_sent(si_code: i32) -> bool {
             #[cfg(target_vendor = "apple")]
             {
-                si_code <= 0 || si_code >= 0x10001
+                !(1..=15).contains(&si_code)
             }
             #[cfg(not(target_vendor = "apple"))]
             {

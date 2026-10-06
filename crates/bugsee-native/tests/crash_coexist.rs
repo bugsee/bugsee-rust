@@ -42,8 +42,8 @@ extern "C" fn recovering_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mu
 extern "C" fn swallowing_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
     // SAFETY: async-signal-safe calls only.
     unsafe {
-        // A fault has a small positive code; a *sent* signal is <= 0 on Linux and
-        // 0x10001+ (SI_USER…) on macOS.
+        // A fault has a small positive code (1..=15); a *sent* signal is <= 0 on
+        // Linux and a large positive code on macOS (observed 0x200).
         let code = (*info).si_code;
         // Visible in the test output: what the OS reports as `si_code` here is
         // exactly what the SDK's sent-vs-fault decision hinges on.
@@ -53,7 +53,7 @@ extern "C" fn swallowing_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mu
             buf[14 + i] = b"0123456789abcdef"[nib as usize];
         }
         libc::write(1, buf.as_ptr().cast(), buf.len());
-        if code > 0 && code < 0x10001 {
+        if (1..=15).contains(&code) {
             let mut dfl: libc::sigaction = std::mem::zeroed();
             dfl.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(libc::SIGSEGV, &dfl, std::ptr::null_mut());
