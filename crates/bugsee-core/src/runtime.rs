@@ -28,13 +28,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
+use crate::fork::{ForkLock, ForkLockable};
 use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
 use crate::model::environment::Environment;
@@ -99,12 +100,6 @@ pub type OnReportDropped = Box<dyn Fn(DropReason) + Send + Sync>;
 /// A callback run on every breadcrumb before it is captured. Return the
 /// (possibly-mutated) breadcrumb to keep it, or `None` to drop it.
 pub type BeforeBreadcrumb = Box<dyn Fn(Breadcrumb) -> Option<Breadcrumb> + Send + Sync>;
-
-/// Lock a mutex, recovering the guard if it was poisoned by a panic. Library
-/// code must never propagate a poisoned-lock panic onto a host thread.
-fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Produces system/process telemetry samples appended as `traces.system` on
 /// each rotation tick. Implemented by the host layer (e.g. via `sysinfo`).
@@ -185,11 +180,11 @@ impl Drop for SnapshotHandle {
 
 /// State shared between the facade, the capture worker, and the uploader.
 struct Shared {
-    scope: Mutex<Scope>,
+    scope: ForkLock<Scope>,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
-    session: Mutex<Option<String>>,
+    session: ForkLock<Option<String>>,
     transport: Arc<dyn Transport>,
     before_send: Option<BeforeSend>,
     on_report_dropped: Option<OnReportDropped>,
@@ -204,6 +199,20 @@ struct Shared {
     max_report_queued: usize,
     /// Whether telemetry sampling is paused (mirrors the facade's pause state).
     paused: AtomicBool,
+}
+
+/// The recorder's own locks join the `fork()` lock protocol, so a forked child
+/// never inherits the scope or the cached access token locked by a thread (the
+/// capture worker merges the scope into every report) that did not survive.
+impl ForkLockable for Shared {
+    fn fork_lock(&self) {
+        self.scope.fork_lock();
+        self.session.fork_lock();
+    }
+    fn fork_unlock(&self) {
+        self.session.fork_unlock();
+        self.scope.fork_unlock();
+    }
 }
 
 enum Msg {
@@ -270,11 +279,11 @@ impl Recorder {
         );
         let environment_json = serde_json::to_vec(&env).unwrap_or_default();
         let shared = Arc::new(Shared {
-            scope: Mutex::new(Scope::default()),
+            scope: ForkLock::new(Scope::default()),
             env,
             environment_json,
             app_token: config.app_token.clone(),
-            session: Mutex::new(None),
+            session: ForkLock::new(None),
             transport,
             before_send: config.before_send,
             on_report_dropped: config.on_report_dropped,
@@ -286,6 +295,9 @@ impl Recorder {
             max_report_queued: DEFAULT_MAX_REPORT_QUEUED,
             paused: AtomicBool::new(false),
         });
+
+        crate::fork::install_fork_hook();
+        crate::fork::register_weak(&shared);
 
         let session = Session::begin(&config.data_dir)?;
         let data_dir = config.data_dir.clone();
@@ -325,9 +337,11 @@ impl Recorder {
     ///
     /// The child gets its **own session generation and liveness marker**, so a
     /// crash in the child is recovered as the child's, and it never touches the
-    /// parent's capture parts. It does not run recovery of prior sessions (the
-    /// parent already did, and doing it twice would double-deliver), and does not
-    /// force-drain the shared queue (the parent's uploader is already on it).
+    /// parent's capture parts. It does recover sessions that died after the parent
+    /// launched (a sibling worker that crashed), guarded by claims so siblings do
+    /// not both do it; it does not force-drain the shared queue (the parent's
+    /// uploader is already on it) or reap queue sidecars (the parent may be
+    /// mid-enqueue).
     ///
     /// `sampler` replaces the telemetry sampler, which died with the worker.
     pub fn revive_after_fork(
@@ -406,7 +420,7 @@ impl Recorder {
 
     /// Mutate the ambient scope (email / labels / attributes).
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = lock_recover(&self.shared.scope);
+        let mut guard = self.shared.scope.lock();
         f(&mut guard)
     }
 
@@ -540,7 +554,7 @@ impl RecorderHandle {
 
     /// Mutate the ambient scope.
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = lock_recover(&self.shared.scope);
+        let mut guard = self.shared.scope.lock();
         f(&mut guard)
     }
 
@@ -691,17 +705,24 @@ fn spawn_pipeline(
     let worker = std::thread::Builder::new()
         .name("bugsee-capture".into())
         .spawn(move || {
-            if fresh_launch {
-                // Queue any crashed prior session before capturing this one.
-                // Contained: a panic here (e.g. a host before_send on a recovered
-                // crash) must not abort the thread before worker_loop starts.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Reap orphaned queue sidecars from a prior killed enqueue/
-                    // remove first (runs before this session enqueues anything).
+            // Queue any crashed prior session before capturing this one.
+            // Contained: a panic here (e.g. a host before_send on a recovered
+            // crash) must not abort the thread before worker_loop starts.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Reap orphaned queue sidecars from a prior killed enqueue/remove
+                // first (runs before this session enqueues anything). Only a fresh
+                // launch: a fork child's parent may be mid-enqueue right now, and
+                // its in-flight sidecars would look orphaned.
+                if fresh_launch {
                     queue::gc_orphans(&worker_data_dir);
-                    run_recovery(&worker_shared, &worker_data_dir, generation);
-                }));
-            }
+                }
+                // A fork child recovers too. A prefork master recovers only at ITS
+                // launch, and its own generation is the lowest, so it can never
+                // recover a worker that died later; the next worker started from
+                // it must, or that crash waits for the master to restart. Claims
+                // keep siblings from recovering the same session twice.
+                run_recovery(&worker_shared, &worker_data_dir, generation);
+            }));
             let _ = worker_upload_tx.send(UploadMsg::Wake);
             worker_loop(
                 rx,
@@ -725,6 +746,11 @@ fn spawn_pipeline(
 
 fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
     for pending in recovery::find_pending(data_dir, current_generation) {
+        // Several processes share this directory (a prefork master and its
+        // workers, above all): exactly one recovers a given session.
+        let Some(_claim) = recovery::claim_pending(data_dir, &pending) else {
+            continue;
+        };
         // Count the attempt *before* processing: a corrupt session that panics
         // the build/assemble path is a poison pill that would otherwise re-run —
         // and abort the whole loop — on every launch. After the cap, abandon it.
@@ -784,7 +810,7 @@ fn recover_one(shared: &Shared, data_dir: &Path, pending: &recovery::PendingSess
 
 /// Merge ambient scope (email / labels / attributes) into a report's metadata.
 fn merge_scope(shared: &Shared, meta: &mut ReportMeta) {
-    let scope = lock_recover(&shared.scope);
+    let scope = shared.scope.lock();
     if meta.email.is_none() {
         meta.email = scope.email.clone();
     }
@@ -1087,6 +1113,10 @@ fn drain(shared: &Shared, data_dir: &Path, backoff_base: Duration, force: bool) 
     let now = epoch_ms();
     let mut attempted = false;
     for report in queue::list_pending(data_dir) {
+        // Another process sharing the queue may be delivering this one.
+        let Some(_claim) = queue::try_claim(&report) else {
+            continue;
+        };
         let Ok((zip, request_json, retry, next_attempt)) = queue::load(&report) else {
             continue;
         };
@@ -1238,6 +1268,9 @@ fn drain_until_empty(
     loop {
         let now = epoch_ms();
         for report in queue::list_pending(data_dir) {
+            let Some(_claim) = queue::try_claim(&report) else {
+                continue; // a peer is delivering it; the loop below waits it out
+            };
             let Ok((zip, request_json, retry, _next)) = queue::load(&report) else {
                 continue;
             };

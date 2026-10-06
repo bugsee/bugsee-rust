@@ -9,22 +9,36 @@
 //! PHP-FPM, Puma/Unicorn and the worker pools of many runtimes `fork()` after the
 //! SDK has started. The child inherits a copy of the process with **only the
 //! forking thread alive**: the SDK's capture and uploader threads are gone, and
-//! any lock another thread held at that instant stays locked forever. Two
-//! primitives make that survivable:
+//! any lock another thread held at that instant stays locked forever.
 //!
-//! * [`fork_epoch`] — a counter bumped in the child (by a `pthread_atfork` hook),
-//!   so any entry point can cheaply notice "I am a fork child" and rebuild.
-//! * [`ForkMutex`] — a mutex whose child-side reset abandons the old lock instead
-//!   of waiting on a thread that no longer exists.
+//! The standard cure for the locks is the `pthread_atfork` lock protocol, and
+//! this module is that protocol: every SDK lock that can be held across the
+//! fork registers here; just *before* `fork` the forking thread takes them all
+//! (so no other thread can be holding one), and right *after* it releases them —
+//! in the parent and in the child. The child therefore inherits every lock
+//! free, with consistent data, instead of one a vanished thread owned.
 //!
-//! The hook itself does nothing but an atomic increment — the only thing that is
-//! safe to do unconditionally between `fork` and `exec` in a multithreaded
-//! process. All real work happens lazily, on the child's next SDK call.
+//! What it deliberately does NOT do in the child's `atfork` hook is rebuild
+//! anything: between `fork` and `exec` a multithreaded process's child may only
+//! do async-signal-safe things. The hook releases locks and bumps [`fork_epoch`];
+//! the SDK notices the new epoch on its next call and rebuilds then.
 //!
-//! Windows has no `fork`, so there everything here is inert.
+//! The protocol needs locks that can be released *without* a guard value (they
+//! are taken in one callback and released in another), so this module uses its
+//! own small spin lock rather than `std::sync::Mutex`. The critical sections
+//! guarded are a few instructions long (enqueue, clone a handle), which is the
+//! regime where a spin-then-yield lock is the right tool.
+//!
+//! Lock-order rule: SDK code must never hold two registered locks at once except
+//! in the registration order (statics first, then per-recorder locks), or the
+//! prepare step could deadlock against it.
+//!
+//! Windows has no `fork`, so there the protocol is inert (the locks still work).
 
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Once, Weak};
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -35,106 +49,306 @@ pub fn fork_epoch() -> u64 {
     EPOCH.load(Ordering::SeqCst)
 }
 
-/// Install the child-side `pthread_atfork` hook. Idempotent; a no-op off unix.
-pub fn install_fork_hook() {
-    #[cfg(unix)]
-    {
-        use std::sync::Once;
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            extern "C" fn child() {
-                // An atomic add is async-signal-safe, which is all a fork child of
-                // a multithreaded process may rely on.
-                EPOCH.fetch_add(1, Ordering::SeqCst);
+// ---------------------------------------------------------------------------
+// The lock
+// ---------------------------------------------------------------------------
+
+/// A guard-less spin-then-yield lock: `lock` and `unlock` may happen in
+/// different callbacks, which an RAII guard cannot express.
+struct RawLock(AtomicBool);
+
+impl RawLock {
+    const fn new() -> Self {
+        RawLock(AtomicBool::new(false))
+    }
+
+    fn lock(&self) {
+        let mut spins = 0u32;
+        while self
+            .0
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
             }
-            // SAFETY: registering a plain `extern "C"` function that only touches
-            // an atomic. A failure (ENOMEM) just leaves fork detection off.
-            unsafe {
-                libc::pthread_atfork(None, None, Some(child));
-            }
-        });
+        }
+    }
+
+    fn try_lock(&self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn unlock(&self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
-/// A `Mutex` for process-global state that can be reset in a fork child.
-///
-/// A plain `static Mutex` is a trap across `fork`: if some other thread held it
-/// at the instant of the fork, the child inherits it locked with no thread left
-/// to release it, and the child's first SDK call deadlocks. [`reset_after_fork`]
-/// side-steps that by moving to a fresh mutex and *leaking* the old one rather
-/// than ever blocking on it.
-///
-/// [`reset_after_fork`]: ForkMutex::reset_after_fork
-pub struct ForkMutex<T: 'static> {
-    slot: AtomicPtr<Mutex<T>>,
-    init: fn() -> T,
+/// Something with locks that must be quiesced across a `fork()`.
+pub trait ForkLockable: Send + Sync {
+    /// Take every lock (called in the forking thread, before `fork`).
+    fn fork_lock(&self);
+    /// Release every lock taken by [`fork_lock`](Self::fork_lock) (called in the
+    /// same thread, after `fork`, in both parent and child).
+    fn fork_unlock(&self);
 }
 
-impl<T: Send + 'static> ForkMutex<T> {
-    /// A mutex whose initial (and post-reset) value is `init()`.
-    pub const fn new(init: fn() -> T) -> Self {
-        ForkMutex {
-            slot: AtomicPtr::new(std::ptr::null_mut()),
-            init,
+/// A mutual-exclusion lock that takes part in the fork protocol. Use it
+/// for any state a forked child will touch. Registration is the owner's job
+/// (see [`ForkMutex`] for statics, [`register_weak`] for per-instance locks).
+pub struct ForkLock<T> {
+    raw: RawLock,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: access to `data` is serialised by `raw`.
+unsafe impl<T: Send> Send for ForkLock<T> {}
+unsafe impl<T: Send> Sync for ForkLock<T> {}
+
+impl<T> ForkLock<T> {
+    /// A lock around `value`.
+    pub const fn new(value: T) -> Self {
+        ForkLock {
+            raw: RawLock::new(),
+            data: UnsafeCell::new(value),
         }
     }
 
-    fn mutex(&self) -> &'static Mutex<T> {
-        let current = self.slot.load(Ordering::Acquire);
-        if !current.is_null() {
-            // SAFETY: only ever set to a leaked `Box<Mutex<T>>`, never freed.
-            return unsafe { &*current };
-        }
-        let fresh = Box::into_raw(Box::new(Mutex::new((self.init)())));
-        match self.slot.compare_exchange(
-            std::ptr::null_mut(),
-            fresh,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            // SAFETY: as above.
-            Ok(_) => unsafe { &*fresh },
-            Err(existing) => {
-                // Lost the race: free ours (never shared) and use the winner's.
-                // SAFETY: `fresh` came from `Box::into_raw` just above, unshared.
-                drop(unsafe { Box::from_raw(fresh) });
-                // SAFETY: `existing` is a leaked box, never freed.
-                unsafe { &*existing }
-            }
-        }
-    }
-
-    /// Lock, recovering the guard if a panic poisoned it.
-    pub fn lock(&self) -> MutexGuard<'static, T> {
-        self.mutex().lock().unwrap_or_else(PoisonError::into_inner)
+    /// Lock, blocking (spin, then yield) until available.
+    pub fn lock(&self) -> ForkGuard<'_, T> {
+        self.raw.lock();
+        ForkGuard { lock: self }
     }
 
     /// Lock without blocking; `None` if it is held.
-    pub fn try_lock(&self) -> Option<MutexGuard<'static, T>> {
-        match self.mutex().try_lock() {
-            Ok(g) => Some(g),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
+    pub fn try_lock(&self) -> Option<ForkGuard<'_, T>> {
+        self.raw.try_lock().then_some(ForkGuard { lock: self })
+    }
+
+    /// Take the lock for the fork protocol (no guard; paired with
+    /// [`ForkLock::fork_unlock`]).
+    pub fn fork_lock(&self) {
+        self.raw.lock();
+    }
+
+    /// Release a lock taken by [`ForkLock::fork_lock`].
+    pub fn fork_unlock(&self) {
+        self.raw.unlock();
+    }
+}
+
+/// RAII guard for a [`ForkLock`].
+pub struct ForkGuard<'a, T> {
+    lock: &'a ForkLock<T>,
+}
+
+impl<T> Deref for ForkGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the lock is held for the guard's lifetime.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for ForkGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: the lock is held for the guard's lifetime, exclusively.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for ForkGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.raw.unlock();
+    }
+}
+
+impl<T: Send> ForkLockable for ForkLock<T> {
+    fn fork_lock(&self) {
+        self.raw.lock();
+    }
+    fn fork_unlock(&self) {
+        self.raw.unlock();
+    }
+}
+
+/// A `static`-friendly [`ForkLock`] that registers itself for the fork protocol
+/// on first use. `lock` takes `&'static self`, which a plain `static` provides.
+pub struct ForkMutex<T: 'static> {
+    inner: ForkLock<Option<T>>,
+    init: fn() -> T,
+    registered: Once,
+}
+
+impl<T: Send + 'static> ForkMutex<T> {
+    /// A mutex whose initial value is `init()`, computed on first lock.
+    pub const fn new(init: fn() -> T) -> Self {
+        ForkMutex {
+            inner: ForkLock::new(None),
+            init,
+            registered: Once::new(),
         }
     }
 
-    /// Call in a fork **child** (single-threaded at that instant). Replaces the
-    /// lock with a fresh one and returns the value the old one held — or `None`
-    /// if it was locked by a thread that no longer exists, in which case that
-    /// value is unrecoverable and the old mutex is simply abandoned.
-    pub fn reset_after_fork(&self) -> Option<T> {
-        let old = self.mutex();
-        let value = match old.try_lock() {
-            Ok(mut g) => Some(std::mem::replace(&mut *g, (self.init)())),
-            Err(TryLockError::Poisoned(p)) => {
-                Some(std::mem::replace(&mut *p.into_inner(), (self.init)()))
+    /// Lock, registering with the fork protocol and initialising on first use.
+    pub fn lock(&'static self) -> ForkMutexGuard<T> {
+        self.registered.call_once(|| register_static(&self.inner));
+        let mut guard = self.inner.lock();
+        if guard.is_none() {
+            *guard = Some((self.init)());
+        }
+        ForkMutexGuard { guard }
+    }
+
+    /// Lock without blocking; `None` if it is held.
+    pub fn try_lock(&'static self) -> Option<ForkMutexGuard<T>> {
+        self.registered.call_once(|| register_static(&self.inner));
+        let mut guard = self.inner.try_lock()?;
+        if guard.is_none() {
+            *guard = Some((self.init)());
+        }
+        Some(ForkMutexGuard { guard })
+    }
+}
+
+/// Guard for a [`ForkMutex`]; derefs to the protected value.
+pub struct ForkMutexGuard<T: 'static> {
+    guard: ForkGuard<'static, Option<T>>,
+}
+
+impl<T> Deref for ForkMutexGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.guard.as_ref().expect("initialised on lock")
+    }
+}
+
+impl<T> DerefMut for ForkMutexGuard<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.guard.as_mut().expect("initialised on lock")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The registry and the atfork callbacks
+// ---------------------------------------------------------------------------
+
+// On Windows there is no `fork`, so nothing reads the registry; it is kept so the
+// lock types behave identically on every platform.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Entry {
+    Static(&'static dyn ForkLockable),
+    Weak(Weak<dyn ForkLockable>),
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Held {
+    Static(&'static dyn ForkLockable),
+    Strong(Arc<dyn ForkLockable>),
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Registry {
+    lock: RawLock,
+    entries: UnsafeCell<Vec<Entry>>,
+    /// What `prepare` locked, so `parent`/`child` unlock exactly that set.
+    held: UnsafeCell<Vec<Held>>,
+}
+
+// SAFETY: `entries` and `held` are only touched with `lock` held. `prepare`
+// takes it and `parent`/`child` release it, on the same (forking) thread.
+unsafe impl Sync for Registry {}
+
+static REGISTRY: Registry = Registry {
+    lock: RawLock::new(),
+    entries: UnsafeCell::new(Vec::new()),
+    held: UnsafeCell::new(Vec::new()),
+};
+
+fn register(entry: Entry) {
+    REGISTRY.lock.lock();
+    // SAFETY: registry lock held.
+    let entries = unsafe { &mut *REGISTRY.entries.get() };
+    // Drop registrations whose owner is gone, so a long-lived process that
+    // relaunches repeatedly does not grow the list without bound.
+    entries.retain(|e| match e {
+        Entry::Static(_) => true,
+        Entry::Weak(w) => w.strong_count() > 0,
+    });
+    entries.push(entry);
+    REGISTRY.lock.unlock();
+}
+
+fn register_static<T: Send + 'static>(lock: &'static ForkLock<T>) {
+    register(Entry::Static(lock));
+}
+
+/// Register a per-instance lock holder (held weakly: when it is dropped the
+/// registration lapses on its own). Call once per instance.
+pub fn register_weak(target: &Arc<impl ForkLockable + 'static>) {
+    let arc: Arc<dyn ForkLockable> = target.clone();
+    register(Entry::Weak(Arc::downgrade(&arc)));
+}
+
+/// Install the `pthread_atfork` hooks. Idempotent; a no-op off unix.
+pub fn install_fork_hook() {
+    #[cfg(unix)]
+    {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            extern "C" fn prepare() {
+                REGISTRY.lock.lock();
+                // SAFETY: registry lock held until `parent`/`child`.
+                let (entries, held) =
+                    unsafe { (&mut *REGISTRY.entries.get(), &mut *REGISTRY.held.get()) };
+                held.clear();
+                for entry in entries.iter() {
+                    match entry {
+                        Entry::Static(s) => {
+                            s.fork_lock();
+                            held.push(Held::Static(*s));
+                        }
+                        Entry::Weak(w) => {
+                            if let Some(strong) = w.upgrade() {
+                                strong.fork_lock();
+                                held.push(Held::Strong(strong));
+                            }
+                        }
+                    }
+                }
             }
-            Err(TryLockError::WouldBlock) => None,
-        };
-        let fresh = Box::into_raw(Box::new(Mutex::new((self.init)())));
-        // The old mutex is leaked on purpose: a dead thread may still "hold" it.
-        self.slot.store(fresh, Ordering::Release);
-        value
+            fn release() {
+                // SAFETY: registry lock still held from `prepare`.
+                let held = unsafe { &mut *REGISTRY.held.get() };
+                // Reverse order of acquisition.
+                while let Some(h) = held.pop() {
+                    match h {
+                        Held::Static(s) => s.fork_unlock(),
+                        Held::Strong(a) => a.fork_unlock(),
+                    }
+                }
+                REGISTRY.lock.unlock();
+            }
+            extern "C" fn parent() {
+                release();
+            }
+            extern "C" fn child() {
+                // Only atomics and lock releases — all that a multithreaded
+                // process's fork child may safely do.
+                EPOCH.fetch_add(1, Ordering::SeqCst);
+                release();
+            }
+            // SAFETY: registers plain `extern "C"` functions. A failure (ENOMEM)
+            // just leaves fork handling off.
+            unsafe {
+                libc::pthread_atfork(Some(prepare), Some(parent), Some(child));
+            }
+        });
     }
 }
 
@@ -143,44 +357,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_round_trips_and_starts_from_init() {
+    fn lock_excludes_and_releases() {
+        static L: ForkLock<u32> = ForkLock::new(0);
+        {
+            let mut g = L.lock();
+            *g += 1;
+            assert!(L.try_lock().is_none(), "held");
+        }
+        assert_eq!(*L.lock(), 1);
+    }
+
+    #[test]
+    fn mutex_initialises_lazily_and_registers_once() {
         static M: ForkMutex<Vec<u8>> = ForkMutex::new(|| vec![1, 2]);
         assert_eq!(*M.lock(), vec![1, 2]);
         M.lock().push(3);
         assert_eq!(*M.lock(), vec![1, 2, 3]);
+        assert!(M.try_lock().is_some());
     }
 
     #[test]
-    fn reset_returns_the_old_value_and_installs_a_fresh_one() {
-        static M: ForkMutex<Option<u32>> = ForkMutex::new(|| None);
-        *M.lock() = Some(7);
-        assert_eq!(M.reset_after_fork(), Some(Some(7)));
-        assert_eq!(*M.lock(), None, "the new mutex starts from init");
-    }
-
-    #[test]
-    fn reset_abandons_a_lock_held_by_a_thread_that_will_never_release_it() {
-        static M: ForkMutex<u32> = ForkMutex::new(|| 0);
-        // Hold the lock on another thread that never lets go — the situation a
-        // fork child is in with respect to a thread that did not survive.
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (_hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            let _g = M.lock();
-            locked_tx.send(()).unwrap();
-            let _ = hold_rx.recv(); // parks until process exit
-        });
-        locked_rx.recv().unwrap();
-        assert!(M.try_lock().is_none(), "held elsewhere");
-
-        assert_eq!(
-            M.reset_after_fork(),
-            None,
-            "the held value is unrecoverable"
-        );
-        // The point: the child can lock again instead of deadlocking.
-        *M.lock() = 5;
-        assert_eq!(*M.lock(), 5);
+    fn contended_increments_are_not_lost() {
+        static L: ForkLock<u64> = ForkLock::new(0);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..2000 {
+                        *L.lock() += 1;
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(*L.lock(), 8000);
     }
 
     #[test]
@@ -189,5 +400,54 @@ mod tests {
         install_fork_hook(); // idempotent
         let before = fork_epoch();
         assert_eq!(fork_epoch(), before);
+    }
+
+    /// The point of the protocol: fork while another thread holds the lock and
+    /// the child must still be able to take it.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_forked_while_another_thread_holds_the_lock_can_still_take_it() {
+        static M: ForkMutex<u64> = ForkMutex::new(|| 0);
+        install_fork_hook();
+        // Prime registration, then hammer the lock from another thread so some
+        // forks land while it is held.
+        drop(M.lock());
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    *M.lock() += 1;
+                }
+            })
+        };
+        for _ in 0..40 {
+            // SAFETY: the child only locks, then `_exit`s.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let ok = M.try_lock().is_some();
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            }
+            let start = std::time::Instant::now();
+            let mut status = 0;
+            loop {
+                let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if r == pid {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(20),
+                    "child hung"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the child inherited the lock held by a thread that did not survive"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().unwrap();
     }
 }

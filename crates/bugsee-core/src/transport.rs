@@ -63,7 +63,7 @@ pub fn deliver(
     transport: &dyn Transport,
     app_token: &str,
     environment_json: &[u8],
-    session: &Mutex<Option<String>>,
+    session: &crate::fork::ForkLock<Option<String>>,
     report: &AssembledReport,
     cached_endpoint: Option<&str>,
     endpoint_out: &mut Option<String>,
@@ -88,12 +88,12 @@ pub fn deliver(
         // briefly re-lock to store — so a future second locker of `session` can't
         // stall behind a token refresh.
         let token = {
-            let existing = session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let existing = session.lock().clone();
             match existing {
                 Some(t) => Some(t),
                 None => {
                     let fresh = transport.register_session(app_token, environment_json)?;
-                    let mut guard = session.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = session.lock();
                     // Another path may have registered while we were unlocked;
                     // keep the existing token if so, else store ours.
                     Some(guard.get_or_insert(fresh).clone())
@@ -115,7 +115,7 @@ pub fn deliver(
                 };
             }
             Err(TransportError::SessionExpired) if attempt == 0 => {
-                *session.lock().unwrap_or_else(|e| e.into_inner()) = None; // re-register, retry
+                *session.lock() = None; // re-register, retry
                 continue;
             }
             Err(e) => return Err(e),

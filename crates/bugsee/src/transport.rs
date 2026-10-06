@@ -19,26 +19,33 @@ pub const DEFAULT_BASE_URL: &str = "https://api.bugsee.com/v2";
 /// A ureq-backed [`Transport`].
 pub struct HttpTransport {
     base_url: String,
-    agent: ureq::Agent,
 }
 
 impl HttpTransport {
     /// Build a transport against `endpoint` or the default base URL.
     pub fn new(endpoint: Option<String>) -> Self {
-        // Use one Agent with explicit timeouts so a stalled connection can never
-        // wedge the single uploader thread forever (the bare `ureq::get/post/put`
-        // helpers use a default agent with NO timeouts). The read/write timeouts
-        // are per-socket-operation, so they trip on a stalled peer without
-        // penalizing a slow-but-progressing large-bundle PUT.
-        let agent = ureq::AgentBuilder::new()
+        HttpTransport {
+            base_url: endpoint.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+        }
+    }
+
+    /// A fresh agent with explicit timeouts, so a stalled connection can never
+    /// wedge the single uploader thread forever (the bare `ureq::get/post/put`
+    /// helpers use a default agent with NO timeouts). The read/write timeouts are
+    /// per-socket-operation, so they trip on a stalled peer without penalising a
+    /// slow-but-progressing large-bundle PUT.
+    ///
+    /// Built per request rather than kept for reuse: a long-lived agent owns a
+    /// keep-alive connection pool, and a `fork()` child would inherit those very
+    /// sockets (and the pool's lock, if an upload was in flight) and interleave
+    /// TLS records with its parent on one connection. Reports are rare, so the
+    /// price of a new connection each time is far smaller than that hazard.
+    fn agent(&self) -> ureq::Agent {
+        ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(30))
             .timeout_write(Duration::from_secs(30))
-            .build();
-        HttpTransport {
-            base_url: endpoint.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            agent,
-        }
+            .build()
     }
 }
 
@@ -120,7 +127,7 @@ impl Transport for HttpTransport {
         let env: Value = serde_json::from_slice(environment_json).unwrap_or(Value::Null);
         let body = serde_json::json!({ "app_token": app_token, "environment": env });
         let resp = self
-            .agent
+            .agent()
             .post(&format!("{}/sessions", self.base_url))
             .set("Content-Type", "application/json")
             .set("x-client-type", "rust")
@@ -154,7 +161,7 @@ impl Transport for HttpTransport {
         }
         let url = format!("{}/issues?app_token={}", self.base_url, app_token);
         let resp = self
-            .agent
+            .agent()
             .post(&url)
             .set("Content-Type", "application/json")
             .set("x-client-type", "rust")
@@ -176,7 +183,7 @@ impl Transport for HttpTransport {
     }
 
     fn upload_bundle(&self, endpoint: &str, zip: &[u8]) -> Result<(), TransportError> {
-        self.agent
+        self.agent()
             .put(endpoint)
             .set("Content-Length", &zip.len().to_string())
             .send_bytes(zip)

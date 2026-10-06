@@ -18,6 +18,7 @@
 
 pub mod bundle;
 pub mod capture;
+pub mod claim;
 pub mod errors;
 pub mod fork;
 pub mod model;

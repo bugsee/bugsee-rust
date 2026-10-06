@@ -407,35 +407,47 @@ fn check_fork() {
     if epoch == SEEN_FORK_EPOCH.load(Ordering::Relaxed) {
         return;
     }
-    // One thread does the rebuild; any other racing thread carries on (its
-    // captures may be dropped for the few microseconds until the new pipeline is
-    // installed, which beats blocking it behind a lock a dead thread might hold).
-    if SEEN_FORK_EPOCH.swap(epoch, Ordering::SeqCst) != epoch {
-        revive_after_fork();
-    }
+    revive_after_fork(epoch);
 }
+
+/// Failed revival attempts allowed before the child gives up and runs without the
+/// SDK, rather than retrying (and paying for) every call forever.
+const MAX_REVIVE_ATTEMPTS: u32 = 3;
 
 /// Runs in a fork child, on its first SDK call. See
 /// [`bugsee_core::Recorder::revive_after_fork`] for what the child gets.
-fn revive_after_fork() {
-    // Every lock below may have been held by a thread that did not survive the
-    // fork; `ForkMutex::reset_after_fork` abandons them rather than waiting.
-    let old_recorder = RECORDER.reset_after_fork().flatten();
-    #[cfg(feature = "native")]
-    let old_native = NATIVE.reset_after_fork().flatten();
-    let info = REVIVE_INFO.reset_after_fork().flatten();
-    #[cfg(feature = "panic")]
-    bugsee_panic::reset_after_fork();
+///
+/// Every global lock is free here: the fork lock protocol took them all in the
+/// forking thread before the fork and released them in the child, so none is
+/// held by a thread that no longer exists.
+fn revive_after_fork(epoch: u64) {
+    // Serialise revival: a second thread calling in meanwhile waits for it rather
+    // than carrying on against a half-built SDK. The value counts failed attempts.
+    static REVIVING: ForkMutex<u32> = ForkMutex::new(|| 0);
+    let mut failures = REVIVING.lock();
+    if SEEN_FORK_EPOCH.load(Ordering::SeqCst) == epoch {
+        return; // another thread finished it while we waited
+    }
 
-    // No recorder (never launched, or its lock was held by a vanished thread):
-    // nothing to revive. Put back what we took and leave the child un-launched.
-    let (Some(mut recorder), Some(info)) = (old_recorder, info) else {
-        *REVIVE_INFO.lock() = info;
-        #[cfg(feature = "native")]
-        {
-            *NATIVE.lock() = old_native;
+    let recorder = RECORDER.lock().take();
+    #[cfg(feature = "native")]
+    let old_native = NATIVE.lock().take();
+    let info = *REVIVE_INFO.lock();
+
+    // Never launched (or stopped): nothing to revive. Mark the fork handled.
+    let (mut recorder, info) = match (recorder, info) {
+        (Some(recorder), Some(info)) => (recorder, info),
+        (recorder, _) => {
+            // A recorder without its info cannot be revived, and dropping it would
+            // try to join threads that do not exist: leak it.
+            std::mem::forget(recorder);
+            #[cfg(feature = "native")]
+            {
+                *NATIVE.lock() = old_native;
+            }
+            SEEN_FORK_EPOCH.store(epoch, Ordering::SeqCst);
+            return;
         }
-        return;
     };
 
     // Not on Apple platforms: `sysinfo` reaches into CoreFoundation/IOKit, which
@@ -456,22 +468,26 @@ fn revive_after_fork() {
     };
 
     if recorder.revive_after_fork(sampler).is_err() {
-        // Could not start a pipeline in the child. Dropping the recorder would try
-        // to join threads that do not exist; leave the child with no SDK instead.
-        std::mem::forget(recorder);
+        // Nothing was swapped in, so the recorder is intact and a later call can
+        // try again; after a few failures stop trying for this child.
+        *failures += 1;
+        if *failures >= MAX_REVIVE_ATTEMPTS {
+            SEEN_FORK_EPOCH.store(epoch, Ordering::SeqCst);
+            *failures = 0;
+        }
         #[cfg(feature = "native")]
         {
             *NATIVE.lock() = old_native;
         }
+        *RECORDER.lock() = Some(recorder);
         return;
     }
 
-    // The crash handler and panic observer are process-global and were inherited
-    // pointing at the PARENT's session. Native capture is reinstalled from scratch
-    // for the child rather than retargeted: on macOS the inherited handler is wired
-    // to threads and ports that exist only in the parent, so it cannot be reused.
-    // Dropping the inherited guard detaches it (best-effort: its parent-side
-    // resources are unreachable from here, which `detach` tolerates).
+    // The crash handler is process-global and was inherited wired to the PARENT's
+    // session (and, on macOS, to threads and ports that exist only there).
+    // Native capture is reinstalled from scratch for the child. Dropping the
+    // inherited guard detaches it (best-effort: its parent-side resources are
+    // unreachable from here, which `detach` tolerates).
     #[cfg(feature = "native")]
     if old_native.is_some() {
         drop(old_native);
@@ -482,8 +498,9 @@ fn revive_after_fork() {
     #[cfg(feature = "panic")]
     bugsee_panic::set_snapshot_path(recorder.panic_info_path());
 
-    *REVIVE_INFO.lock() = Some(info);
     *RECORDER.lock() = Some(recorder);
+    *failures = 0;
+    SEEN_FORK_EPOCH.store(epoch, Ordering::SeqCst);
 }
 
 /// Submit a populated deferred report (called by `Report::upload`).

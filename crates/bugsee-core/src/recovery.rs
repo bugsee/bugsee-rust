@@ -153,7 +153,7 @@ fn marker_is_fresh(marker: &Path) -> bool {
 /// means gone. A rare pid-reuse false-positive can defer recovering a real crash
 /// to a later launch — acceptable vs. corrupting a running peer's live session.
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -166,7 +166,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// No portable liveness probe off-unix: treat as dead so recovery still proceeds
 /// (single-process is the common case; a live shared-dir peer is a unix concern).
 #[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     false
 }
 
@@ -344,6 +344,17 @@ pub fn bump_attempts(data_dir: &Path, pending: &PendingSession) -> u32 {
         .saturating_add(1);
     let _ = std::fs::write(&path, next.to_string());
     next
+}
+
+/// Claim a pending session for recovery, so that of several processes sharing the
+/// data directory exactly one recovers it. The claim lives beside the liveness
+/// marker and is released when the returned guard drops.
+pub fn claim_pending(data_dir: &Path, pending: &PendingSession) -> Option<crate::claim::Claim> {
+    crate::claim::try_claim(
+        &data_dir
+            .join("sessions")
+            .join(format!("{}.claim", pending.generation)),
+    )
 }
 
 /// Reap leftover on-disk state from generations that no longer have a liveness

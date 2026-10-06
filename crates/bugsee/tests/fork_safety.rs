@@ -189,14 +189,19 @@ fn a_forked_child_keeps_reporting_and_the_parent_is_unaffected() {
     assert!(Bugsee::flush(Duration::from_secs(10)));
 
     let reports = delivered(&out);
-    assert!(
-        mentions(&reports, "report-from-child") >= 1,
-        "the child's report was never delivered: {}",
+    // Exactly once: parent and child both drain the shared queue, and a claim per
+    // queued report is what keeps the second one from uploading it again.
+    assert_eq!(
+        mentions(&reports, "report-from-child"),
+        1,
+        "the child's report must be delivered exactly once: {}",
         summarize(&reports)
     );
-    assert!(
-        mentions(&reports, "report-from-parent") >= 1,
-        "the parent stopped reporting after forking"
+    assert_eq!(
+        mentions(&reports, "report-from-parent"),
+        1,
+        "the parent's report must be delivered exactly once: {}",
+        summarize(&reports)
     );
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&out);
@@ -397,20 +402,119 @@ fn forking_while_another_thread_is_capturing_never_deadlocks_the_child() {
         })
     };
 
-    for _ in 0..25 {
+    for i in 0..25 {
         let child = fork_child(|| {
             Bugsee::log(bugsee::core::model::enums::LogLevel::Info, "child");
             Bugsee::set_attribute("child", "1");
-            // Only the SDK's own locks are on trial here, not delivery.
-            Bugsee::flush(Duration::from_secs(5));
-            0
+            // A child that quietly lost its SDK must not pass for a working one:
+            // it has to be launched and its pipeline has to answer a flush.
+            i32::from(!(Bugsee::is_launched() && Bugsee::flush(Duration::from_secs(10))))
         });
-        let status = wait_with_deadline(child, Duration::from_secs(30));
-        assert!(libc::WIFEXITED(status), "child died abnormally: {status}");
+        let status = wait_with_deadline(child, Duration::from_secs(60));
+        assert!(
+            exited_with(status, 0),
+            "child {i} lost its SDK or died after the fork (wait status {status})"
+        );
     }
 
     stop.store(true, Ordering::Relaxed);
     hammer.join().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The prefork layout this whole feature exists for: a long-lived master, one
+/// worker that crashes, and the NEXT worker forked from the master. The master
+/// recovered at its own launch and never rescans, and its generation is the
+/// lowest, so the replacement worker is the only thing that can pick the crash up.
+#[cfg(feature = "native")]
+#[test]
+fn a_worker_that_crashed_is_recovered_by_the_next_worker_while_the_master_lives() {
+    let _serial = serial();
+    let data = scratch("data");
+    let out = scratch("out");
+    let _master = Bugsee::launch_with(
+        LaunchOptions::new("APP_TOKEN")
+            .data_dir(&data)
+            .native_crash_capture(true)
+            .with_transport(FileTransport::new(&out)),
+    )
+    .expect("launch");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Worker A uses the SDK, then dies for real.
+    let a = fork_child(|| {
+        Bugsee::capture_message(LogLevel::Warning, "worker-a-alive");
+        unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+        0
+    });
+    assert!(libc::WIFSIGNALED(wait_with_deadline(
+        a,
+        Duration::from_secs(30)
+    )));
+
+    // The master stays up. Worker B is forked from it; reviving must recover A.
+    let b = fork_child(|| {
+        i32::from(!(Bugsee::is_launched() && Bugsee::flush(Duration::from_secs(10))))
+    });
+    assert!(
+        exited_with(wait_with_deadline(b, Duration::from_secs(60)), 0),
+        "the replacement worker could not start its SDK"
+    );
+
+    let reports = delivered(&out);
+    let crashes = reports
+        .iter()
+        .filter(|r| r["exception_type"] == "native" && r["signal"]["name"] == "SIGSEGV")
+        .count();
+    assert_eq!(
+        crashes,
+        1,
+        "worker A's crash must be recovered exactly once while the master lives: {}",
+        summarize(&reports)
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A panic in a child BEFORE any SDK call runs the hook while the persisted
+/// snapshot path still points into the parent's session. It must not be written
+/// there: the parent's later abort would be reported as this panic.
+#[test]
+fn a_panic_in_the_child_before_touching_the_sdk_does_not_write_into_the_parents_session() {
+    let _serial = serial();
+    let data = scratch("data");
+    let out = scratch("out");
+    let _guard = Bugsee::launch_with(
+        LaunchOptions::new("APP_TOKEN")
+            .data_dir(&data)
+            .native_crash_capture(false)
+            .with_transport(FileTransport::new(&out)),
+    )
+    .expect("launch");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let child = fork_child(|| {
+        // No SDK call first: the observer's hook is the first thing to run.
+        let _ = std::thread::spawn(|| panic!("child-panic-before-sdk")).join();
+        0
+    });
+    assert!(exited_with(
+        wait_with_deadline(child, Duration::from_secs(30)),
+        0
+    ));
+
+    let stray: Vec<_> = std::fs::read_dir(data.join("parts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join("panic.info"))
+        .filter(|p| p.exists())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the child's panic was written into its parent's session: {stray:?}"
+    );
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&out);
 }

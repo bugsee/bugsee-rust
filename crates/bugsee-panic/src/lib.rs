@@ -65,21 +65,26 @@ thread_local! {
 static REPORTER: OnceLock<Arc<dyn PanicReporter>> = OnceLock::new();
 static INSTALL: Once = Once::new();
 /// Where to persist the panic snapshot for next-launch abort correlation.
-static SNAPSHOT_PATH: bugsee_core::fork::ForkMutex<Option<PathBuf>> =
+///
+/// Stored with the fork epoch it was set in. After a `fork()` the path points
+/// into the PARENT's session, and the child's panic hook can run before the SDK
+/// has had a chance to retarget it; a path from an earlier epoch is therefore
+/// ignored rather than written to (which would put the child's panic into the
+/// parent's session, to be welded onto the parent's next abort).
+static SNAPSHOT_PATH: bugsee_core::fork::ForkMutex<Option<(PathBuf, u64)>> =
     bugsee_core::fork::ForkMutex::new(|| None);
+
+/// The snapshot path, if it was set in the current fork epoch.
+fn current_snapshot_path(slot: &Option<(PathBuf, u64)>) -> Option<&PathBuf> {
+    slot.as_ref()
+        .filter(|(_, epoch)| *epoch == bugsee_core::fork::fork_epoch())
+        .map(|(path, _)| path)
+}
 
 /// Set the on-disk path where the observer persists a panic snapshot (used to
 /// correlate an aborting panic with its `SIGABRT` on the next launch).
 pub fn set_snapshot_path(path: PathBuf) {
-    *SNAPSHOT_PATH.lock() = Some(path);
-}
-
-/// Forget the snapshot path in a `fork()` child. The inherited path points into
-/// the PARENT's session; left alone, a panic in the child would overwrite the
-/// parent's snapshot and be correlated with the wrong process's crash. The
-/// caller sets the child's own path afterwards.
-pub fn reset_after_fork() {
-    let _ = SNAPSHOT_PATH.reset_after_fork();
+    *SNAPSHOT_PATH.lock() = Some((path, bugsee_core::fork::fork_epoch()));
 }
 
 /// Clear the persisted-snapshot path.
@@ -180,7 +185,7 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
             // SIGABRT on the next launch. try_lock avoids any deadlock if the
             // panic happened while the path was being set.
             if let Some(guard) = SNAPSHOT_PATH.try_lock() {
-                if let Some(path) = guard.as_ref() {
+                if let Some(path) = current_snapshot_path(&guard) {
                     let snapshot = PanicInfo {
                         reason: reason.clone(),
                         file: file.clone(),
@@ -291,7 +296,7 @@ fn report_caught(payload: &(dyn std::any::Any + Send)) {
     // self-deadlock): this runs AFTER `catch_unwind` returns — the panic has
     // fully unwound and released any locks — so a spuriously-lost `try_lock` race
     // must not silently skip the cleanup and strand a stale snapshot.
-    if let Some(path) = SNAPSHOT_PATH.lock().as_ref() {
+    if let Some(path) = current_snapshot_path(&SNAPSHOT_PATH.lock()) {
         let _ = std::fs::remove_file(path);
     }
 
