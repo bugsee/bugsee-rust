@@ -498,17 +498,37 @@ unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> us
         }
     }
 
-    let mut raw = [core::ptr::null_mut::<core::ffi::c_void>(); MAX_FRAMES];
-    let want = (MAX_FRAMES - n) as u32;
+    let mut raw = [core::ptr::null_mut::<core::ffi::c_void>(); MAX_FRAMES + HANDLER_FRAME_SLACK];
     let got = unsafe {
-        win32::RtlCaptureStackBackTrace(0, want, raw.as_mut_ptr(), core::ptr::null_mut())
+        win32::RtlCaptureStackBackTrace(
+            0,
+            raw.len() as u32,
+            raw.as_mut_ptr(),
+            core::ptr::null_mut(),
+        )
     } as usize;
 
-    for &pc in raw.iter().take(got.min(MAX_FRAMES - n)) {
-        if pc.is_null() {
+    let mut pcs = [0usize; MAX_FRAMES + HANDLER_FRAME_SLACK];
+    let mut m = 0;
+    for &p in raw.iter().take(got) {
+        if p.is_null() {
             break;
         }
-        out[n] = pc as usize;
+        pcs[m] = p as usize;
+        m += 1;
+    }
+
+    // The walk starts inside the handler. When it reaches the faulting
+    // instruction, keep everything from there (callers included) and drop the
+    // handler frames above it; otherwise keep the old behaviour — the PC
+    // recorded above followed by whatever the walk produced.
+    if n == 1 {
+        if let Some(k) = select_crash_frames(&pcs[..m], Some(out[0]), out) {
+            return k;
+        }
+    }
+    for &p in pcs.iter().take(m.min(MAX_FRAMES - n)) {
+        out[n] = p;
         n += 1;
     }
 
@@ -1357,15 +1377,24 @@ unsafe fn read_task_mem(
     kr == mach2::kern_return::KERN_SUCCESS && outsize == want
 }
 
-/// Linux/Android: the handler runs on the crashing thread, so a signal-safe
-/// unwind of the current stack captures the fault (handles x86_64 and aarch64).
+/// Linux/Android: the handler runs on the crashing thread, so an unwind of the
+/// current stack captures the fault (handles x86_64 and aarch64).
+///
+/// That unwind starts INSIDE the handler, so its first frames are our own
+/// (`capture_frames`, `on_crash`, `crash-handler`, the signal trampoline) and
+/// only then the interrupted code. Those frames are noise at best and, on a
+/// stack overflow, they spend the frame budget before the interesting part. The
+/// interrupted PC is known exactly from the signal's `ucontext`, so the walk is
+/// cut to start there; if the unwinder never reaches it, the PC alone is kept
+/// rather than a list of handler frames.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn capture_frames(_cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
+fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
+    let mut raw = [0usize; MAX_FRAMES + HANDLER_FRAME_SLACK];
     let mut n = 0;
     unsafe {
         backtrace::trace_unsynchronized(|frame| {
-            if n < out.len() {
-                out[n] = frame.ip() as usize;
+            if n < raw.len() {
+                raw[n] = frame.ip() as usize;
                 n += 1;
                 true
             } else {
@@ -1373,7 +1402,65 @@ fn capture_frames(_cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
             }
         });
     }
-    n
+    let pc = context_pc(cc);
+    match select_crash_frames(&raw[..n], pc, out) {
+        Some(k) => k,
+        // The unwinder never reached the interrupted PC: record the PC itself,
+        // which is exact, instead of a handler-only stack.
+        None => match pc {
+            Some(pc) => {
+                out[0] = pc;
+                1
+            }
+            None => {
+                let k = n.min(MAX_FRAMES);
+                out[..k].copy_from_slice(&raw[..k]);
+                k
+            }
+        },
+    }
+}
+
+/// How many extra raw frames to unwind so that discarding the handler's own
+/// frames still leaves a full `MAX_FRAMES` of the interrupted stack.
+#[cfg(any(windows, target_os = "linux", target_os = "android", test))]
+const HANDLER_FRAME_SLACK: usize = 24;
+
+/// Cut an unwind that began inside the handler down to the interrupted code:
+/// copy `raw` from the first frame equal to `pc` (the faulting instruction).
+/// `None` when `pc` is unknown or never appears — the caller picks a fallback.
+#[cfg(any(windows, target_os = "linux", target_os = "android", test))]
+fn select_crash_frames(raw: &[usize], pc: Option<usize>, out: &mut [usize]) -> Option<usize> {
+    let pc = pc.filter(|&p| p != 0)?;
+    let start = raw.iter().position(|&f| f == pc)?;
+    let n = (raw.len() - start).min(out.len());
+    out[..n].copy_from_slice(&raw[start..start + n]);
+    Some(n)
+}
+
+/// The interrupted instruction pointer from the signal's saved register state.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn context_pc(cc: &CrashContext) -> Option<usize> {
+    let mc = &cc.context.uc_mcontext;
+    #[cfg(target_arch = "x86_64")]
+    let pc = mc.gregs[16] as usize; // REG_RIP
+    #[cfg(target_arch = "x86")]
+    let pc = mc.gregs[14] as usize; // REG_EIP
+    #[cfg(target_arch = "aarch64")]
+    let pc = mc.pc as usize;
+    #[cfg(target_arch = "arm")]
+    let pc = mc.arm_pc as usize;
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )))]
+    let pc = {
+        let _ = mc;
+        0usize
+    };
+    (pc != 0).then_some(pc)
 }
 
 #[cfg(test)]
@@ -1525,5 +1612,35 @@ mod windows_signal_tests {
         // "could not be named".
         assert_eq!(exception_to_signal(0xDEAD_BEEFu32 as i32), 0);
         assert_eq!(exception_to_signal(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod frame_selection_tests {
+    use super::*;
+
+    #[test]
+    fn drops_handler_frames_above_the_interrupted_pc() {
+        let raw = [0x10, 0x11, 0x12, 0xAAA, 0xBBB, 0xCCC];
+        let mut out = [0usize; 8];
+        let n = select_crash_frames(&raw, Some(0xAAA), &mut out).unwrap();
+        assert_eq!(&out[..n], &[0xAAA, 0xBBB, 0xCCC]);
+    }
+
+    #[test]
+    fn output_is_capped_to_the_destination() {
+        let raw = [1, 2, 3, 4, 5];
+        let mut out = [0usize; 2];
+        let n = select_crash_frames(&raw, Some(2), &mut out).unwrap();
+        assert_eq!(&out[..n], &[2, 3]);
+    }
+
+    #[test]
+    fn unknown_or_unreached_pc_selects_nothing() {
+        let mut out = [0usize; 4];
+        assert!(select_crash_frames(&[1, 2, 3], None, &mut out).is_none());
+        assert!(select_crash_frames(&[1, 2, 3], Some(0), &mut out).is_none());
+        assert!(select_crash_frames(&[1, 2, 3], Some(9), &mut out).is_none());
+        assert!(select_crash_frames(&[], Some(9), &mut out).is_none());
     }
 }
