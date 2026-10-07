@@ -364,6 +364,26 @@ fn child() {
                 std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
             };
         }
+        // The same one-shot logger, but the fault is a WRITE to a mapped read-only
+        // page: the address stays readable, so "unreadable" cannot be what tells
+        // that the host did nothing.
+        "one_shot_readonly" => {
+            install_host_with(log_and_return, libc::SA_RESETHAND);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            // SAFETY: an anonymous read-only page, written on purpose.
+            unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                assert_ne!(p, libc::MAP_FAILED);
+                std::ptr::write_volatile(p as *mut u8, 1);
+            }
+        }
         // The host installs itself AFTER the SDK, recovers its own faults, and
         // passes every other fault down the chain.
         "host_after_sdk" => {
@@ -653,6 +673,27 @@ fn a_one_shot_logging_host_does_not_make_the_crash_loop() {
     );
     assert!(marker.contains("address=0x0\n"), "{marker:?}");
     assert!(marker.contains("frame=0x"), "{marker:?}");
+}
+
+#[test]
+fn a_one_shot_logging_host_does_not_loop_on_a_read_only_page_either() {
+    child();
+    let (out, marker) = run(
+        "one_shot_readonly",
+        "a_one_shot_logging_host_does_not_loop_on_a_read_only_page_either",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let calls = stdout.matches("HOST_LOGGED").count();
+    #[cfg(not(target_vendor = "apple"))]
+    assert_eq!(calls, 1, "a one-shot handler runs once: {stdout}");
+    #[cfg(target_vendor = "apple")]
+    assert!((1..=16).contains(&calls), "the loop must end: {stdout}");
+    assert!(
+        matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
+        "{:?}",
+        out.status
+    );
+    assert!(marker.contains("signal=11"), "{marker:?}");
 }
 
 #[test]

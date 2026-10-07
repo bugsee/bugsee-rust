@@ -1943,6 +1943,7 @@ mod imp {
         struct NoopSlot {
             tid: AtomicI32,
             pc: AtomicUsize,
+            addr: AtomicUsize,
             run: AtomicUsize,
         }
         const NOOP_SLOTS: usize = 16;
@@ -1950,11 +1951,17 @@ mod imp {
             NoopSlot {
                 tid: AtomicI32::new(0),
                 pc: AtomicUsize::new(0),
+                addr: AtomicUsize::new(0),
                 run: AtomicUsize::new(0),
             }
         }; NOOP_SLOTS];
-        /// Consecutive no-op returns at one PC after which the process is ended.
+        /// Consecutive identical faults (same thread, PC and address) after which the
+        /// process is ended: when the host demonstrably did nothing...
         const NOOP_LIMIT: usize = 3;
+        /// ...and when it may have fixed a permission (a mapped page that stays
+        /// readable), which a write-barrier GC does at one PC across many pages —
+        /// but never at one address, dozens of times in a row.
+        const RETRY_LIMIT: usize = 16;
 
         /// How many faults are between "header written" and "outcome known". Only
         /// the first writes `crash.info` up front (see `record_header`).
@@ -2259,25 +2266,30 @@ mod imp {
         /// fault on this thread has come back `NOOP_LIMIT` times with the host doing
         /// nothing. (Two threads whose ids collide in the table only restart each
         /// other's count, which delays the end of a loop, never causes one.)
-        fn is_noop_loop(tid: i32, pc: usize, noop: bool) -> bool {
-            let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
-            if slot.tid.load(Ordering::Acquire) != tid {
-                if !noop {
+        fn is_noop_loop(tid: i32, pc: usize, addr: usize, outcome: HostOutcome) -> bool {
+            let limit = match outcome {
+                HostOutcome::DidNothing => NOOP_LIMIT,
+                HostOutcome::Retry => RETRY_LIMIT,
+                _ => {
+                    // The host did something: whatever came before is not a loop.
+                    let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
+                    if slot.tid.load(Ordering::Acquire) == tid {
+                        slot.run.store(0, Ordering::Release);
+                    }
                     return false;
                 }
+            };
+            let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
+            if slot.tid.load(Ordering::Acquire) == tid
+                && slot.pc.load(Ordering::Acquire) == pc
+                && slot.addr.load(Ordering::Acquire) == addr
+                && slot.run.load(Ordering::Acquire) > 0
+            {
+                slot.run.fetch_add(1, Ordering::AcqRel) + 1 >= limit
+            } else {
                 slot.tid.store(tid, Ordering::Release);
                 slot.pc.store(pc, Ordering::Release);
-                slot.run.store(1, Ordering::Release);
-                return false;
-            }
-            if !noop {
-                slot.run.store(0, Ordering::Release);
-                return false;
-            }
-            if slot.pc.load(Ordering::Acquire) == pc {
-                slot.run.fetch_add(1, Ordering::AcqRel) + 1 >= NOOP_LIMIT
-            } else {
-                slot.pc.store(pc, Ordering::Release);
+                slot.addr.store(addr, Ordering::Release);
                 slot.run.store(1, Ordering::Release);
                 false
             }
@@ -2451,8 +2463,13 @@ mod imp {
         enum HostOutcome {
             /// It demonstrably did nothing: the retry would fault identically.
             DidNothing,
-            /// It changed the registers or made the address readable.
+            /// It changed the registers, or made an unreadable address readable.
             Changed,
+            /// Registers unchanged and the address was readable before and still is
+            /// (a permission fault on a mapped page): it may have fixed the
+            /// permission, or done nothing. Only a long run of the very same fault
+            /// tells.
+            Retry,
             /// Cannot tell (a sent signal, a breakpoint, an unsupported arch).
             Unknown,
         }
@@ -2492,6 +2509,8 @@ mod imp {
             // when saved; the other calls are async-signal-safe.
             unsafe {
                 let before = snapshot(uc);
+                let was_unreadable = matches!(sig, libc::SIGSEGV | libc::SIGBUS)
+                    && unreadable(fault_address(info, sig));
                 if prev.sa_flags & libc::SA_RESETHAND != 0 {
                     let mut dfl: libc::sigaction = core::mem::zeroed();
                     dfl.sa_sigaction = libc::SIG_DFL;
@@ -2525,14 +2544,18 @@ mod imp {
                 if before.words[..before.len] != after.words[..after.len] {
                     return HostOutcome::Changed;
                 }
-                let nothing = match sig {
-                    libc::SIGSEGV | libc::SIGBUS => unreadable(fault_address(info, sig)),
-                    _ => true,
-                };
-                if nothing {
-                    HostOutcome::DidNothing
-                } else {
-                    HostOutcome::Changed
+                match sig {
+                    libc::SIGSEGV | libc::SIGBUS => {
+                        if unreadable(fault_address(info, sig)) {
+                            HostOutcome::DidNothing
+                        } else if was_unreadable {
+                            // Made readable by the host: that is a fix.
+                            HostOutcome::Changed
+                        } else {
+                            HostOutcome::Retry
+                        }
+                    }
+                    _ => HostOutcome::DidNothing,
                 }
             }
         }
@@ -2724,14 +2747,15 @@ mod imp {
             } else {
                 HostOutcome::Unknown
             };
-            let did_nothing = is_noop_loop(tid, regs.pc, outcome == HostOutcome::DidNothing);
+            let did_nothing =
+                is_noop_loop(tid, regs.pc, unsafe { fault_address(info, sig) }, outcome);
             // Judge THIS fault by what its own host did. The disposition is shared
             // by every thread: another thread's host (or `die_of`) may have put the
             // default back while this one's host was fixing its page.
             let fatal = did_nothing
                 || match outcome {
                     HostOutcome::Changed => false,
-                    HostOutcome::DidNothing | HostOutcome::Unknown => unsafe {
+                    HostOutcome::DidNothing | HostOutcome::Retry | HostOutcome::Unknown => unsafe {
                         host_declined(sig, info)
                     },
                 };
