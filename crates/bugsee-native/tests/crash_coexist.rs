@@ -363,6 +363,23 @@ fn child() {
             };
             let _ = recovered.join();
         }
+        // The inverse: the write barrier is FIRST in flight (it owns the header)
+        // and a fatal fault elsewhere puts the default back before it returns.
+        "write_barrier_then_fatal" => {
+            install_host_with(lingering_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = read_only_page() as usize;
+            let barrier = std::thread::spawn(move || {
+                // SAFETY: deliberate fault the host recovers from.
+                unsafe { std::ptr::write_volatile(p as *mut u8, 7) };
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: deliberate null write; nobody recovers it.
+            unsafe {
+                std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+            };
+            let _ = barrier.join();
+        }
         // The fault the host aborts on is NOT the first one in flight (another
         // thread's recovery is still going): its report must still be completed.
         "second_in_flight_abort" => {
@@ -663,6 +680,25 @@ fn a_write_barrier_recovery_finishing_after_a_fatal_fault_does_not_replace_its_r
     let (out, marker) = run(
         "fatal_then_slow_write_barrier",
         "a_write_barrier_recovery_finishing_after_a_fatal_fault_does_not_replace_its_report",
+    );
+    assert!(
+        matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
+        "{:?}",
+        out.status
+    );
+    assert!(
+        marker.contains("address=0x0\n"),
+        "the fatal fault's report must be the one left: {marker:?}"
+    );
+    assert!(marker.contains("frame=0x"), "{marker:?}");
+}
+
+#[test]
+fn a_first_in_flight_write_barrier_is_not_reported_as_the_crash() {
+    child();
+    let (out, marker) = run(
+        "write_barrier_then_fatal",
+        "a_first_in_flight_write_barrier_is_not_reported_as_the_crash",
     );
     assert!(
         matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),

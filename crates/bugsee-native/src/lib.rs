@@ -2269,7 +2269,7 @@ mod imp {
         fn is_noop_loop(tid: i32, pc: usize, addr: usize, outcome: HostOutcome) -> bool {
             let limit = match outcome {
                 HostOutcome::DidNothing => NOOP_LIMIT,
-                HostOutcome::Retry => RETRY_LIMIT,
+                HostOutcome::Retry | HostOutcome::RetryOneShot => RETRY_LIMIT,
                 _ => {
                     // The host did something: whatever came before is not a loop.
                     let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
@@ -2470,6 +2470,9 @@ mod imp {
             /// permission, or done nothing. Only a long run of the very same fault
             /// tells.
             Retry,
+            /// As `Retry`, but this call reset a one-shot (`SA_RESETHAND`) host, so
+            /// the default really is back for the retry.
+            RetryOneShot,
             /// Cannot tell (a sent signal, a breakpoint, an unsupported arch).
             Unknown,
         }
@@ -2552,7 +2555,11 @@ mod imp {
                             // Made readable by the host: that is a fix.
                             HostOutcome::Changed
                         } else {
-                            HostOutcome::Retry
+                            if prev.sa_flags & libc::SA_RESETHAND != 0 {
+                                HostOutcome::RetryOneShot
+                            } else {
+                                HostOutcome::Retry
+                            }
                         }
                     }
                     _ => HostOutcome::DidNothing,
@@ -2753,16 +2760,16 @@ mod imp {
             // by every thread: another thread's host (or `die_of`) may have put the
             // default back while this one's host was fixing its page.
             //
-            // `Retry` (a mapped page the host may have just made writable) is
-            // ambiguous: only the fault that owns the header can read the shared
-            // default as "declined". A later one in flight must prove itself by
-            // repeating (`did_nothing`), or its recovery could replace the fatal
-            // fault's report.
+            //
+            // `Retry` (a mapped page the host may have just made writable, a write
+            // barrier) says nothing by itself: the shared default may have been put
+            // back by another thread's host. It is fatal only once the same fault
+            // has repeated (`did_nothing`), or when THIS call reset a one-shot host
+            // (`RetryOneShot`) and the default is indeed back.
             let fatal = did_nothing
                 || match outcome {
-                    HostOutcome::Changed => false,
-                    HostOutcome::Retry if generation == 0 => false,
-                    HostOutcome::DidNothing | HostOutcome::Retry | HostOutcome::Unknown => unsafe {
+                    HostOutcome::Changed | HostOutcome::Retry => false,
+                    HostOutcome::DidNothing | HostOutcome::RetryOneShot | HostOutcome::Unknown => unsafe {
                         host_declined(sig, info)
                     },
                 };
