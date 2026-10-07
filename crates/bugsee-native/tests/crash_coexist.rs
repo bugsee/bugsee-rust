@@ -219,6 +219,7 @@ fn child() {
         // The thread already has a SMALL alternate stack (Rust gives its threads
         // one sized for its own tiny handler). Unwinding in our handler must not
         // overflow it, or the crash arrives without frames.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         "small_altstack" => {
             // SAFETY: leaks an 8 KiB buffer as this thread's alternate stack.
             unsafe {
@@ -283,6 +284,7 @@ fn child() {
                 std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
             };
         }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         "thread_altstack" => {
             let _h = bugsee_native::install(marker.clone()).unwrap();
             let kb: usize = 12;
@@ -388,6 +390,9 @@ fn a_sent_signal_swallowed_by_the_host_leaves_no_marker() {
     assert!(marker.contains("address=0x0\n"), "{marker:?}");
 }
 
+// Linux/Android only: macOS refuses an alternate stack under 32 KiB, and its
+// handler walks frame pointers from the signal context in a few reads anyway.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_small_existing_alternate_stack_still_yields_frames() {
     child();
@@ -407,6 +412,7 @@ fn a_small_existing_alternate_stack_still_yields_frames() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_thread_with_a_tiny_alternate_stack_still_yields_frames() {
     child();
