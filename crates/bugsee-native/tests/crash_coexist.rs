@@ -532,10 +532,17 @@ fn a_one_shot_logging_host_does_not_make_the_crash_loop() {
         "a_one_shot_logging_host_does_not_make_the_crash_loop",
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        stdout.matches("HOST_LOGGED").count(),
-        1,
-        "a one-shot handler runs once, as the kernel would have it: {stdout}"
+    let calls = stdout.matches("HOST_LOGGED").count();
+    // Linux reports SA_RESETHAND, so the handler is called once, as the kernel
+    // would have it. macOS does not report it: the SDK cannot know the host is
+    // one-shot, notices that the same fault keeps coming back unfixed, and ends
+    // the process after a few calls instead of looping forever.
+    #[cfg(not(target_vendor = "apple"))]
+    assert_eq!(calls, 1, "a one-shot handler runs once: {stdout}");
+    #[cfg(target_vendor = "apple")]
+    assert!(
+        (1..=3).contains(&calls),
+        "the loop must end quickly: {stdout}"
     );
     assert!(
         matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
