@@ -195,7 +195,7 @@ mod imp {
     const HANDLER_BUDGET_SECS: u32 = 5;
 
     /// A `SIGALRM`-based deadline for the crash handler. Only async-signal-safe
-    /// calls (`sigaction`, `sigprocmask`, `sigpending`, `sigwait`, `alarm`) are
+    /// calls (`sigaction`, `pthread_sigmask`, `sigpending`, `sigwait`, `alarm`) are
     /// used.
     ///
     /// The host's own `SIGALRM` disposition, thread signal mask and remaining
@@ -225,7 +225,7 @@ mod imp {
                 let mut old_mask: libc::sigset_t = core::mem::zeroed();
                 // Block SIGALRM first so nothing can be delivered while the
                 // disposition is switched to the default (terminate) action.
-                libc::sigprocmask(libc::SIG_BLOCK, &set, &mut old_mask);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old_mask);
                 libc::sigaction(libc::SIGALRM, &dfl, &mut previous);
                 // A host SIGALRM that already expired is pending: consume it, or
                 // unblocking below would kill the process before the marker is
@@ -246,7 +246,7 @@ mod imp {
                 // Start the deadline, then let it be delivered (the default
                 // action only fires if some thread can take it).
                 let leftover = libc::alarm(HANDLER_BUDGET_SECS);
-                libc::sigprocmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
                 Watchdog {
                     previous,
                     old_mask,
@@ -263,7 +263,7 @@ mod imp {
                 if self.leftover != 0 {
                     libc::alarm(self.leftover);
                 }
-                libc::sigprocmask(libc::SIG_SETMASK, &self.old_mask, core::ptr::null_mut());
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.old_mask, core::ptr::null_mut());
             }
         }
     }
@@ -1879,15 +1879,50 @@ mod imp {
         /// Bumped by every marker header written, under `WRITING`: whoever deletes
         /// or extends a marker must still be the one who wrote it.
         static GEN: AtomicU64 = AtomicU64::new(0);
-        /// The thread currently inside a host handler we called (0 = none), the
-        /// stack address of the frame that called it, and the original fault's
-        /// registers and marker generation — so a fault *inside* that handler can
-        /// be told apart from a fresh one and the original report completed.
-        static CHAIN_TID: AtomicI32 = AtomicI32::new(0);
-        static CHAIN_SP: AtomicUsize = AtomicUsize::new(0);
-        static CHAIN_PC: AtomicUsize = AtomicUsize::new(0);
-        static CHAIN_FP: AtomicUsize = AtomicUsize::new(0);
-        static CHAIN_GEN: AtomicU64 = AtomicU64::new(0);
+        /// One slot per thread currently inside a host handler we called: the stack
+        /// address of the frame that called it, and the original fault's registers
+        /// and marker generation — so a fault *inside* that handler can be told
+        /// apart from a fresh one and the original report completed. Several
+        /// threads can be chaining at once (a host recovering faults on many
+        /// threads), so this is a small table, not one global slot.
+        struct ChainSlot {
+            tid: AtomicI32,
+            sp: AtomicUsize,
+            pc: AtomicUsize,
+            fp: AtomicUsize,
+            generation: AtomicU64,
+        }
+        const CHAIN_SLOTS: usize = 16;
+        static CHAIN: [ChainSlot; CHAIN_SLOTS] = [const {
+            ChainSlot {
+                tid: AtomicI32::new(0),
+                sp: AtomicUsize::new(0),
+                pc: AtomicUsize::new(0),
+                fp: AtomicUsize::new(0),
+                generation: AtomicU64::new(0),
+            }
+        }; CHAIN_SLOTS];
+
+        /// Claim a slot for `tid` (all busy: no chain info, which only degrades the
+        /// nested-abort completion).
+        fn claim_chain(tid: i32) -> Option<&'static ChainSlot> {
+            let start = (tid as usize) % CHAIN_SLOTS;
+            for i in 0..CHAIN_SLOTS {
+                let slot = &CHAIN[(start + i) % CHAIN_SLOTS];
+                if slot
+                    .tid
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Some(slot);
+                }
+            }
+            None
+        }
+
+        fn find_chain(tid: i32) -> Option<&'static ChainSlot> {
+            CHAIN.iter().find(|s| s.tid.load(Ordering::Acquire) == tid)
+        }
         /// The marker generation whose frames are already on disk, so completing a
         /// report twice (eagerly for a stack overflow, then again from the
         /// `abort()` that follows it) appends them once.
@@ -2069,27 +2104,33 @@ mod imp {
             restore_alt_stack();
         }
 
-        /// Let the default action happen: reset the disposition and, for a signal
-        /// that was *sent* (no fault will retrigger), deliver it again.
-        unsafe fn die_of(sig: libc::c_int, info: *const libc::siginfo_t) {
+        /// End the process with `sig`: reset the disposition and deliver the signal
+        /// to ourselves. This does not rely on the faulting instruction being
+        /// retried, which is not dependable everywhere (macOS goes through a Mach
+        /// exception first, and a retry can land back in a still-installed handler).
+        unsafe fn die_of(sig: libc::c_int, _info: *const libc::siginfo_t) {
             // SAFETY: async-signal-safe calls only.
             unsafe {
                 let mut dfl: libc::sigaction = core::mem::zeroed();
                 dfl.sa_sigaction = libc::SIG_DFL;
                 libc::sigemptyset(&mut dfl.sa_mask);
                 libc::sigaction(sig, &dfl, core::ptr::null_mut());
-                if is_sent((*info).si_code) || sig == libc::SIGABRT {
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    let failed = {
-                        let tid = libc::syscall(libc::SYS_gettid) as i32;
-                        libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, sig) < 0
-                    };
-                    #[cfg(target_vendor = "apple")]
-                    let failed = libc::pthread_kill(libc::pthread_self(), sig) != 0;
-                    if failed {
-                        libc::_exit(1);
-                    }
+                // A protection fault is SIGBUS on some platforms and SIGSEGV on
+                // others: whichever way the retry would go, it must not find us.
+                libc::sigaction(libc::SIGSEGV, &dfl, core::ptr::null_mut());
+                libc::sigaction(libc::SIGBUS, &dfl, core::ptr::null_mut());
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let failed = {
+                    let tid = libc::syscall(libc::SYS_gettid) as i32;
+                    libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, sig) < 0
+                };
+                #[cfg(target_vendor = "apple")]
+                let failed = libc::pthread_kill(libc::pthread_self(), sig) != 0;
+                if failed {
+                    libc::_exit(1);
                 }
+                // The signal is blocked while we are in its handler, so it is
+                // delivered when this returns: nothing else may run until then.
             }
         }
 
@@ -2342,11 +2383,14 @@ mod imp {
             generation: u64,
         ) -> bool {
             let here = 0u8;
-            CHAIN_PC.store(regs.pc, Ordering::Release);
-            CHAIN_FP.store(regs.fp, Ordering::Release);
-            CHAIN_GEN.store(generation, Ordering::Release);
-            CHAIN_SP.store(core::ptr::addr_of!(here) as usize, Ordering::Release);
-            CHAIN_TID.store(tid, Ordering::Release);
+            let slot = claim_chain(tid);
+            if let Some(slot) = slot {
+                slot.pc.store(regs.pc, Ordering::Release);
+                slot.fp.store(regs.fp, Ordering::Release);
+                slot.generation.store(generation, Ordering::Release);
+                slot.sp
+                    .store(core::ptr::addr_of!(here) as usize, Ordering::Release);
+            }
             // SAFETY: `prev.sa_sigaction` was a valid handler of the recorded kind
             // when saved; the other calls are async-signal-safe.
             unsafe {
@@ -2372,7 +2416,9 @@ mod imp {
                     f(sig);
                 }
                 libc::pthread_sigmask(libc::SIG_SETMASK, &saved, core::ptr::null_mut());
-                CHAIN_TID.store(0, Ordering::Release);
+                if let Some(slot) = slot {
+                    slot.tid.store(0, Ordering::Release);
+                }
                 // A signal that was only sent is swallowed by doing nothing, and a
                 // breakpoint resumes after itself: neither refaults.
                 if is_sent((*info).si_code) || sig == libc::SIGTRAP || before.len == 0 {
@@ -2422,27 +2468,33 @@ mod imp {
         /// report is still missing its frames.
         #[inline(never)]
         unsafe fn finish_original_report(tid: i32, path: *mut Vec<PathChar>) {
+            let Some(slot) = find_chain(tid) else {
+                return;
+            };
             if path.is_null() {
                 return;
             }
             let regs = Regs {
-                pc: CHAIN_PC.load(Ordering::Acquire),
-                fp: CHAIN_FP.load(Ordering::Acquire),
+                pc: slot.pc.load(Ordering::Acquire),
+                fp: slot.fp.load(Ordering::Acquire),
                 sp: 0,
             };
             // SAFETY: the path is a leaked box.
-            unsafe { complete_report(tid, &*path, regs, CHAIN_GEN.load(Ordering::Acquire)) };
+            unsafe { complete_report(tid, &*path, regs, slot.generation.load(Ordering::Acquire)) };
         }
 
         /// Is this `SIGABRT` raised from inside the host handler we called?
         #[inline(never)]
         fn aborting_inside_host(tid: i32, sig: libc::c_int) -> bool {
-            if sig != libc::SIGABRT || CHAIN_TID.load(Ordering::Acquire) != tid {
+            if sig != libc::SIGABRT {
                 return false;
             }
+            let Some(slot) = find_chain(tid) else {
+                return false;
+            };
             let here = 0u8;
             let sp = core::ptr::addr_of!(here) as usize;
-            let chain_sp = CHAIN_SP.load(Ordering::Acquire);
+            let chain_sp = slot.sp.load(Ordering::Acquire);
             chain_sp != 0 && sp < chain_sp && chain_sp - sp < NESTED_WINDOW
         }
 
@@ -2461,7 +2513,7 @@ mod imp {
             }
             // SAFETY: kernel-provided siginfo of a fault signal.
             let addr = unsafe { fault_address(info, sig) };
-            addr >= regs.sp.saturating_sub(64 * 1024) && addr <= regs.sp.saturating_add(4096)
+            addr >= regs.sp.saturating_sub(16 * 1024) && addr <= regs.sp.saturating_add(4096)
         }
 
         unsafe extern "C" fn handler(
