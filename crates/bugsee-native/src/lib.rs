@@ -2752,9 +2752,16 @@ mod imp {
             // Judge THIS fault by what its own host did. The disposition is shared
             // by every thread: another thread's host (or `die_of`) may have put the
             // default back while this one's host was fixing its page.
+            //
+            // `Retry` (a mapped page the host may have just made writable) is
+            // ambiguous: only the fault that owns the header can read the shared
+            // default as "declined". A later one in flight must prove itself by
+            // repeating (`did_nothing`), or its recovery could replace the fatal
+            // fault's report.
             let fatal = did_nothing
                 || match outcome {
                     HostOutcome::Changed => false,
+                    HostOutcome::Retry if generation == 0 => false,
                     HostOutcome::DidNothing | HostOutcome::Retry | HostOutcome::Unknown => unsafe {
                         host_declined(sig, info)
                     },

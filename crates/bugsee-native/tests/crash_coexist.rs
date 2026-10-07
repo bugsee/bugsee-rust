@@ -202,12 +202,21 @@ fn install_host(sig: libc::c_int, siginfo: bool) {
 }
 
 fn guarded_page() -> *mut u8 {
+    page_with(libc::PROT_NONE)
+}
+
+/// A mapped, readable page the host makes writable (a write barrier).
+fn read_only_page() -> *mut u8 {
+    page_with(libc::PROT_READ)
+}
+
+fn page_with(prot: libc::c_int) -> *mut u8 {
     // SAFETY: anonymous mapping.
     unsafe {
         let p = libc::mmap(
             std::ptr::null_mut(),
             4096,
-            libc::PROT_NONE,
+            prot,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
             0,
@@ -326,6 +335,23 @@ fn child() {
             install_host_with(lingering_host, 0);
             let _h = bugsee_native::install(marker.clone()).unwrap();
             let p = guarded_page() as usize;
+            let recovered = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                // SAFETY: deliberate fault the host recovers from.
+                unsafe { std::ptr::write_volatile(p as *mut u8, 7) };
+            });
+            // SAFETY: deliberate null write; nobody recovers it.
+            unsafe {
+                std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+            };
+            let _ = recovered.join();
+        }
+        // The same race, but the recovered fault is a write barrier: a mapped
+        // read-only page the host makes writable (readable before and after).
+        "fatal_then_slow_write_barrier" => {
+            install_host_with(lingering_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = read_only_page() as usize;
             let recovered = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 // SAFETY: deliberate fault the host recovers from.
@@ -618,6 +644,25 @@ fn a_recovery_finishing_after_a_fatal_fault_does_not_replace_its_report() {
     let (out, marker) = run(
         "fatal_then_slow_recovery",
         "a_recovery_finishing_after_a_fatal_fault_does_not_replace_its_report",
+    );
+    assert!(
+        matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
+        "{:?}",
+        out.status
+    );
+    assert!(
+        marker.contains("address=0x0\n"),
+        "the fatal fault's report must be the one left: {marker:?}"
+    );
+    assert!(marker.contains("frame=0x"), "{marker:?}");
+}
+
+#[test]
+fn a_write_barrier_recovery_finishing_after_a_fatal_fault_does_not_replace_its_report() {
+    child();
+    let (out, marker) = run(
+        "fatal_then_slow_write_barrier",
+        "a_write_barrier_recovery_finishing_after_a_fatal_fault_does_not_replace_its_report",
     );
     assert!(
         matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
