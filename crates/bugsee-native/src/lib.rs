@@ -453,9 +453,9 @@ mod imp {
     /// Persist the GUARANTEED marker header (signal/code/addr/time): cheap and
     /// async-signal-safe, so it can be written before the host handler runs.
     #[cfg(unix)]
-    fn on_crash_header(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize) {
+    fn on_crash_header(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize, pc: usize) {
         // SAFETY: async-signal-safe writes to a path that outlives the process.
-        unsafe { write_marker(path_cbytes, signo, code, addr) }
+        unsafe { write_marker(path_cbytes, signo, code, addr, pc) }
     }
 
     /// Unwind from the interrupted registers and append `frame=` lines to a marker
@@ -482,8 +482,10 @@ mod imp {
         #[cfg(target_vendor = "apple")]
         // SAFETY: fault-safe reads of the crashed thread's own stack.
         let n = unsafe { capture_frames(regs.pc, regs.fp, frames) };
+        // The header already carries the interrupted PC as the first frame.
+        let skip = usize::from(n > 0 && regs.pc != 0 && frames[0] == regs.pc);
         // SAFETY: as in `on_crash_header`.
-        unsafe { append_frames(path_cbytes, &frames[..n]) };
+        unsafe { append_frames(path_cbytes, &frames[skip..n]) };
     }
 
     /// The fault address for a signal that carries one (SIGSEGV/SIGBUS/SIGILL/
@@ -579,8 +581,18 @@ mod imp {
     /// [`append_frames`] so this essential header is persisted BEFORE any (possibly
     /// non-async-signal-safe) frame capture runs — a re-fault there then loses only
     /// the frames, not the whole crash report (F29).
+    ///
+    /// `pc` (the interrupted instruction, `0` when unknown) goes in as the first
+    /// `frame=` line, so the one frame we know exactly survives even if unwinding
+    /// the rest later fails on a small signal stack.
     #[cfg(unix)]
-    unsafe fn write_marker(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize) {
+    unsafe fn write_marker(
+        path_cbytes: &[PathChar],
+        signo: i32,
+        code: i32,
+        addr: usize,
+        pc: usize,
+    ) {
         let fd = unsafe {
             libc::open(
                 path_cbytes.as_ptr() as *const libc::c_char,
@@ -616,6 +628,11 @@ mod imp {
         b.s(b"\ntime=");
         b.dec(time_ms);
         b.byte(b'\n');
+        if pc != 0 {
+            b.s(b"frame=0x");
+            b.hex(pc);
+            b.byte(b'\n');
+        }
         unsafe {
             let _ = libc::write(fd, b.buf.as_ptr() as *const libc::c_void, b.len);
             let _ = libc::close(fd);
@@ -2110,6 +2127,7 @@ mod imp {
             path: *mut Vec<PathChar>,
             sig: libc::c_int,
             info: *mut libc::siginfo_t,
+            pc: usize,
         ) -> u64 {
             lock_writing(tid);
             let mut generation = 0;
@@ -2129,7 +2147,7 @@ mod imp {
                     };
                     #[cfg(not(target_vendor = "apple"))]
                     let recorded = sig;
-                    on_crash_header(&*path, recorded, (*info).si_code, addr);
+                    on_crash_header(&*path, recorded, (*info).si_code, addr, pc);
                 }
                 watchdog.disarm();
                 generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
@@ -2285,7 +2303,7 @@ mod imp {
             }
 
             let regs = unsafe { regs_of(uc) };
-            let generation = unsafe { record_header(tid, path, sig, info) };
+            let generation = unsafe { record_header(tid, path, sig, info, regs.pc) };
             let wrote = generation != 0;
             if wrote && unsafe { looks_like_stack_overflow(sig, info, regs) } {
                 unsafe { complete_report(tid, &*path, regs, generation) };

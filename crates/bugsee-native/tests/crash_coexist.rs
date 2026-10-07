@@ -444,6 +444,14 @@ fn recovering_one_threads_fault_does_not_delete_another_threads_marker() {
         "the real crash's marker must survive the other thread's recovery: {marker:?}"
     );
     assert!(marker.contains("frame=0x"), "{marker:?}");
+    // The interrupted PC is in the header AND is the first unwound frame: it must
+    // be listed once.
+    let frames: Vec<&str> = marker.lines().filter(|l| l.starts_with("frame=")).collect();
+    assert!(frames.len() >= 2, "{marker:?}");
+    assert_ne!(
+        frames[0], frames[1],
+        "the first frame is duplicated: {marker:?}"
+    );
 }
 
 #[test]
