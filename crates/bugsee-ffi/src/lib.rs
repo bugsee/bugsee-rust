@@ -35,6 +35,17 @@ pub enum BugseeStatus {
     Timeout = 5,
 }
 
+/// Log level for [`bugsee_log`]: errors.
+pub const BUGSEE_LEVEL_ERROR: i32 = 1;
+/// Log level for [`bugsee_log`]: warnings.
+pub const BUGSEE_LEVEL_WARNING: i32 = 2;
+/// Log level for [`bugsee_log`]: informational messages.
+pub const BUGSEE_LEVEL_INFO: i32 = 3;
+/// Log level for [`bugsee_log`]: debugging output.
+pub const BUGSEE_LEVEL_DEBUG: i32 = 4;
+/// Log level for [`bugsee_log`]: verbose output.
+pub const BUGSEE_LEVEL_VERBOSE: i32 = 5;
+
 /// Copy a C string into an owned `String` (UTF-8), or `None` if null / not valid
 /// UTF-8. Returning an owned value avoids any borrow outliving the C pointer.
 ///
@@ -303,10 +314,10 @@ pub extern "C" fn bugsee_flush(timeout_ms: u32) -> BugseeStatus {
 
 fn level_from_int(level: i32) -> LogLevel {
     match level {
-        1 => LogLevel::Error,
-        2 => LogLevel::Warning,
-        3 => LogLevel::Info,
-        4 => LogLevel::Debug,
+        BUGSEE_LEVEL_ERROR => LogLevel::Error,
+        BUGSEE_LEVEL_WARNING => LogLevel::Warning,
+        BUGSEE_LEVEL_INFO => LogLevel::Info,
+        BUGSEE_LEVEL_DEBUG => LogLevel::Debug,
         _ => LogLevel::Verbose,
     }
 }

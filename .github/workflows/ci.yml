@@ -58,6 +58,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The C header is generated from the Rust source; an ABI change must show
+      # up as a header diff in the PR that made it. Linux only: it needs `nm -D`
+      # and the header is platform-independent.
+      - name: C header is up to date (ABI gate)
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+
+      - name: Check C header / exported symbols
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/ffi-header.sh check
+
   msrv:
     name: build (MSRV 1.88)
     runs-on: ubuntu-latest
