@@ -1891,6 +1891,11 @@ mod imp {
             pc: AtomicUsize,
             fp: AtomicUsize,
             generation: AtomicU64,
+            /// The fault itself (as recorded in a marker), for a report that has
+            /// to be written from here if it was not the first in flight.
+            sig: AtomicI32,
+            code: AtomicI32,
+            addr: AtomicUsize,
         }
         const CHAIN_SLOTS: usize = 16;
         static CHAIN: [ChainSlot; CHAIN_SLOTS] = [const {
@@ -1900,6 +1905,9 @@ mod imp {
                 pc: AtomicUsize::new(0),
                 fp: AtomicUsize::new(0),
                 generation: AtomicU64::new(0),
+                sig: AtomicI32::new(0),
+                code: AtomicI32::new(0),
+                addr: AtomicUsize::new(0),
             }
         }; CHAIN_SLOTS];
 
@@ -2186,9 +2194,20 @@ mod imp {
             WRITING.store(0, Ordering::Release);
         }
 
-        /// The marker header for `sig`. Apple reports a stack overflow (and other
-        /// protection faults) as SIGBUS; the Mach path this replaced called every
-        /// EXC_BAD_ACCESS SIGSEGV and consumers rely on that.
+        /// The signal number recorded for `sig`. Apple reports a stack overflow (and
+        /// other protection faults) as SIGBUS; the Mach path this replaced called
+        /// every EXC_BAD_ACCESS SIGSEGV and consumers rely on that.
+        fn recorded_signal(sig: libc::c_int) -> libc::c_int {
+            #[cfg(target_vendor = "apple")]
+            {
+                if sig == libc::SIGBUS {
+                    return libc::SIGSEGV;
+                }
+            }
+            sig
+        }
+
+        /// The marker header for `sig`.
         unsafe fn write_header(
             path: &[PathChar],
             sig: libc::c_int,
@@ -2198,15 +2217,7 @@ mod imp {
             // SAFETY: `info` is the kernel's siginfo for a fault signal.
             unsafe {
                 let addr = fault_address(info, sig);
-                #[cfg(target_vendor = "apple")]
-                let recorded = if sig == libc::SIGBUS {
-                    libc::SIGSEGV
-                } else {
-                    sig
-                };
-                #[cfg(not(target_vendor = "apple"))]
-                let recorded = sig;
-                on_crash_header(path, recorded, (*info).si_code, addr, pc);
+                on_crash_header(path, recorded_signal(sig), (*info).si_code, addr, pc);
             }
         }
 
@@ -2287,6 +2298,13 @@ mod imp {
             }
         }
 
+        /// Does `crash.info` already hold a COMPLETE report of a fatal fault? Nothing
+        /// may replace it: the process is dying of that one.
+        fn report_is_complete() -> bool {
+            let owner = OWNER.load(Ordering::Acquire);
+            owner != 0 && FRAMED.load(Ordering::Acquire) == owner
+        }
+
         /// A fault that did not write its header up front and has turned out fatal:
         /// write the whole report now.
         #[inline(never)]
@@ -2298,6 +2316,10 @@ mod imp {
             regs: Regs,
         ) {
             lock_writing(tid);
+            if report_is_complete() {
+                WRITING.store(0, Ordering::Release);
+                return;
+            }
             let watchdog = Watchdog::arm();
             // SAFETY: `info` is the kernel's siginfo for this fault.
             unsafe { write_header(path, sig, info, regs.pc) };
@@ -2423,8 +2445,20 @@ mod imp {
             }
         }
 
-        /// Call the previous handler the way the kernel would have. Returns `true`
-        /// when it demonstrably did NOTHING about the fault — the saved registers
+        /// What the host did about a fault, judged from THIS call (never from the
+        /// process-wide disposition, which another thread's host may have changed).
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        enum HostOutcome {
+            /// It demonstrably did nothing: the retry would fault identically.
+            DidNothing,
+            /// It changed the registers or made the address readable.
+            Changed,
+            /// Cannot tell (a sent signal, a breakpoint, an unsupported arch).
+            Unknown,
+        }
+
+        /// Call the previous handler the way the kernel would have. Reports whether
+        /// it demonstrably did NOTHING about the fault — the saved registers
         /// are unchanged and the faulting address is still unreadable — so the
         /// retry would fault identically forever (a logging-only handler; macOS does
         /// not even report `SA_RESETHAND`, so a one-shot one cannot be recognised
@@ -2438,10 +2472,16 @@ mod imp {
             uc: *mut libc::c_void,
             regs: Regs,
             generation: u64,
-        ) -> bool {
+        ) -> HostOutcome {
             let here = 0u8;
             let slot = claim_chain(tid);
             if let Some(slot) = slot {
+                // SAFETY: kernel-provided siginfo.
+                unsafe {
+                    slot.sig.store(recorded_signal(sig), Ordering::Release);
+                    slot.code.store((*info).si_code, Ordering::Release);
+                    slot.addr.store(fault_address(info, sig), Ordering::Release);
+                }
                 slot.pc.store(regs.pc, Ordering::Release);
                 slot.fp.store(regs.fp, Ordering::Release);
                 slot.generation.store(generation, Ordering::Release);
@@ -2479,15 +2519,20 @@ mod imp {
                 // A signal that was only sent is swallowed by doing nothing, and a
                 // breakpoint resumes after itself: neither refaults.
                 if is_sent((*info).si_code) || sig == libc::SIGTRAP || before.len == 0 {
-                    return false;
+                    return HostOutcome::Unknown;
                 }
                 let after = snapshot(uc);
                 if before.words[..before.len] != after.words[..after.len] {
-                    return false;
+                    return HostOutcome::Changed;
                 }
-                match sig {
+                let nothing = match sig {
                     libc::SIGSEGV | libc::SIGBUS => unreadable(fault_address(info, sig)),
                     _ => true,
+                };
+                if nothing {
+                    HostOutcome::DidNothing
+                } else {
+                    HostOutcome::Changed
                 }
             }
         }
@@ -2536,8 +2581,33 @@ mod imp {
                 fp: slot.fp.load(Ordering::Acquire),
                 sp: 0,
             };
+            let generation = slot.generation.load(Ordering::Acquire);
             // SAFETY: the path is a leaked box.
-            unsafe { complete_report(tid, &*path, regs, slot.generation.load(Ordering::Acquire)) };
+            unsafe {
+                if generation != 0 {
+                    complete_report(tid, &*path, regs, generation);
+                    return;
+                }
+                // The original fault was not the first in flight, so it wrote no
+                // header: write its whole report from what was saved.
+                lock_writing(tid);
+                if !report_is_complete() {
+                    let watchdog = Watchdog::arm();
+                    on_crash_header(
+                        &*path,
+                        slot.sig.load(Ordering::Acquire),
+                        slot.code.load(Ordering::Acquire),
+                        slot.addr.load(Ordering::Acquire),
+                        regs.pc,
+                    );
+                    let generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                    OWNER.store(generation, Ordering::Release);
+                    FRAMED.store(generation, Ordering::Release);
+                    on_crash_frames(&*path, regs);
+                    watchdog.disarm();
+                }
+                WRITING.store(0, Ordering::Release);
+            }
         }
 
         /// Is this `SIGABRT` raised from inside the host handler we called?
@@ -2649,10 +2719,23 @@ mod imp {
                 unsafe { die_of(sig, info) };
                 return;
             }
-            let noop = h != libc::SIG_IGN
-                && unsafe { call_host(prev, tid, sig, info, uc, regs, generation) };
-            let did_nothing = is_noop_loop(tid, regs.pc, noop);
-            if did_nothing || unsafe { host_declined(sig, info) } {
+            let outcome = if h != libc::SIG_IGN {
+                unsafe { call_host(prev, tid, sig, info, uc, regs, generation) }
+            } else {
+                HostOutcome::Unknown
+            };
+            let did_nothing = is_noop_loop(tid, regs.pc, outcome == HostOutcome::DidNothing);
+            // Judge THIS fault by what its own host did. The disposition is shared
+            // by every thread: another thread's host (or `die_of`) may have put the
+            // default back while this one's host was fixing its page.
+            let fatal = did_nothing
+                || match outcome {
+                    HostOutcome::Changed => false,
+                    HostOutcome::DidNothing | HostOutcome::Unknown => unsafe {
+                        host_declined(sig, info)
+                    },
+                };
+            if fatal {
                 // The process is about to die of this fault: finish the report.
                 unsafe { finish_fatal(tid, path, sig, info, regs, generation) };
                 end_flight();
