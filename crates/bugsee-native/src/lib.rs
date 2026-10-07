@@ -1927,13 +1927,24 @@ mod imp {
         /// report twice (eagerly for a stack overflow, then again from the
         /// `abort()` that follows it) appends them once.
         static FRAMED: AtomicU64 = AtomicU64::new(0);
-        /// The thread and PC of the last fault a host returned from without doing
+        /// Per thread: the PC of the last fault a host returned from without doing
         /// anything, and how many times in a row that has happened. One such return
         /// is normal (a swallowed `raise`, which macOS delivers looking exactly like
-        /// a fault); the same fault coming straight back is a loop.
-        static NOOP_TID: AtomicI32 = AtomicI32::new(0);
-        static NOOP_PC: AtomicUsize = AtomicUsize::new(0);
-        static NOOP_RUN: AtomicUsize = AtomicUsize::new(0);
+        /// a fault); the same fault coming straight back is a loop. Per thread, so
+        /// a recovery elsewhere cannot cancel another thread's count.
+        struct NoopSlot {
+            tid: AtomicI32,
+            pc: AtomicUsize,
+            run: AtomicUsize,
+        }
+        const NOOP_SLOTS: usize = 16;
+        static NOOP: [NoopSlot; NOOP_SLOTS] = [const {
+            NoopSlot {
+                tid: AtomicI32::new(0),
+                pc: AtomicUsize::new(0),
+                run: AtomicUsize::new(0),
+            }
+        }; NOOP_SLOTS];
         /// Consecutive no-op returns at one PC after which the process is ended.
         const NOOP_LIMIT: usize = 3;
 
@@ -2234,18 +2245,29 @@ mod imp {
         }
 
         /// Record whether the host did nothing about this fault; `true` once the same
-        /// fault has come back `NOOP_LIMIT` times with the host doing nothing.
+        /// fault on this thread has come back `NOOP_LIMIT` times with the host doing
+        /// nothing. (Two threads whose ids collide in the table only restart each
+        /// other's count, which delays the end of a loop, never causes one.)
         fn is_noop_loop(tid: i32, pc: usize, noop: bool) -> bool {
-            if !noop {
-                NOOP_RUN.store(0, Ordering::Release);
+            let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
+            if slot.tid.load(Ordering::Acquire) != tid {
+                if !noop {
+                    return false;
+                }
+                slot.tid.store(tid, Ordering::Release);
+                slot.pc.store(pc, Ordering::Release);
+                slot.run.store(1, Ordering::Release);
                 return false;
             }
-            if NOOP_TID.load(Ordering::Acquire) == tid && NOOP_PC.load(Ordering::Acquire) == pc {
-                NOOP_RUN.fetch_add(1, Ordering::AcqRel) + 1 >= NOOP_LIMIT
+            if !noop {
+                slot.run.store(0, Ordering::Release);
+                return false;
+            }
+            if slot.pc.load(Ordering::Acquire) == pc {
+                slot.run.fetch_add(1, Ordering::AcqRel) + 1 >= NOOP_LIMIT
             } else {
-                NOOP_TID.store(tid, Ordering::Release);
-                NOOP_PC.store(pc, Ordering::Release);
-                NOOP_RUN.store(1, Ordering::Release);
+                slot.pc.store(pc, Ordering::Release);
+                slot.run.store(1, Ordering::Release);
                 false
             }
         }
@@ -2533,6 +2555,26 @@ mod imp {
             chain_sp != 0 && sp < chain_sp && chain_sp - sp < NESTED_WINDOW
         }
 
+        /// Is this handler running on an alternate stack with under 32 KiB left?
+        #[inline(never)]
+        fn on_small_alt_stack() -> bool {
+            let here = 0u8;
+            let sp = core::ptr::addr_of!(here) as usize;
+            // SAFETY: sigaltstack query into a zeroed struct.
+            unsafe {
+                let mut cur: libc::stack_t = core::mem::zeroed();
+                if libc::sigaltstack(core::ptr::null(), &mut cur) != 0 {
+                    return false;
+                }
+                let base = cur.ss_sp as usize;
+                if sp < base || sp >= base + cur.ss_size {
+                    // Not on the alternate stack: the thread's own stack has room.
+                    return false;
+                }
+                sp - base < 32 * 1024
+            }
+        }
+
         /// A memory fault at (or just under) the stack pointer is a stack overflow.
         /// Rust's own handler for one prints and then `abort()`s, which needs a
         /// whole second signal frame on a possibly tiny alternate stack — so for
@@ -2544,6 +2586,14 @@ mod imp {
             regs: Regs,
         ) -> bool {
             if !matches!(sig, libc::SIGSEGV | libc::SIGBUS) || regs.sp == 0 {
+                return false;
+            }
+            // Only matters where the nested `abort()` could not get a second signal
+            // frame: a handler running on a SMALL alternate stack. On a big one (or
+            // on the thread's own stack) the abort path completes the report, and a
+            // recovered guard-page fault (a JVM yellow page, Go stack growth) pays
+            // nothing extra.
+            if !on_small_alt_stack() {
                 return false;
             }
             // SAFETY: kernel-provided siginfo of a fault signal.
