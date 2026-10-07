@@ -66,6 +66,13 @@ extern "C" fn log_and_return(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut li
     unsafe { libc::write(1, MSG.as_ptr().cast(), MSG.len()) };
 }
 
+/// Write a progress note straight to stdout (async-signal-safe, usable from a
+/// signal handler), so a hung child shows how far it got.
+fn note(msg: &[u8]) {
+    // SAFETY: write(2) of a static buffer.
+    unsafe { libc::write(1, msg.as_ptr().cast(), msg.len()) };
+}
+
 fn sleep_ms(ms: i64) {
     let ts = libc::timespec {
         tv_sec: 0,
@@ -92,11 +99,15 @@ extern "C" fn slow_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc
     unsafe {
         let addr = (*info).si_addr() as usize & !4095;
         if addr == PAGE.load(std::sync::atomic::Ordering::SeqCst) {
+            note(b"HOST recovering-fault enter\n");
             sleep_ms(150);
             libc::mprotect(addr as *mut _, 4096, libc::PROT_READ | libc::PROT_WRITE);
+            note(b"HOST recovering-fault done\n");
         } else {
+            note(b"HOST fatal-fault enter\n");
             sleep_ms(600);
             decline();
+            note(b"HOST fatal-fault declined\n");
         }
     }
 }
@@ -245,10 +256,13 @@ fn child() {
             let _h = bugsee_native::install(marker.clone()).unwrap();
             let p = guarded_page() as usize;
             let recovered = std::thread::spawn(move || {
+                note(b"THREAD about to fault\n");
                 // SAFETY: deliberate fault the host recovers from.
                 unsafe { std::ptr::write_volatile(p as *mut u8, 7) };
+                note(b"THREAD resumed\n");
             });
             std::thread::sleep(std::time::Duration::from_millis(50));
+            note(b"MAIN about to write null\n");
             // SAFETY: deliberate null write; nobody recovers it.
             unsafe {
                 std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
@@ -350,7 +364,21 @@ fn run(kind: &str, test: &str) -> (std::process::Output, String) {
         Err(_) => {
             // SAFETY: kills the child we spawned.
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            panic!("{kind}: the child hung");
+            // What it printed before it stopped says how far it got.
+            let seen = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .ok()
+                .and_then(|o| o.ok())
+                .map(|o| {
+                    format!(
+                        "stdout={:?} stderr={:?}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    )
+                })
+                .unwrap_or_default();
+            let left = std::fs::read_to_string(&marker).unwrap_or_default();
+            panic!("{kind}: the child hung; {seen}; crash.info={left:?}");
         }
     };
     let written = std::fs::read_to_string(&marker).unwrap_or_default();
