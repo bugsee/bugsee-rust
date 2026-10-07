@@ -255,6 +255,23 @@ fn child() {
             };
             let _ = recovered.join();
         }
+        // The same race the other way round: the fatal fault comes FIRST and the
+        // one the host recovers from arrives while it is still being handled.
+        "racing_fatal_first" => {
+            install_host_with(slow_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = guarded_page() as usize;
+            let recovered = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // SAFETY: deliberate fault the host recovers from.
+                unsafe { std::ptr::write_volatile(p as *mut u8, 7) };
+            });
+            // SAFETY: deliberate null write; nobody recovers it.
+            unsafe {
+                std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+            };
+            let _ = recovered.join();
+        }
         // A host whose handler is one-shot (`SA_RESETHAND`): the kernel would reset
         // it before running it, and so must the SDK when it calls it.
         "one_shot_host" => {
@@ -458,6 +475,25 @@ fn recovering_one_threads_fault_does_not_delete_another_threads_marker() {
         frames[0], frames[1],
         "the first frame is duplicated: {marker:?}"
     );
+}
+
+#[test]
+fn a_fatal_fault_survives_a_later_fault_the_host_recovers() {
+    child();
+    let (out, marker) = run(
+        "racing_fatal_first",
+        "a_fatal_fault_survives_a_later_fault_the_host_recovers",
+    );
+    assert!(
+        matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
+        "{:?}",
+        out.status
+    );
+    assert!(
+        marker.contains("address=0x0\n"),
+        "a later recovered fault must neither overwrite nor delete the fatal one's marker: {marker:?}"
+    );
+    assert!(marker.contains("frame=0x"), "{marker:?}");
 }
 
 #[test]

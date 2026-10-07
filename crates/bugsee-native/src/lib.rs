@@ -1892,6 +1892,12 @@ mod imp {
         /// report twice (eagerly for a stack overflow, then again from the
         /// `abort()` that follows it) appends them once.
         static FRAMED: AtomicU64 = AtomicU64::new(0);
+        /// How many faults are between "header written" and "outcome known". Only
+        /// the first writes `crash.info` up front (see `record_header`).
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        /// The generation of the header currently in `crash.info` (0 = none): a
+        /// handler may delete or extend the marker only while it is still its own.
+        static OWNER: AtomicU64 = AtomicU64::new(0);
 
         /// The alternate stack we installed (if any), to put the old one back.
         struct AltSave {
@@ -2103,11 +2109,11 @@ mod imp {
             }
         }
 
-        /// Append the unwound frames to the marker written at generation `gen` —
-        /// unless another thread has written its own marker since.
+        /// Append the unwound frames to the marker THIS handler wrote (generation
+        /// `generation`) — unless something else owns `crash.info` by now.
         unsafe fn complete_report(tid: i32, path: &[PathChar], regs: Regs, generation: u64) {
             lock_writing(tid);
-            if GEN.load(Ordering::Acquire) == generation
+            if OWNER.load(Ordering::Acquire) == generation
                 && FRAMED.load(Ordering::Acquire) != generation
             {
                 FRAMED.store(generation, Ordering::Release);
@@ -2118,9 +2124,41 @@ mod imp {
             WRITING.store(0, Ordering::Release);
         }
 
-        /// Write the marker header for this fault. Returns the marker generation,
-        /// or 0 when there is nowhere to write. Kept out of line, like the other
-        /// phases below, so the stack it needs is released before unwinding starts.
+        /// The marker header for `sig`. Apple reports a stack overflow (and other
+        /// protection faults) as SIGBUS; the Mach path this replaced called every
+        /// EXC_BAD_ACCESS SIGSEGV and consumers rely on that.
+        unsafe fn write_header(
+            path: &[PathChar],
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            pc: usize,
+        ) {
+            // SAFETY: `info` is the kernel's siginfo for a fault signal.
+            unsafe {
+                let addr = fault_address(info, sig);
+                #[cfg(target_vendor = "apple")]
+                let recorded = if sig == libc::SIGBUS {
+                    libc::SIGSEGV
+                } else {
+                    sig
+                };
+                #[cfg(not(target_vendor = "apple"))]
+                let recorded = sig;
+                on_crash_header(path, recorded, (*info).si_code, addr, pc);
+            }
+        }
+
+        /// Register this fault as in flight and, if it is the only one, write its
+        /// marker header. Returns `(first, generation)`; generation 0 means no
+        /// header was written.
+        ///
+        /// Only the FIRST in-flight fault writes up front. A second one would
+        /// overwrite the first's header, and if the second is the one the host
+        /// recovers from, deleting it afterwards would destroy the first's report
+        /// too. A later fault writes only if it turns out to be fatal.
+        ///
+        /// Kept out of line, like the other phases below, so the stack it needs is
+        /// released before unwinding starts.
         #[inline(never)]
         unsafe fn record_header(
             tid: i32,
@@ -2128,35 +2166,171 @@ mod imp {
             sig: libc::c_int,
             info: *mut libc::siginfo_t,
             pc: usize,
-        ) -> u64 {
+        ) -> (bool, u64) {
             lock_writing(tid);
+            let first = IN_FLIGHT.fetch_add(1, Ordering::AcqRel) == 0;
             let mut generation = 0;
-            if !path.is_null() {
+            if first && !path.is_null() {
                 let watchdog = Watchdog::arm();
-                // SAFETY: `info` comes from the kernel; the path is a leaked box.
-                unsafe {
-                    let addr = fault_address(info, sig);
-                    // Apple reports a stack overflow (and other protection faults)
-                    // as SIGBUS; the Mach path this replaced called every
-                    // EXC_BAD_ACCESS SIGSEGV and consumers rely on that.
-                    #[cfg(target_vendor = "apple")]
-                    let recorded = if sig == libc::SIGBUS {
-                        libc::SIGSEGV
-                    } else {
-                        sig
-                    };
-                    #[cfg(not(target_vendor = "apple"))]
-                    let recorded = sig;
-                    on_crash_header(&*path, recorded, (*info).si_code, addr, pc);
-                }
+                // SAFETY: the path is a leaked box.
+                unsafe { write_header(&*path, sig, info, pc) };
                 watchdog.disarm();
                 generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                OWNER.store(generation, Ordering::Release);
             }
             WRITING.store(0, Ordering::Release);
-            generation
+            (first, generation)
         }
 
-        /// Call the previous handler the way the kernel would have.
+        /// This fault is decided (recovered or about to be fatal): it is no longer
+        /// in flight.
+        fn end_flight() {
+            let _ =
+                IN_FLIGHT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        }
+
+        /// A fault that did not write its header up front and has turned out fatal:
+        /// write the whole report now.
+        #[inline(never)]
+        unsafe fn report_unrecorded(
+            tid: i32,
+            path: &[PathChar],
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            regs: Regs,
+        ) {
+            lock_writing(tid);
+            let watchdog = Watchdog::arm();
+            // SAFETY: `info` is the kernel's siginfo for this fault.
+            unsafe { write_header(path, sig, info, regs.pc) };
+            let generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+            OWNER.store(generation, Ordering::Release);
+            FRAMED.store(generation, Ordering::Release);
+            on_crash_frames(path, regs);
+            watchdog.disarm();
+            WRITING.store(0, Ordering::Release);
+        }
+
+        /// The process is going to die of this fault: make sure `crash.info` has a
+        /// complete report of it.
+        #[inline(never)]
+        unsafe fn finish_fatal(
+            tid: i32,
+            path: *mut Vec<PathChar>,
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            regs: Regs,
+            generation: u64,
+        ) {
+            if path.is_null() {
+                return;
+            }
+            // SAFETY: the path is a leaked box.
+            unsafe {
+                if generation != 0 {
+                    complete_report(tid, &*path, regs, generation);
+                } else {
+                    report_unrecorded(tid, &*path, sig, info, regs);
+                }
+            }
+        }
+
+        /// The interrupted registers, to tell whether a host changed anything.
+        #[derive(Clone, Copy)]
+        struct Snapshot {
+            words: [usize; 34],
+            len: usize,
+        }
+
+        #[inline(never)]
+        unsafe fn snapshot(uc: *const libc::c_void) -> Snapshot {
+            let mut s = Snapshot {
+                words: [0; 34],
+                len: 0,
+            };
+            // SAFETY: `uc` is the kernel-provided context of the fault.
+            unsafe {
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "android"),
+                    target_arch = "x86_64"
+                ))]
+                {
+                    let mc = &(*(uc as *const libc::ucontext_t)).uc_mcontext;
+                    for (i, g) in mc.gregs.iter().enumerate().take(34) {
+                        s.words[i] = *g as usize;
+                        s.len = i + 1;
+                    }
+                }
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "android"),
+                    target_arch = "aarch64"
+                ))]
+                {
+                    let mc = &(*(uc as *const libc::ucontext_t)).uc_mcontext;
+                    for (i, r) in mc.regs.iter().enumerate() {
+                        s.words[i] = *r as usize;
+                    }
+                    s.words[31] = mc.sp as usize;
+                    s.words[32] = mc.pc as usize;
+                    s.len = 33;
+                }
+                #[cfg(target_vendor = "apple")]
+                {
+                    let ss = &(*(*(uc as *const DarwinUcontext)).uc_mcontext).ss;
+                    let n = (core::mem::size_of_val(ss) / core::mem::size_of::<usize>()).min(34);
+                    core::ptr::copy_nonoverlapping(
+                        ss as *const _ as *const usize,
+                        s.words.as_mut_ptr(),
+                        n,
+                    );
+                    s.len = n;
+                }
+                #[cfg(not(any(
+                    all(
+                        any(target_os = "linux", target_os = "android"),
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    target_vendor = "apple"
+                )))]
+                let _ = uc;
+            }
+            s
+        }
+
+        /// Is `addr` unreadable right now? (A host that fixes a fault by mapping or
+        /// unprotecting memory makes the retry succeed; one that did nothing leaves
+        /// it unreadable.)
+        #[inline(never)]
+        unsafe fn unreadable(addr: usize) -> bool {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // SAFETY: `access` only reads the "path" at `addr`; an unreadable
+            // pointer is reported as `EFAULT` instead of faulting (and needs no
+            // ptrace permission, unlike `process_vm_readv`).
+            unsafe {
+                libc::access(addr as *const libc::c_char, libc::F_OK) < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
+            }
+            #[cfg(target_vendor = "apple")]
+            // SAFETY: fault-safe read through the kernel.
+            unsafe {
+                let mut byte = 0u8;
+                let mut out = 0u64;
+                mach2::vm::mach_vm_read_overwrite(
+                    mach2::traps::mach_task_self(),
+                    addr as u64,
+                    1,
+                    core::ptr::addr_of_mut!(byte) as u64,
+                    &mut out,
+                ) != mach2::kern_return::KERN_SUCCESS
+            }
+        }
+
+        /// Call the previous handler the way the kernel would have. Returns `true`
+        /// when it demonstrably did NOTHING about the fault — the saved registers
+        /// are unchanged and the faulting address is still unreadable — so the
+        /// retry would fault identically forever (a logging-only handler; macOS does
+        /// not even report `SA_RESETHAND`, so a one-shot one cannot be recognised
+        /// by its flags).
         #[inline(never)]
         unsafe fn call_host(
             prev: &libc::sigaction,
@@ -2166,7 +2340,7 @@ mod imp {
             uc: *mut libc::c_void,
             regs: Regs,
             generation: u64,
-        ) {
+        ) -> bool {
             let here = 0u8;
             CHAIN_PC.store(regs.pc, Ordering::Release);
             CHAIN_FP.store(regs.fp, Ordering::Release);
@@ -2176,6 +2350,7 @@ mod imp {
             // SAFETY: `prev.sa_sigaction` was a valid handler of the recorded kind
             // when saved; the other calls are async-signal-safe.
             unsafe {
+                let before = snapshot(uc);
                 if prev.sa_flags & libc::SA_RESETHAND != 0 {
                     let mut dfl: libc::sigaction = core::mem::zeroed();
                     dfl.sa_sigaction = libc::SIG_DFL;
@@ -2197,8 +2372,21 @@ mod imp {
                     f(sig);
                 }
                 libc::pthread_sigmask(libc::SIG_SETMASK, &saved, core::ptr::null_mut());
+                CHAIN_TID.store(0, Ordering::Release);
+                // A signal that was only sent is swallowed by doing nothing, and a
+                // breakpoint resumes after itself: neither refaults.
+                if is_sent((*info).si_code) || sig == libc::SIGTRAP || before.len == 0 {
+                    return false;
+                }
+                let after = snapshot(uc);
+                if before.words[..before.len] != after.words[..after.len] {
+                    return false;
+                }
+                match sig {
+                    libc::SIGSEGV | libc::SIGBUS => unreadable(fault_address(info, sig)),
+                    _ => true,
+                }
             }
-            CHAIN_TID.store(0, Ordering::Release);
         }
 
         /// Did the host decline? A returned handler that put the default back is
@@ -2217,13 +2405,14 @@ mod imp {
             }
         }
 
-        /// The host recovered: drop the marker — if it is still ours.
+        /// The host recovered: drop the marker — if it is still the one we wrote.
         #[inline(never)]
         unsafe fn drop_marker(tid: i32, path: *mut Vec<PathChar>, generation: u64) {
             lock_writing(tid);
-            if GEN.load(Ordering::Acquire) == generation {
+            if OWNER.load(Ordering::Acquire) == generation {
                 // SAFETY: unlink of the leaked, NUL-terminated path.
                 unsafe { libc::unlink((*path).as_ptr() as *const libc::c_char) };
+                OWNER.store(0, Ordering::Release);
             }
             WRITING.store(0, Ordering::Release);
         }
@@ -2303,9 +2492,8 @@ mod imp {
             }
 
             let regs = unsafe { regs_of(uc) };
-            let generation = unsafe { record_header(tid, path, sig, info, regs.pc) };
-            let wrote = generation != 0;
-            if wrote && unsafe { looks_like_stack_overflow(sig, info, regs) } {
+            let (_first, generation) = unsafe { record_header(tid, path, sig, info, regs.pc) };
+            if generation != 0 && unsafe { looks_like_stack_overflow(sig, info, regs) } {
                 unsafe { complete_report(tid, &*path, regs, generation) };
             }
 
@@ -2319,23 +2507,26 @@ mod imp {
             let h = prev.sa_sigaction;
             if h == libc::SIG_DFL || (h == libc::SIG_IGN && !is_sent(unsafe { (*info).si_code })) {
                 // Nobody else handles it: the process dies of this fault.
-                if wrote {
-                    unsafe { complete_report(tid, &*path, regs, generation) };
-                }
+                unsafe { finish_fatal(tid, path, sig, info, regs, generation) };
+                end_flight();
                 unsafe { die_of(sig, info) };
                 return;
             }
-            if h != libc::SIG_IGN {
-                unsafe { call_host(prev, tid, sig, info, uc, regs, generation) };
-            }
-            if !wrote {
-                return;
-            }
-            if unsafe { host_declined(sig, info) } {
+            let did_nothing = h != libc::SIG_IGN
+                && unsafe { call_host(prev, tid, sig, info, uc, regs, generation) };
+            if did_nothing || unsafe { host_declined(sig, info) } {
                 // The process is about to die of this fault: finish the report.
-                unsafe { complete_report(tid, &*path, regs, generation) };
+                unsafe { finish_fatal(tid, path, sig, info, regs, generation) };
+                end_flight();
+                if did_nothing {
+                    // The retry would fault the same way forever: let it die.
+                    unsafe { die_of(sig, info) };
+                }
             } else {
-                unsafe { drop_marker(tid, path, generation) };
+                if generation != 0 {
+                    unsafe { drop_marker(tid, path, generation) };
+                }
+                end_flight();
             }
         }
     }
