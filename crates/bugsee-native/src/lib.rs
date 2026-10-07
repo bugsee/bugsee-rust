@@ -18,6 +18,32 @@
 //!
 //! See `DESIGN.md` §5, §15.
 
+//! # Coexisting with a host runtime
+//!
+//! Runtimes embedding the SDK (CLR, JVM, V8, Dart, Ruby…) fault on purpose and
+//! recover. The guarantees, per platform:
+//!
+//! * **Linux/Android/macOS** — the SDK installs *over* the existing handlers and calls
+//!   the previous one itself. A cheap marker header (signal, address, time) is
+//!   written first; the stack is unwound only if the host *declines* (restores the
+//!   default action), so a host that recovers hundreds of faults a second pays
+//!   almost nothing. If the host recovers, the marker is **deleted** — unless
+//!   another thread has written its own since — and the SDK stays armed. A
+//!   handler installed *after* the SDK sits in front of it and the SDK never sees
+//!   what it handles; one that declines by calling down the chain still gets a
+//!   full report. A fault that looks like a stack overflow is unwound first,
+//!   because Rust's own handler for it ends in `abort()`.
+//!
+//!   Limits: `SIGABRT` is always treated as fatal. A host that ends the process
+//!   from inside its own handler (its own dump, then `_exit`) leaves a marker
+//!   with a header but no frames. A host that leaves its handler by `siglongjmp`
+//!   keeps the marker (it is discarded if the session ends cleanly). On macOS a
+//!   signal that was merely *sent* looks like a fault, so a host that swallows
+//!   one by resetting the default action leaves a marker too (same cleanup).
+//! * **Windows** — reporting happens in the unhandled-exception filter, which
+//!   runs only after every vectored/structured handler declined, so a fault a
+//!   host recovers from never reaches it, whichever was installed first.
+//!
 //! # Supported platforms
 //!
 //! Linux, Android, macOS and Windows. The handler is built on the
@@ -36,6 +62,7 @@
 mod imp {
     use std::path::PathBuf;
 
+    #[cfg(windows)]
     use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 
     /// Max crashing-thread frames captured for the dedup signature.
@@ -55,8 +82,23 @@ mod imp {
     const MODULES_NAME: &str = "crash.modules";
 
     /// Keeps the native crash handler installed for its lifetime.
+    #[cfg(windows)]
     pub struct NativeHandler {
         _handler: CrashHandler,
+    }
+
+    /// Keeps the native crash handler installed for its lifetime (dropping it puts
+    /// the previously installed handlers back).
+    #[cfg(unix)]
+    pub struct NativeHandler {
+        _private: (),
+    }
+
+    #[cfg(unix)]
+    impl Drop for NativeHandler {
+        fn drop(&mut self) {
+            posix::uninstall();
+        }
     }
 
     /// The marker path the handler writes to, behind an atomic so [`rebind`] can
@@ -78,11 +120,6 @@ mod imp {
         ONCE.call_once(|| {
             extern "C" fn child() {
                 MARKER_PATH.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
-                #[cfg(target_vendor = "apple")]
-                // SAFETY: Mach traps and `sigaction` are async-signal-safe.
-                unsafe {
-                    reset_inherited_exception_ports();
-                }
             }
             // SAFETY: registers a plain `extern "C"` fn that only does an atomic
             // store. Failure (ENOMEM) just leaves the hook uninstalled.
@@ -90,55 +127,6 @@ mod imp {
                 libc::pthread_atfork(None, None, Some(child));
             }
         });
-    }
-
-    /// A `fork()` child inherits the parent's Mach exception PORTS, which route a
-    /// fault to the PARENT's handler thread. That thread then services an
-    /// exception raised by a different task and the child's faulting thread is
-    /// never resumed: the child HANGS instead of crashing. Restore the default
-    /// disposition (the fault becomes an ordinary signal and the child dies), and
-    /// do the same for `SIGABRT`, whose inherited handler also waits on the
-    /// parent's now-absent handler thread. The SDK reinstalls a proper handler for
-    /// the child when it next runs (see the facade's fork revival).
-    ///
-    /// Only async-signal-safe calls: this runs in the child between `fork` and
-    /// whatever the host does next.
-    #[cfg(target_vendor = "apple")]
-    unsafe fn reset_inherited_exception_ports() {
-        // The same set `crash-handler` registers for.
-        use mach2::exception_types::{
-            EXCEPTION_DEFAULT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION,
-            EXC_MASK_BREAKPOINT, EXC_MASK_CRASH, EXC_MASK_GUARD, EXC_MASK_RESOURCE,
-        };
-        extern "C" {
-            fn task_set_exception_ports(
-                task: u32,
-                exception_mask: u32,
-                new_port: u32,
-                behavior: i32,
-                new_flavor: i32,
-            ) -> i32;
-        }
-        const MACH_PORT_NULL: u32 = 0;
-        const THREAD_STATE_NONE: i32 = 5;
-        let mask = EXC_MASK_BAD_ACCESS
-            | EXC_MASK_BAD_INSTRUCTION
-            | EXC_MASK_ARITHMETIC
-            | EXC_MASK_BREAKPOINT
-            | EXC_MASK_CRASH
-            | EXC_MASK_RESOURCE
-            | EXC_MASK_GUARD;
-        // SAFETY: plain Mach trap on this task; MACH_PORT_NULL clears the port.
-        unsafe {
-            task_set_exception_ports(
-                mach2::traps::mach_task_self(),
-                mask,
-                MACH_PORT_NULL,
-                EXCEPTION_DEFAULT as i32,
-                THREAD_STATE_NONE,
-            );
-            libc::signal(libc::SIGABRT, libc::SIG_DFL);
-        }
     }
 
     fn publish_marker_path(path: &std::path::Path) {
@@ -165,26 +153,34 @@ mod imp {
             write_modules_file(&dir.join(MODULES_NAME));
         }
 
-        let handler = CrashHandler::attach(unsafe {
-            crash_handler::make_crash_event(move |cc: &CrashContext| {
-                #[cfg(any(unix, windows))]
-                let watchdog = Watchdog::arm();
-                let path = MARKER_PATH.load(std::sync::atomic::Ordering::Acquire);
-                if !path.is_null() {
-                    // Only ever a leaked `Box<Vec<_>>`, never freed (this closure is
-                    // already inside the `unsafe` block that builds the handler).
-                    on_crash(&*path, cc);
-                }
-                #[cfg(any(unix, windows))]
-                watchdog.disarm();
-                // Continue to the previous/default handler so the process terminates
-                // with the original signal (and any host reporter also sees it).
-                CrashEventResult::Handled(false)
+        #[cfg(unix)]
+        {
+            posix::install()?;
+            Ok(NativeHandler { _private: () })
+        }
+        #[cfg(windows)]
+        {
+            let handler = CrashHandler::attach(unsafe {
+                crash_handler::make_crash_event(move |cc: &CrashContext| {
+                    #[cfg(any(unix, windows))]
+                    let watchdog = Watchdog::arm();
+                    let path = MARKER_PATH.load(std::sync::atomic::Ordering::Acquire);
+                    if !path.is_null() {
+                        // Only ever a leaked `Box<Vec<_>>`, never freed (this closure is
+                        // already inside the `unsafe` block that builds the handler).
+                        on_crash(&*path, cc);
+                    }
+                    #[cfg(any(unix, windows))]
+                    watchdog.disarm();
+                    // Continue to the previous/default handler so the process terminates
+                    // with the original signal (and any host reporter also sees it).
+                    CrashEventResult::Handled(false)
+                })
             })
-        })
-        .map_err(|e| std::io::Error::other(format!("crash handler attach failed: {e}")))?;
+            .map_err(|e| std::io::Error::other(format!("crash handler attach failed: {e}")))?;
 
-        Ok(NativeHandler { _handler: handler })
+            Ok(NativeHandler { _handler: handler })
+        }
     }
 
     /// How long the crash handler may run before the process is killed outright.
@@ -199,7 +195,7 @@ mod imp {
     const HANDLER_BUDGET_SECS: u32 = 5;
 
     /// A `SIGALRM`-based deadline for the crash handler. Only async-signal-safe
-    /// calls (`sigaction`, `sigprocmask`, `sigpending`, `sigwait`, `alarm`) are
+    /// calls (`sigaction`, `pthread_sigmask`, `sigpending`, `sigwait`, `alarm`) are
     /// used.
     ///
     /// The host's own `SIGALRM` disposition, thread signal mask and remaining
@@ -229,7 +225,7 @@ mod imp {
                 let mut old_mask: libc::sigset_t = core::mem::zeroed();
                 // Block SIGALRM first so nothing can be delivered while the
                 // disposition is switched to the default (terminate) action.
-                libc::sigprocmask(libc::SIG_BLOCK, &set, &mut old_mask);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old_mask);
                 libc::sigaction(libc::SIGALRM, &dfl, &mut previous);
                 // A host SIGALRM that already expired is pending: consume it, or
                 // unblocking below would kill the process before the marker is
@@ -250,7 +246,7 @@ mod imp {
                 // Start the deadline, then let it be delivered (the default
                 // action only fires if some thread can take it).
                 let leftover = libc::alarm(HANDLER_BUDGET_SECS);
-                libc::sigprocmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
                 Watchdog {
                     previous,
                     old_mask,
@@ -267,7 +263,7 @@ mod imp {
                 if self.leftover != 0 {
                     libc::alarm(self.leftover);
                 }
-                libc::sigprocmask(libc::SIG_SETMASK, &self.old_mask, core::ptr::null_mut());
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.old_mask, core::ptr::null_mut());
             }
         }
     }
@@ -423,126 +419,89 @@ mod imp {
         bytes
     }
 
-    // Linux/Android deliver a POSIX signal — `siginfo` carries signo/code/addr.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
-        let si = &cc.siginfo;
-        let signo = si.ssi_signo as i32;
-        let code = si.ssi_code;
-        let addr = fault_address(si, signo);
+    /// The interrupted registers needed to unwind from a fault, read from the
+    /// signal's `ucontext` while it is still valid.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct Regs {
+        pc: usize,
+        fp: usize,
+        sp: usize,
+    }
 
-        // F29: persist the GUARANTEED marker (signal/code/addr) FIRST, THEN capture
-        // frames. Linux frame capture runs `backtrace::trace_unsynchronized` on the
-        // crashing thread, which is NOT async-signal-safe (it may lock / re-fault);
-        // if it does, the essential crash info has already been written rather than
-        // the whole report being lost.
-        unsafe {
-            write_marker(path_cbytes, signo, code, addr);
+    #[cfg(unix)]
+    unsafe fn regs_of(uc: *const libc::c_void) -> Regs {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: `uc` is the kernel-provided `ucontext_t` of the fault.
+            let ucp = uc as *const libc::ucontext_t;
+            let (pc, sp) = unsafe { (context_pc(ucp), context_sp(ucp)) };
+            Regs {
+                pc: pc.unwrap_or(0),
+                fp: 0,
+                sp,
+            }
         }
-        let mut frames = [0usize; MAX_FRAMES];
-        let n = capture_frames(cc, &mut frames);
-        unsafe {
-            append_frames(path_cbytes, &frames[..n]);
+        #[cfg(target_vendor = "apple")]
+        {
+            // SAFETY: as above.
+            let (pc, fp, sp) = unsafe { context_regs(uc as *const DarwinUcontext) };
+            Regs { pc, fp, sp }
         }
+    }
+
+    /// Persist the GUARANTEED marker header (signal/code/addr/time): cheap and
+    /// async-signal-safe, so it can be written before the host handler runs.
+    #[cfg(unix)]
+    fn on_crash_header(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize, pc: usize) {
+        // SAFETY: async-signal-safe writes to a path that outlives the process.
+        unsafe { write_marker(path_cbytes, signo, code, addr, pc) }
+    }
+
+    /// Unwind from the interrupted registers and append `frame=` lines to a marker
+    /// whose header is already on disk (F29: a re-fault here loses only the frames).
+    /// Linux frame capture runs `backtrace::trace_unsynchronized` on the crashing
+    /// thread, which is NOT async-signal-safe (it may lock / re-fault).
+    #[cfg(unix)]
+    fn on_crash_frames(path_cbytes: &[PathChar], regs: Regs) {
+        // The buffers are statics, not locals: this runs on a signal stack that may
+        // be only a few KiB (Rust gives each thread one sized for its own tiny
+        // handler), and the unwinder needs most of it. The marker latch, held by
+        // every caller, makes the access exclusive.
+        struct Bufs(core::cell::UnsafeCell<([usize; MAX_FRAMES], [usize; RAW_FRAMES])>);
+        // SAFETY: only touched while holding the marker latch.
+        unsafe impl Sync for Bufs {}
+        static BUFS: Bufs = Bufs(core::cell::UnsafeCell::new((
+            [0; MAX_FRAMES],
+            [0; RAW_FRAMES],
+        )));
+        // SAFETY: exclusive by the latch (see above).
+        let (frames, _raw) = unsafe { &mut *BUFS.0.get() };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let n = capture_frames((regs.pc != 0).then_some(regs.pc), frames, _raw);
+        #[cfg(target_vendor = "apple")]
+        // SAFETY: fault-safe reads of the crashed thread's own stack.
+        let n = unsafe { capture_frames(regs.pc, regs.fp, frames) };
+        // The header already carries the interrupted PC as the first frame.
+        let skip = usize::from(n > 0 && regs.pc != 0 && frames[0] == regs.pc);
+        // SAFETY: as in `on_crash_header`.
+        unsafe { append_frames(path_cbytes, &frames[skip..n]) };
     }
 
     /// The fault address for a signal that carries one (SIGSEGV/SIGBUS/SIGILL/
-    /// SIGFPE/SIGTRAP), read through the real `siginfo_t` layout; `0` otherwise.
-    ///
-    /// `crash-handler` fills `cc.siginfo` by REINTERPRETING the delivered
-    /// `siginfo_t` as a `signalfd_siginfo` (a raw byte copy), so `ssi_addr` (offset
-    /// 72) does not line up with `siginfo_t::si_addr` (offset 16) and reads as ~0
-    /// (F30). The copied bytes ARE a faithful `siginfo_t`, so read the address back
-    /// through that layout.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn fault_address(si: &libc::signalfd_siginfo, signo: i32) -> usize {
-        const SIGILL: i32 = 4;
-        const SIGTRAP: i32 = 5;
-        const SIGBUS: i32 = 7;
-        const SIGFPE: i32 = 8;
-        const SIGSEGV: i32 = 11;
-        if !matches!(signo, SIGILL | SIGTRAP | SIGBUS | SIGFPE | SIGSEGV) {
+    /// SIGFPE/SIGTRAP); `0` otherwise.
+    #[cfg(unix)]
+    unsafe fn fault_address(si: *const libc::siginfo_t, signo: i32) -> usize {
+        // `libc` constants: SIGBUS differs between Linux (7) and BSD/Apple (10).
+        if !matches!(
+            signo,
+            libc::SIGILL | libc::SIGTRAP | libc::SIGBUS | libc::SIGFPE | libc::SIGSEGV
+        ) {
             return 0;
         }
-        // SAFETY: `si` is a byte-faithful copy of the original `siginfo_t` (both
-        // structs are 128 bytes), so reinterpreting back and reading `si_addr()` (the
-        // `_sigfault` union member) is valid for a fault signal.
-        unsafe {
-            let sip = si as *const libc::signalfd_siginfo as *const libc::siginfo_t;
-            (*sip).si_addr() as usize
-        }
-    }
-
-    // Apple platforms deliver a Mach exception — map it to the closest signal.
-    #[cfg(target_vendor = "apple")]
-    fn on_crash(path_cbytes: &[PathChar], cc: &CrashContext) {
-        // Mach exception kinds + codes we special-case (mach/exception_types.h).
-        const EXC_BAD_ACCESS: u32 = 1;
-        const EXC_SOFTWARE: u32 = 5;
-        // EXC_SOFTWARE code[0] marking a delivered Unix signal; the subcode (code[1])
-        // then holds the *signal number*, NOT a fault address.
-        const EXC_SOFT_SIGNAL: i64 = 0x10003;
-        const SIGSEGV: i32 = 11;
-        const SIGABRT: i32 = 6;
-
-        let (signo, code, addr) = match &cc.exception {
-            Some(e) => {
-                if e.kind == EXC_SOFTWARE && e.code as i64 == EXC_SOFT_SIGNAL {
-                    // A Unix signal delivered as a Mach exception (e.g. SIGABRT from a
-                    // Swift fatalError / uncaught NSException): the real signal is in
-                    // the subcode, and there is no fault address.
-                    (
-                        e.subcode.map(|s| s as i32).unwrap_or(SIGABRT),
-                        e.code as i32,
-                        0,
-                    )
-                } else if e.kind == EXC_BAD_ACCESS {
-                    // Only EXC_BAD_ACCESS carries a fault address in the subcode.
-                    (SIGSEGV, e.code as i32, e.subcode.unwrap_or(0) as usize)
-                } else {
-                    // Other exceptions: map kind→signal; the subcode is not a reliable
-                    // address for these, so don't record it as one.
-                    (mach_to_signal(e.kind), e.code as i32, 0)
-                }
-            }
-            None => (0, 0, 0),
-        };
-        unsafe {
-            write_marker(path_cbytes, signo, code, addr);
-        }
-        let mut frames = [0usize; MAX_FRAMES];
-        let n = unsafe { capture_frames(cc, &mut frames) };
-        unsafe {
-            append_frames(path_cbytes, &frames[..n]);
-        }
-    }
-
-    /// Map a Mach exception kind to the closest POSIX signal number (BSD values).
-    /// `EXC_BAD_ACCESS`/`EXC_SOFTWARE` are handled by the caller; an unknown kind
-    /// maps to `0` (UNKNOWN) rather than masquerading as `SIGABRT` — which would make
-    /// it spuriously eligible for panic↔SIGABRT correlation on the next launch.
-    #[cfg(target_vendor = "apple")]
-    fn mach_to_signal(kind: u32) -> i32 {
-        match kind {
-            1 => 11, // EXC_BAD_ACCESS      -> SIGSEGV
-            2 => 4,  // EXC_BAD_INSTRUCTION -> SIGILL
-            3 => 8,  // EXC_ARITHMETIC      -> SIGFPE
-            6 => 5,  // EXC_BREAKPOINT      -> SIGTRAP
-            _ => 0,  // EXC_CRASH/RESOURCE/GUARD/… -> UNKNOWN (not SIGABRT)
-        }
-    }
-
-    // Other Unixes / Windows: record that a crash occurred; details vary per OS.
-    #[cfg(not(any(
-        windows,
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple"
-    )))]
-    fn on_crash(path_cbytes: &[PathChar], _cc: &CrashContext) {
-        unsafe {
-            write_marker(path_cbytes, 0, 0, 0);
-        }
+        // SAFETY: `si` is the kernel-provided `siginfo_t` of a fault signal, whose
+        // `_sigfault` union member holds the address.
+        unsafe { (*si).si_addr() as usize }
     }
 
     /// A small stack-only formatter — no heap, no locks (async-signal-safe).
@@ -622,8 +581,18 @@ mod imp {
     /// [`append_frames`] so this essential header is persisted BEFORE any (possibly
     /// non-async-signal-safe) frame capture runs — a re-fault there then loses only
     /// the frames, not the whole crash report (F29).
+    ///
+    /// `pc` (the interrupted instruction, `0` when unknown) goes in as the first
+    /// `frame=` line, so the one frame we know exactly survives even if unwinding
+    /// the rest later fails on a small signal stack.
     #[cfg(unix)]
-    unsafe fn write_marker(path_cbytes: &[PathChar], signo: i32, code: i32, addr: usize) {
+    unsafe fn write_marker(
+        path_cbytes: &[PathChar],
+        signo: i32,
+        code: i32,
+        addr: usize,
+        pc: usize,
+    ) {
         let fd = unsafe {
             libc::open(
                 path_cbytes.as_ptr() as *const libc::c_char,
@@ -659,6 +628,11 @@ mod imp {
         b.s(b"\ntime=");
         b.dec(time_ms);
         b.byte(b'\n');
+        if pc != 0 {
+            b.s(b"frame=0x");
+            b.hex(pc);
+            b.byte(b'\n');
+        }
         unsafe {
             let _ = libc::write(fd, b.buf.as_ptr() as *const libc::c_void, b.len);
             let _ = libc::close(fd);
@@ -1599,64 +1573,21 @@ mod imp {
     /// Capture up to [`MAX_FRAMES`] absolute PCs of the crashing thread into `out`,
     /// returning the count. Must be async-signal-safe.
     ///
-    /// Apple: the handler runs on a *separate* thread, so read the crashed thread's
-    /// registers via `thread_get_state` and walk its frame-pointer chain with the
-    /// fault-safe `mach_vm_read_overwrite`.
+    /// Apple: start from the interrupted `pc`/`fp` in the signal's context and walk
+    /// the frame-pointer chain with the fault-safe `mach_vm_read_overwrite`.
     #[cfg(target_vendor = "apple")]
-    unsafe fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
-        use mach2::kern_return::KERN_SUCCESS;
-        use mach2::thread_act::thread_get_state;
-        use mach2::thread_status::thread_state_t;
-
-        #[cfg(target_arch = "aarch64")]
-        let (pc, mut fp) = {
-            use mach2::structs::arm_thread_state64_t;
-            use mach2::thread_status::ARM_THREAD_STATE64;
-            let mut state = arm_thread_state64_t::new();
-            let mut count = arm_thread_state64_t::count();
-            let kr = unsafe {
-                thread_get_state(
-                    cc.thread,
-                    ARM_THREAD_STATE64,
-                    &mut state as *mut _ as thread_state_t,
-                    &mut count,
-                )
-            };
-            if kr != KERN_SUCCESS {
-                return 0;
-            }
-            (state.__pc as usize, state.__fp as usize)
-        };
-        #[cfg(target_arch = "x86_64")]
-        let (pc, mut fp) = {
-            use mach2::structs::x86_thread_state64_t;
-            use mach2::thread_status::x86_THREAD_STATE64;
-            let mut state = x86_thread_state64_t::new();
-            let mut count = x86_thread_state64_t::count();
-            let kr = unsafe {
-                thread_get_state(
-                    cc.thread,
-                    x86_THREAD_STATE64,
-                    &mut state as *mut _ as thread_state_t,
-                    &mut count,
-                )
-            };
-            if kr != KERN_SUCCESS {
-                return 0;
-            }
-            (state.__rip as usize, state.__rbp as usize)
-        };
-
+    unsafe fn capture_frames(pc: usize, mut fp: usize, out: &mut [usize; MAX_FRAMES]) -> usize {
+        let task = mach2::traps::mach_task_self();
         let mut n = 0;
         if pc != 0 {
-            out[n] = pc;
+            out[n] = strip_pac(pc);
             n += 1;
         }
         // Frame-pointer chain: [fp] = caller's fp, [fp + word] = return address
         // (same layout on arm64 and x86_64).
         while n < out.len() && fp >= 0x1000 {
             let mut slot = [0usize; 2];
-            if !unsafe { read_task_mem(cc.task, fp, &mut slot) } {
+            if !unsafe { read_task_mem(task, fp, &mut slot) } {
                 break;
             }
             // On arm64e a return address on the stack is PAC-signed; strip the
@@ -1676,6 +1607,42 @@ mod imp {
             fp = next_fp;
         }
         n
+    }
+
+    /// The interrupted `(pc, fp)` from the signal's saved register state.
+    #[cfg(target_vendor = "apple")]
+    unsafe fn context_regs(uc: *const DarwinUcontext) -> (usize, usize, usize) {
+        // SAFETY: `uc` and its `uc_mcontext` come from the kernel for this signal.
+        unsafe {
+            let ss = &(*(*uc).uc_mcontext).ss;
+            #[cfg(target_arch = "aarch64")]
+            return (ss.__pc as usize, ss.__fp as usize, ss.__sp as usize);
+            #[cfg(target_arch = "x86_64")]
+            return (ss.__rip as usize, ss.__rbp as usize, ss.__rsp as usize);
+        }
+    }
+
+    /// `ucontext_t` as laid out by Darwin (`libc` does not expose it): the mcontext
+    /// is `{exception state (16 bytes on both arm64 and x86_64), thread state}`.
+    #[cfg(target_vendor = "apple")]
+    #[repr(C)]
+    struct DarwinUcontext {
+        uc_onstack: i32,
+        uc_sigmask: u32,
+        uc_stack: libc::stack_t,
+        uc_link: *mut DarwinUcontext,
+        uc_mcsize: usize,
+        uc_mcontext: *mut DarwinMcontext,
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[repr(C)]
+    struct DarwinMcontext {
+        es: [u8; 16],
+        #[cfg(target_arch = "aarch64")]
+        ss: mach2::structs::arm_thread_state64_t,
+        #[cfg(target_arch = "x86_64")]
+        ss: mach2::structs::x86_thread_state64_t,
     }
 
     /// Fault-safe read of two words at `addr` from `task` (returns false on bad
@@ -1712,8 +1679,11 @@ mod imp {
     /// cut to start there; if the unwinder never reaches it, the PC alone is kept
     /// rather than a list of handler frames.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn capture_frames(cc: &CrashContext, out: &mut [usize; MAX_FRAMES]) -> usize {
-        let mut raw = [0usize; MAX_FRAMES + HANDLER_FRAME_SLACK];
+    fn capture_frames(
+        pc: Option<usize>,
+        out: &mut [usize; MAX_FRAMES],
+        raw: &mut [usize; RAW_FRAMES],
+    ) -> usize {
         let mut n = 0;
         unsafe {
             backtrace::trace_unsynchronized(|frame| {
@@ -1726,7 +1696,6 @@ mod imp {
                 }
             });
         }
-        let pc = context_pc(cc);
         match select_crash_frames(&raw[..n], pc, out) {
             Some(k) => k,
             // The unwinder never reached the interrupted PC: keep the exact PC
@@ -1758,8 +1727,11 @@ mod imp {
 
     /// How many extra raw frames to unwind so that discarding the handler's own
     /// frames still leaves a full `MAX_FRAMES` of the interrupted stack.
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(windows, unix))]
     const HANDLER_FRAME_SLACK: usize = 24;
+    /// Raw unwinder output buffer length (the interrupted code plus the handler's own frames).
+    #[cfg(unix)]
+    const RAW_FRAMES: usize = MAX_FRAMES + HANDLER_FRAME_SLACK;
 
     /// Cut an unwind that began inside the handler down to the interrupted code:
     /// copy `raw` from the first frame equal (or within one byte) to `pc` (the
@@ -1781,8 +1753,9 @@ mod imp {
 
     /// The interrupted instruction pointer from the signal's saved register state.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn context_pc(cc: &CrashContext) -> Option<usize> {
-        let mc = &cc.context.uc_mcontext;
+    unsafe fn context_pc(uc: *const libc::ucontext_t) -> Option<usize> {
+        // SAFETY: `uc` is the kernel-provided `ucontext_t` of the fault.
+        let mc = unsafe { &(*uc).uc_mcontext };
         #[cfg(target_arch = "x86_64")]
         let pc = mc.gregs[16] as usize; // REG_RIP
         #[cfg(target_arch = "x86")]
@@ -1802,6 +1775,1019 @@ mod imp {
             0usize
         };
         (pc != 0).then_some(pc)
+    }
+
+    /// The interrupted stack pointer from the signal's saved register state.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe fn context_sp(uc: *const libc::ucontext_t) -> usize {
+        // SAFETY: `uc` is the kernel-provided `ucontext_t` of the fault.
+        let mc = unsafe { &(*uc).uc_mcontext };
+        #[cfg(target_arch = "x86_64")]
+        let sp = mc.gregs[15] as usize; // REG_RSP
+        #[cfg(target_arch = "x86")]
+        let sp = mc.gregs[7] as usize; // REG_ESP
+        #[cfg(target_arch = "aarch64")]
+        let sp = mc.sp as usize;
+        #[cfg(target_arch = "arm")]
+        let sp = mc.arm_sp as usize;
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "aarch64",
+            target_arch = "arm"
+        )))]
+        let sp = {
+            let _ = mc;
+            0usize
+        };
+        sp
+    }
+
+    #[cfg(unix)]
+    /// The Unix signal path (Linux, Android, macOS).
+    ///
+    /// Written here rather than taken from `crash-handler` because that crate's
+    /// handler cannot coexist with a host that recovers from faults: after ONE
+    /// signal it restores every previous disposition and returns, so (a) it never
+    /// learns whether the host handled the fault, leaving a crash marker for a
+    /// process that goes on living, and (b) the SDK is uninstalled for good after
+    /// the first recoverable fault.
+    ///
+    /// # Chaining contract
+    ///
+    /// Our handler is installed *over* whatever was there (the host's runtime,
+    /// another reporter, Rust's own `SIGSEGV` handler). On a fault it:
+    ///
+    /// 1. writes the marker HEADER (signal, code, address, time) — cheap and
+    ///    async-signal-safe, with no unwinding, so a host that recovers hundreds of
+    ///    faults a second (implicit null checks, guard pages) pays almost nothing;
+    /// 2. calls the previous handler **itself**, with the real `siginfo`/`ucontext`
+    ///    so the host can fix the interrupted context;
+    /// 3. if that handler returned and did not restore the default action (or the
+    ///    signal was only *sent*), the fault was recovered: the marker is deleted —
+    ///    unless another thread has since written a marker of its own, which is
+    ///    left alone — and our handler stays installed;
+    /// 4. otherwise the process is going to die of the fault, and only now are the
+    ///    stack frames unwound and appended.
+    ///
+    /// If the host handler itself ends the process (a reporter that writes its
+    /// own dump and exits), the marker keeps its header and has no frames, except
+    /// for the `abort()` that Rust's own stack-overflow handler ends with, which
+    /// completes the report from the original fault's registers.
+    ///
+    /// Not covered: a host that leaves its handler by `siglongjmp` (the marker
+    /// stays, and is only attributed to a later death if the session does not end
+    /// cleanly), and `SIGABRT`, which is always treated as fatal because `abort()`
+    /// terminates the process even when a handler returns.
+    mod posix {
+        use super::*;
+        use core::cell::UnsafeCell;
+        use core::mem::MaybeUninit;
+        use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+
+        const SIGNALS: [libc::c_int; 6] = [
+            libc::SIGABRT,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGSEGV,
+            libc::SIGTRAP,
+        ];
+        /// Size of the alternate stack we provide when the thread's own is missing
+        /// or too small to unwind on (Rust sizes its threads' for its own tiny
+        /// handler, and a modern CPU's signal frame alone can be several KiB).
+        const ALT_STACK_BYTES: usize = 128 * 1024;
+        /// An existing alternate stack at least this big is kept.
+        const ALT_STACK_MIN_KEEP: usize = 64 * 1024;
+        /// How far below a chaining frame a nested fault is still "inside the host
+        /// handler we called" rather than a fresh signal on a reused stack.
+        const NESTED_WINDOW: usize = 1 << 20;
+
+        struct Previous(UnsafeCell<MaybeUninit<[libc::sigaction; 6]>>);
+        // SAFETY: each entry is written by `install` (as the `oldact` of the
+        // `sigaction` that arms its signal), before the handler can run for that
+        // signal, and only read by the handler afterwards.
+        unsafe impl Sync for Previous {}
+        static PREVIOUS: Previous = Previous(UnsafeCell::new(MaybeUninit::zeroed()));
+
+        /// Number of live `NativeHandler`s; the handlers are armed while non-zero.
+        static STATE: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        /// Mirror of the above for the handler (which must not lock).
+        static ARMED: AtomicUsize = AtomicUsize::new(0);
+        /// Thread currently writing (or deleting) the marker (0 = none).
+        static WRITING: AtomicI32 = AtomicI32::new(0);
+        /// Bumped by every marker header written, under `WRITING`: whoever deletes
+        /// or extends a marker must still be the one who wrote it.
+        static GEN: AtomicU64 = AtomicU64::new(0);
+        /// One slot per thread currently inside a host handler we called: the stack
+        /// address of the frame that called it, and the original fault's registers
+        /// and marker generation — so a fault *inside* that handler can be told
+        /// apart from a fresh one and the original report completed. Several
+        /// threads can be chaining at once (a host recovering faults on many
+        /// threads), so this is a small table, not one global slot.
+        struct ChainSlot {
+            tid: AtomicI32,
+            sp: AtomicUsize,
+            pc: AtomicUsize,
+            fp: AtomicUsize,
+            generation: AtomicU64,
+            /// The fault itself (as recorded in a marker), for a report that has
+            /// to be written from here if it was not the first in flight.
+            sig: AtomicI32,
+            code: AtomicI32,
+            addr: AtomicUsize,
+        }
+        const CHAIN_SLOTS: usize = 16;
+        static CHAIN: [ChainSlot; CHAIN_SLOTS] = [const {
+            ChainSlot {
+                tid: AtomicI32::new(0),
+                sp: AtomicUsize::new(0),
+                pc: AtomicUsize::new(0),
+                fp: AtomicUsize::new(0),
+                generation: AtomicU64::new(0),
+                sig: AtomicI32::new(0),
+                code: AtomicI32::new(0),
+                addr: AtomicUsize::new(0),
+            }
+        }; CHAIN_SLOTS];
+
+        /// Claim a slot for `tid` (all busy: no chain info, which only degrades the
+        /// nested-abort completion).
+        fn claim_chain(tid: i32) -> Option<&'static ChainSlot> {
+            let start = (tid as usize) % CHAIN_SLOTS;
+            for i in 0..CHAIN_SLOTS {
+                let slot = &CHAIN[(start + i) % CHAIN_SLOTS];
+                if slot
+                    .tid
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Some(slot);
+                }
+            }
+            None
+        }
+
+        fn find_chain(tid: i32) -> Option<&'static ChainSlot> {
+            CHAIN.iter().find(|s| s.tid.load(Ordering::Acquire) == tid)
+        }
+        /// The marker generation whose frames are already on disk, so completing a
+        /// report twice (eagerly for a stack overflow, then again from the
+        /// `abort()` that follows it) appends them once.
+        static FRAMED: AtomicU64 = AtomicU64::new(0);
+        /// Per thread: the PC of the last fault a host returned from without doing
+        /// anything, and how many times in a row that has happened. One such return
+        /// is normal (a swallowed `raise`, which macOS delivers looking exactly like
+        /// a fault); the same fault coming straight back is a loop. Per thread, so
+        /// a recovery elsewhere cannot cancel another thread's count.
+        struct NoopSlot {
+            tid: AtomicI32,
+            pc: AtomicUsize,
+            addr: AtomicUsize,
+            run: AtomicUsize,
+        }
+        const NOOP_SLOTS: usize = 16;
+        static NOOP: [NoopSlot; NOOP_SLOTS] = [const {
+            NoopSlot {
+                tid: AtomicI32::new(0),
+                pc: AtomicUsize::new(0),
+                addr: AtomicUsize::new(0),
+                run: AtomicUsize::new(0),
+            }
+        }; NOOP_SLOTS];
+        /// Consecutive identical faults (same thread, PC and address) after which the
+        /// process is ended: when the host demonstrably did nothing...
+        const NOOP_LIMIT: usize = 3;
+        /// ...and when it may have fixed a permission (a mapped page that stays
+        /// readable), which a write-barrier GC does at one PC across many pages —
+        /// but never at one address, dozens of times in a row.
+        const RETRY_LIMIT: usize = 16;
+
+        /// How many faults are between "header written" and "outcome known". Only
+        /// the first writes `crash.info` up front (see `record_header`).
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        /// The generation of the header currently in `crash.info` (0 = none): a
+        /// handler may delete or extend the marker only while it is still its own.
+        static OWNER: AtomicU64 = AtomicU64::new(0);
+
+        /// The alternate stack we installed (if any), to put the old one back.
+        struct AltSave {
+            had_old: bool,
+            old_sp: usize,
+            old_size: usize,
+            new_sp: usize,
+        }
+        static ALT: std::sync::Mutex<Option<AltSave>> = std::sync::Mutex::new(None);
+
+        /// Whether `si_code` says the signal was *sent* (`kill`, `raise`, …) rather
+        /// than raised by a fault: `<= 0` on Linux. macOS cannot tell — it delivers
+        /// a signal sent with `raise`/`pthread_kill` with a fault-like code
+        /// (`SEGV_ACCERR`), so there a *sent* signal that the host swallows by
+        /// resetting the default action keeps its marker (it is discarded if the
+        /// session ends cleanly).
+        fn is_sent(si_code: i32) -> bool {
+            si_code <= 0
+        }
+
+        fn gettid() -> i32 {
+            // SAFETY: plain syscall / libc call.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                libc::syscall(libc::SYS_gettid) as i32
+            }
+            #[cfg(target_vendor = "apple")]
+            unsafe {
+                let mut id = 0u64;
+                libc::pthread_threadid_np(0, &mut id);
+                id as i32
+            }
+        }
+
+        /// A handler needs somewhere to run when the faulting thread's own stack is
+        /// the problem (stack overflow), and room to unwind. Keep the installing
+        /// thread's alternate stack if it is big enough; otherwise give it ours.
+        fn ensure_alt_stack() {
+            // SAFETY: sigaltstack/mmap/mprotect with filled structs; the mapping is
+            // leaked on purpose (a thread may still be running on it).
+            unsafe {
+                let mut cur: libc::stack_t = core::mem::zeroed();
+                if libc::sigaltstack(core::ptr::null(), &mut cur) != 0 {
+                    return;
+                }
+                let has_old = cur.ss_flags & libc::SS_DISABLE == 0 && !cur.ss_sp.is_null();
+                if has_old && cur.ss_size >= ALT_STACK_MIN_KEEP {
+                    return;
+                }
+                let page = libc::sysconf(libc::_SC_PAGESIZE).max(4096) as usize;
+                let map = libc::mmap(
+                    core::ptr::null_mut(),
+                    page + ALT_STACK_BYTES,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                if map == libc::MAP_FAILED {
+                    return;
+                }
+                let sp = (map as usize + page) as *mut libc::c_void;
+                if libc::mprotect(sp, ALT_STACK_BYTES, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                    libc::munmap(map, page + ALT_STACK_BYTES);
+                    return;
+                }
+                let st = libc::stack_t {
+                    ss_sp: sp,
+                    ss_flags: 0,
+                    ss_size: ALT_STACK_BYTES,
+                };
+                if libc::sigaltstack(&st, core::ptr::null_mut()) == 0 {
+                    *ALT.lock().unwrap_or_else(|e| e.into_inner()) = Some(AltSave {
+                        had_old: has_old,
+                        old_sp: cur.ss_sp as usize,
+                        old_size: cur.ss_size,
+                        new_sp: sp as usize,
+                    });
+                }
+            }
+        }
+
+        /// Put the thread's previous alternate stack back, if ours is still active.
+        fn restore_alt_stack() {
+            let Some(save) = ALT.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                return;
+            };
+            // SAFETY: sigaltstack with a filled/zeroed `stack_t`.
+            unsafe {
+                let mut cur: libc::stack_t = core::mem::zeroed();
+                if libc::sigaltstack(core::ptr::null(), &mut cur) != 0
+                    || cur.ss_sp as usize != save.new_sp
+                {
+                    return;
+                }
+                let st = if save.had_old {
+                    libc::stack_t {
+                        ss_sp: save.old_sp as *mut libc::c_void,
+                        ss_flags: 0,
+                        ss_size: save.old_size,
+                    }
+                } else {
+                    let mut off: libc::stack_t = core::mem::zeroed();
+                    off.ss_flags = libc::SS_DISABLE;
+                    off
+                };
+                libc::sigaltstack(&st, core::ptr::null_mut());
+            }
+        }
+
+        pub(super) fn install() -> std::io::Result<()> {
+            let mut count = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if *count > 0 {
+                *count += 1;
+                return Ok(());
+            }
+            ensure_alt_stack();
+            // SAFETY: sigaction with zeroed + filled structs. `ARMED` goes up first
+            // so a signal arriving mid-install is handled; each handler is armed in
+            // the same call that saves its `PREVIOUS` entry.
+            unsafe {
+                let prev = (*PREVIOUS.0.get()).as_mut_ptr().cast::<libc::sigaction>();
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                libc::sigemptyset(&mut sa.sa_mask);
+                for sig in SIGNALS {
+                    libc::sigaddset(&mut sa.sa_mask, sig);
+                }
+                sa.sa_sigaction = handler as *const () as usize;
+                sa.sa_flags = libc::SA_ONSTACK | libc::SA_SIGINFO;
+                ARMED.store(1, Ordering::Release);
+                for (i, sig) in SIGNALS.iter().enumerate() {
+                    if libc::sigaction(*sig, &sa, prev.add(i)) != 0 {
+                        let err = std::io::Error::last_os_error();
+                        // Roll back what was already taken over.
+                        for (j, done) in SIGNALS.iter().enumerate().take(i) {
+                            libc::sigaction(*done, prev.add(j), core::ptr::null_mut());
+                        }
+                        ARMED.store(0, Ordering::Release);
+                        restore_alt_stack();
+                        return Err(err);
+                    }
+                }
+            }
+            *count = 1;
+            Ok(())
+        }
+
+        pub(super) fn uninstall() {
+            let mut count = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            *count = count.saturating_sub(1);
+            if *count > 0 {
+                return;
+            }
+            ARMED.store(0, Ordering::Release);
+            // SAFETY: restores the dispositions saved by `install`.
+            unsafe {
+                let prev = (*PREVIOUS.0.get()).as_ptr().cast::<libc::sigaction>();
+                for (i, sig) in SIGNALS.iter().enumerate() {
+                    let mut cur: libc::sigaction = core::mem::zeroed();
+                    // Only undo what is still ours: a host that installed its own
+                    // handler on top since must not be clobbered.
+                    if libc::sigaction(*sig, core::ptr::null(), &mut cur) == 0
+                        && cur.sa_sigaction == handler as *const () as usize
+                    {
+                        libc::sigaction(*sig, prev.add(i), core::ptr::null_mut());
+                    }
+                }
+            }
+            restore_alt_stack();
+        }
+
+        /// End the process with `sig`: reset the disposition and deliver the signal
+        /// to ourselves. This does not rely on the faulting instruction being
+        /// retried, which is not dependable everywhere (macOS goes through a Mach
+        /// exception first, and a retry can land back in a still-installed handler).
+        unsafe fn die_of(sig: libc::c_int, _info: *const libc::siginfo_t) {
+            // SAFETY: async-signal-safe calls only.
+            unsafe {
+                let mut dfl: libc::sigaction = core::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut dfl.sa_mask);
+                libc::sigaction(sig, &dfl, core::ptr::null_mut());
+                // A protection fault is SIGBUS on some platforms and SIGSEGV on
+                // others: whichever way the retry would go, it must not find us.
+                libc::sigaction(libc::SIGSEGV, &dfl, core::ptr::null_mut());
+                libc::sigaction(libc::SIGBUS, &dfl, core::ptr::null_mut());
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let failed = {
+                    let tid = libc::syscall(libc::SYS_gettid) as i32;
+                    libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, sig) < 0
+                };
+                #[cfg(target_vendor = "apple")]
+                let failed = libc::pthread_kill(libc::pthread_self(), sig) != 0;
+                if failed {
+                    libc::_exit(1);
+                }
+                // The signal is blocked while we are in its handler, so it is
+                // delivered when this returns: nothing else may run until then.
+            }
+        }
+
+        /// Take the marker latch (one thread writes or deletes at a time; another
+        /// crashing thread waits, bounded by the watchdog on the holder).
+        fn lock_writing(tid: i32) {
+            while WRITING
+                .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
+                // SAFETY: nanosleep is async-signal-safe.
+                unsafe { libc::nanosleep(&ts, core::ptr::null_mut()) };
+            }
+        }
+
+        /// Append the unwound frames to the marker THIS handler wrote (generation
+        /// `generation`) — unless something else owns `crash.info` by now.
+        unsafe fn complete_report(tid: i32, path: &[PathChar], regs: Regs, generation: u64) {
+            lock_writing(tid);
+            if OWNER.load(Ordering::Acquire) == generation
+                && FRAMED.load(Ordering::Acquire) != generation
+            {
+                FRAMED.store(generation, Ordering::Release);
+                let watchdog = Watchdog::arm();
+                on_crash_frames(path, regs);
+                watchdog.disarm();
+            }
+            WRITING.store(0, Ordering::Release);
+        }
+
+        /// The signal number recorded for `sig`. Apple reports a stack overflow (and
+        /// other protection faults) as SIGBUS; the Mach path this replaced called
+        /// every EXC_BAD_ACCESS SIGSEGV and consumers rely on that.
+        fn recorded_signal(sig: libc::c_int) -> libc::c_int {
+            #[cfg(target_vendor = "apple")]
+            {
+                if sig == libc::SIGBUS {
+                    return libc::SIGSEGV;
+                }
+            }
+            sig
+        }
+
+        /// The marker header for `sig`.
+        unsafe fn write_header(
+            path: &[PathChar],
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            pc: usize,
+        ) {
+            // SAFETY: `info` is the kernel's siginfo for a fault signal.
+            unsafe {
+                let addr = fault_address(info, sig);
+                on_crash_header(path, recorded_signal(sig), (*info).si_code, addr, pc);
+            }
+        }
+
+        /// Register this fault as in flight and, if it is the only one, write its
+        /// marker header. Returns `(first, generation)`; generation 0 means no
+        /// header was written.
+        ///
+        /// Only the FIRST in-flight fault writes up front. A second one would
+        /// overwrite the first's header, and if the second is the one the host
+        /// recovers from, deleting it afterwards would destroy the first's report
+        /// too. A later fault writes only if it turns out to be fatal.
+        ///
+        /// Kept out of line, like the other phases below, so the stack it needs is
+        /// released before unwinding starts.
+        #[inline(never)]
+        unsafe fn record_header(
+            tid: i32,
+            path: *mut Vec<PathChar>,
+            sig: libc::c_int,
+            info: *mut libc::siginfo_t,
+            pc: usize,
+        ) -> (bool, u64) {
+            lock_writing(tid);
+            let first = IN_FLIGHT.fetch_add(1, Ordering::AcqRel) == 0;
+            let mut generation = 0;
+            if first && !path.is_null() {
+                let watchdog = Watchdog::arm();
+                // SAFETY: the path is a leaked box.
+                unsafe { write_header(&*path, sig, info, pc) };
+                watchdog.disarm();
+                generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                OWNER.store(generation, Ordering::Release);
+            }
+            WRITING.store(0, Ordering::Release);
+            (first, generation)
+        }
+
+        /// Record whether the host did nothing about this fault; `true` once the same
+        /// fault on this thread has come back `NOOP_LIMIT` times with the host doing
+        /// nothing. (Two threads whose ids collide in the table only restart each
+        /// other's count, which delays the end of a loop, never causes one.)
+        fn is_noop_loop(tid: i32, pc: usize, addr: usize, outcome: HostOutcome) -> bool {
+            let limit = match outcome {
+                HostOutcome::DidNothing => NOOP_LIMIT,
+                HostOutcome::Retry | HostOutcome::RetryOneShot => RETRY_LIMIT,
+                _ => {
+                    // The host did something: whatever came before is not a loop.
+                    let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
+                    if slot.tid.load(Ordering::Acquire) == tid {
+                        slot.run.store(0, Ordering::Release);
+                    }
+                    return false;
+                }
+            };
+            let slot = &NOOP[(tid as usize) % NOOP_SLOTS];
+            if slot.tid.load(Ordering::Acquire) == tid
+                && slot.pc.load(Ordering::Acquire) == pc
+                && slot.addr.load(Ordering::Acquire) == addr
+                && slot.run.load(Ordering::Acquire) > 0
+            {
+                slot.run.fetch_add(1, Ordering::AcqRel) + 1 >= limit
+            } else {
+                slot.tid.store(tid, Ordering::Release);
+                slot.pc.store(pc, Ordering::Release);
+                slot.addr.store(addr, Ordering::Release);
+                slot.run.store(1, Ordering::Release);
+                false
+            }
+        }
+
+        /// This fault is decided (recovered or about to be fatal): it is no longer
+        /// in flight.
+        fn end_flight() {
+            // (`fetch_update` is deprecated on newer toolchains and its replacement
+            // is newer than the MSRV, so spell the loop out.)
+            let mut n = IN_FLIGHT.load(Ordering::Acquire);
+            while n > 0 {
+                match IN_FLIGHT.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => break,
+                    Err(now) => n = now,
+                }
+            }
+        }
+
+        /// Does `crash.info` already hold a COMPLETE report of a fatal fault? Nothing
+        /// may replace it: the process is dying of that one.
+        fn report_is_complete() -> bool {
+            let owner = OWNER.load(Ordering::Acquire);
+            owner != 0 && FRAMED.load(Ordering::Acquire) == owner
+        }
+
+        /// A fault that did not write its header up front and has turned out fatal:
+        /// write the whole report now.
+        #[inline(never)]
+        unsafe fn report_unrecorded(
+            tid: i32,
+            path: &[PathChar],
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            regs: Regs,
+        ) {
+            lock_writing(tid);
+            if report_is_complete() {
+                WRITING.store(0, Ordering::Release);
+                return;
+            }
+            let watchdog = Watchdog::arm();
+            // SAFETY: `info` is the kernel's siginfo for this fault.
+            unsafe { write_header(path, sig, info, regs.pc) };
+            let generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+            OWNER.store(generation, Ordering::Release);
+            FRAMED.store(generation, Ordering::Release);
+            on_crash_frames(path, regs);
+            watchdog.disarm();
+            WRITING.store(0, Ordering::Release);
+        }
+
+        /// The process is going to die of this fault: make sure `crash.info` has a
+        /// complete report of it.
+        #[inline(never)]
+        unsafe fn finish_fatal(
+            tid: i32,
+            path: *mut Vec<PathChar>,
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            regs: Regs,
+            generation: u64,
+        ) {
+            if path.is_null() {
+                return;
+            }
+            // SAFETY: the path is a leaked box.
+            unsafe {
+                if generation != 0 {
+                    complete_report(tid, &*path, regs, generation);
+                } else {
+                    report_unrecorded(tid, &*path, sig, info, regs);
+                }
+            }
+        }
+
+        /// The interrupted registers, to tell whether a host changed anything.
+        #[derive(Clone, Copy)]
+        struct Snapshot {
+            words: [usize; 34],
+            len: usize,
+        }
+
+        #[inline(never)]
+        unsafe fn snapshot(uc: *const libc::c_void) -> Snapshot {
+            let mut s = Snapshot {
+                words: [0; 34],
+                len: 0,
+            };
+            // SAFETY: `uc` is the kernel-provided context of the fault.
+            unsafe {
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "android"),
+                    target_arch = "x86_64"
+                ))]
+                {
+                    let mc = &(*(uc as *const libc::ucontext_t)).uc_mcontext;
+                    for (i, g) in mc.gregs.iter().enumerate().take(34) {
+                        s.words[i] = *g as usize;
+                        s.len = i + 1;
+                    }
+                }
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "android"),
+                    target_arch = "aarch64"
+                ))]
+                {
+                    let mc = &(*(uc as *const libc::ucontext_t)).uc_mcontext;
+                    for (i, r) in mc.regs.iter().enumerate() {
+                        s.words[i] = *r as usize;
+                    }
+                    s.words[31] = mc.sp as usize;
+                    s.words[32] = mc.pc as usize;
+                    s.len = 33;
+                }
+                #[cfg(target_vendor = "apple")]
+                {
+                    let ss = &(*(*(uc as *const DarwinUcontext)).uc_mcontext).ss;
+                    let n = (core::mem::size_of_val(ss) / core::mem::size_of::<usize>()).min(34);
+                    core::ptr::copy_nonoverlapping(
+                        ss as *const _ as *const usize,
+                        s.words.as_mut_ptr(),
+                        n,
+                    );
+                    s.len = n;
+                }
+                #[cfg(not(any(
+                    all(
+                        any(target_os = "linux", target_os = "android"),
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    target_vendor = "apple"
+                )))]
+                let _ = uc;
+            }
+            s
+        }
+
+        /// Is `addr` unreadable right now? (A host that fixes a fault by mapping or
+        /// unprotecting memory makes the retry succeed; one that did nothing leaves
+        /// it unreadable.)
+        #[inline(never)]
+        unsafe fn unreadable(addr: usize) -> bool {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // SAFETY: `access` only reads the "path" at `addr`; an unreadable
+            // pointer is reported as `EFAULT` instead of faulting (and needs no
+            // ptrace permission, unlike `process_vm_readv`).
+            unsafe {
+                libc::access(addr as *const libc::c_char, libc::F_OK) < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
+            }
+            #[cfg(target_vendor = "apple")]
+            // SAFETY: fault-safe read through the kernel.
+            unsafe {
+                let mut byte = 0u8;
+                let mut out = 0u64;
+                mach2::vm::mach_vm_read_overwrite(
+                    mach2::traps::mach_task_self(),
+                    addr as u64,
+                    1,
+                    core::ptr::addr_of_mut!(byte) as u64,
+                    &mut out,
+                ) != mach2::kern_return::KERN_SUCCESS
+            }
+        }
+
+        /// What the host did about a fault, judged from THIS call (never from the
+        /// process-wide disposition, which another thread's host may have changed).
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        enum HostOutcome {
+            /// It demonstrably did nothing: the retry would fault identically.
+            DidNothing,
+            /// It changed the registers, or made an unreadable address readable.
+            Changed,
+            /// Registers unchanged and the address was readable before and still is
+            /// (a permission fault on a mapped page): it may have fixed the
+            /// permission, or done nothing. Only a long run of the very same fault
+            /// tells.
+            Retry,
+            /// As `Retry`, but this call reset a one-shot (`SA_RESETHAND`) host, so
+            /// the default really is back for the retry.
+            RetryOneShot,
+            /// Cannot tell (a sent signal, a breakpoint, an unsupported arch).
+            Unknown,
+        }
+
+        /// Call the previous handler the way the kernel would have. Reports whether
+        /// it demonstrably did NOTHING about the fault — the saved registers
+        /// are unchanged and the faulting address is still unreadable — so the
+        /// retry would fault identically forever (a logging-only handler; macOS does
+        /// not even report `SA_RESETHAND`, so a one-shot one cannot be recognised
+        /// by its flags).
+        #[inline(never)]
+        unsafe fn call_host(
+            prev: &libc::sigaction,
+            tid: i32,
+            sig: libc::c_int,
+            info: *mut libc::siginfo_t,
+            uc: *mut libc::c_void,
+            regs: Regs,
+            generation: u64,
+        ) -> HostOutcome {
+            let here = 0u8;
+            let slot = claim_chain(tid);
+            if let Some(slot) = slot {
+                // SAFETY: kernel-provided siginfo.
+                unsafe {
+                    slot.sig.store(recorded_signal(sig), Ordering::Release);
+                    slot.code.store((*info).si_code, Ordering::Release);
+                    slot.addr.store(fault_address(info, sig), Ordering::Release);
+                }
+                slot.pc.store(regs.pc, Ordering::Release);
+                slot.fp.store(regs.fp, Ordering::Release);
+                slot.generation.store(generation, Ordering::Release);
+                slot.sp
+                    .store(core::ptr::addr_of!(here) as usize, Ordering::Release);
+            }
+            // SAFETY: `prev.sa_sigaction` was a valid handler of the recorded kind
+            // when saved; the other calls are async-signal-safe.
+            unsafe {
+                let before = snapshot(uc);
+                let was_unreadable = matches!(sig, libc::SIGSEGV | libc::SIGBUS)
+                    && unreadable(fault_address(info, sig));
+                if prev.sa_flags & libc::SA_RESETHAND != 0 {
+                    let mut dfl: libc::sigaction = core::mem::zeroed();
+                    dfl.sa_sigaction = libc::SIG_DFL;
+                    libc::sigemptyset(&mut dfl.sa_mask);
+                    libc::sigaction(sig, &dfl, core::ptr::null_mut());
+                }
+                let mut saved: libc::sigset_t = core::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_BLOCK, &prev.sa_mask, &mut saved);
+                if prev.sa_flags & libc::SA_SIGINFO != 0 {
+                    let f: unsafe extern "C" fn(
+                        libc::c_int,
+                        *mut libc::siginfo_t,
+                        *mut libc::c_void,
+                    ) = core::mem::transmute(prev.sa_sigaction);
+                    f(sig, info, uc);
+                } else {
+                    let f: unsafe extern "C" fn(libc::c_int) =
+                        core::mem::transmute(prev.sa_sigaction);
+                    f(sig);
+                }
+                libc::pthread_sigmask(libc::SIG_SETMASK, &saved, core::ptr::null_mut());
+                if let Some(slot) = slot {
+                    slot.tid.store(0, Ordering::Release);
+                }
+                // A signal that was only sent is swallowed by doing nothing, and a
+                // breakpoint resumes after itself: neither refaults.
+                if is_sent((*info).si_code) || sig == libc::SIGTRAP || before.len == 0 {
+                    return HostOutcome::Unknown;
+                }
+                let after = snapshot(uc);
+                if before.words[..before.len] != after.words[..after.len] {
+                    return HostOutcome::Changed;
+                }
+                match sig {
+                    libc::SIGSEGV | libc::SIGBUS => {
+                        if unreadable(fault_address(info, sig)) {
+                            HostOutcome::DidNothing
+                        } else if was_unreadable {
+                            // Made readable by the host: that is a fix.
+                            HostOutcome::Changed
+                        } else {
+                            if prev.sa_flags & libc::SA_RESETHAND != 0 {
+                                HostOutcome::RetryOneShot
+                            } else {
+                                HostOutcome::Retry
+                            }
+                        }
+                    }
+                    _ => HostOutcome::DidNothing,
+                }
+            }
+        }
+
+        /// Did the host decline? A returned handler that put the default back is
+        /// declining (the fault retriggers and kills the process); anything else —
+        /// or a signal that was only sent — means the process lives.
+        #[inline(never)]
+        unsafe fn host_declined(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
+            if sig == libc::SIGABRT {
+                return true;
+            }
+            // SAFETY: reads the current disposition and the kernel's siginfo.
+            unsafe {
+                let mut cur: libc::sigaction = core::mem::zeroed();
+                let ok = libc::sigaction(sig, core::ptr::null(), &mut cur) == 0;
+                ok && cur.sa_sigaction == libc::SIG_DFL && !is_sent((*info).si_code)
+            }
+        }
+
+        /// The host recovered: drop the marker — if it is still the one we wrote.
+        #[inline(never)]
+        unsafe fn drop_marker(tid: i32, path: *mut Vec<PathChar>, generation: u64) {
+            lock_writing(tid);
+            if OWNER.load(Ordering::Acquire) == generation {
+                // SAFETY: unlink of the leaked, NUL-terminated path.
+                unsafe { libc::unlink((*path).as_ptr() as *const libc::c_char) };
+                OWNER.store(0, Ordering::Release);
+            }
+            WRITING.store(0, Ordering::Release);
+        }
+
+        /// The `abort()` that ends Rust's own stack-overflow handler (or any host
+        /// handler that aborts): the process is dying of the ORIGINAL fault, whose
+        /// report is still missing its frames.
+        #[inline(never)]
+        unsafe fn finish_original_report(tid: i32, path: *mut Vec<PathChar>) {
+            let Some(slot) = find_chain(tid) else {
+                return;
+            };
+            if path.is_null() {
+                return;
+            }
+            let regs = Regs {
+                pc: slot.pc.load(Ordering::Acquire),
+                fp: slot.fp.load(Ordering::Acquire),
+                sp: 0,
+            };
+            let generation = slot.generation.load(Ordering::Acquire);
+            // SAFETY: the path is a leaked box.
+            unsafe {
+                if generation != 0 {
+                    complete_report(tid, &*path, regs, generation);
+                    return;
+                }
+                // The original fault was not the first in flight, so it wrote no
+                // header: write its whole report from what was saved.
+                lock_writing(tid);
+                if !report_is_complete() {
+                    let watchdog = Watchdog::arm();
+                    on_crash_header(
+                        &*path,
+                        slot.sig.load(Ordering::Acquire),
+                        slot.code.load(Ordering::Acquire),
+                        slot.addr.load(Ordering::Acquire),
+                        regs.pc,
+                    );
+                    let generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                    OWNER.store(generation, Ordering::Release);
+                    FRAMED.store(generation, Ordering::Release);
+                    on_crash_frames(&*path, regs);
+                    watchdog.disarm();
+                }
+                WRITING.store(0, Ordering::Release);
+            }
+        }
+
+        /// Is this `SIGABRT` raised from inside the host handler we called?
+        #[inline(never)]
+        fn aborting_inside_host(tid: i32, sig: libc::c_int) -> bool {
+            if sig != libc::SIGABRT {
+                return false;
+            }
+            let Some(slot) = find_chain(tid) else {
+                return false;
+            };
+            let here = 0u8;
+            let sp = core::ptr::addr_of!(here) as usize;
+            let chain_sp = slot.sp.load(Ordering::Acquire);
+            chain_sp != 0 && sp < chain_sp && chain_sp - sp < NESTED_WINDOW
+        }
+
+        /// Is this handler running on an alternate stack with under 32 KiB left?
+        #[inline(never)]
+        fn on_small_alt_stack() -> bool {
+            let here = 0u8;
+            let sp = core::ptr::addr_of!(here) as usize;
+            // SAFETY: sigaltstack query into a zeroed struct.
+            unsafe {
+                let mut cur: libc::stack_t = core::mem::zeroed();
+                if libc::sigaltstack(core::ptr::null(), &mut cur) != 0 {
+                    return false;
+                }
+                let base = cur.ss_sp as usize;
+                if sp < base || sp >= base + cur.ss_size {
+                    // Not on the alternate stack: the thread's own stack has room.
+                    return false;
+                }
+                sp - base < 32 * 1024
+            }
+        }
+
+        /// A memory fault at (or just under) the stack pointer is a stack overflow.
+        /// Rust's own handler for one prints and then `abort()`s, which needs a
+        /// whole second signal frame on a possibly tiny alternate stack — so for
+        /// this one case the report is completed BEFORE the host handler runs.
+        #[inline(never)]
+        unsafe fn looks_like_stack_overflow(
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            regs: Regs,
+        ) -> bool {
+            if !matches!(sig, libc::SIGSEGV | libc::SIGBUS) || regs.sp == 0 {
+                return false;
+            }
+            // Only matters where the nested `abort()` could not get a second signal
+            // frame: a handler running on a SMALL alternate stack. On a big one (or
+            // on the thread's own stack) the abort path completes the report, and a
+            // recovered guard-page fault (a JVM yellow page, Go stack growth) pays
+            // nothing extra.
+            if !on_small_alt_stack() {
+                return false;
+            }
+            // SAFETY: kernel-provided siginfo of a fault signal.
+            let addr = unsafe { fault_address(info, sig) };
+            addr >= regs.sp.saturating_sub(16 * 1024) && addr <= regs.sp.saturating_add(4096)
+        }
+
+        unsafe extern "C" fn handler(
+            sig: libc::c_int,
+            info: *mut libc::siginfo_t,
+            uc: *mut libc::c_void,
+        ) {
+            let tid = gettid();
+            let Some(idx) = SIGNALS.iter().position(|&s| s == sig) else {
+                return;
+            };
+            // SAFETY (the calls below): async-signal-safe, on kernel-provided
+            // `info`/`uc` and leaked, process-lifetime statics.
+            if ARMED.load(Ordering::Acquire) == 0 {
+                // Uninstalled while a signal was in flight.
+                unsafe { die_of(sig, info) };
+                return;
+            }
+            // A fault while WE are writing the marker: nothing more can be done.
+            if WRITING.load(Ordering::Acquire) == tid {
+                unsafe { die_of(sig, info) };
+                return;
+            }
+            let path = MARKER_PATH.load(Ordering::Acquire);
+            if aborting_inside_host(tid, sig) {
+                unsafe { finish_original_report(tid, path) };
+                return;
+            }
+
+            let regs = unsafe { regs_of(uc) };
+            let (_first, generation) = unsafe { record_header(tid, path, sig, info, regs.pc) };
+            if generation != 0 && unsafe { looks_like_stack_overflow(sig, info, regs) } {
+                unsafe { complete_report(tid, &*path, regs, generation) };
+            }
+
+            // `PREVIOUS[idx]` is initialised before its handler can run.
+            let prev = unsafe {
+                &*(*PREVIOUS.0.get())
+                    .as_ptr()
+                    .cast::<libc::sigaction>()
+                    .add(idx)
+            };
+            let h = prev.sa_sigaction;
+            if h == libc::SIG_DFL || (h == libc::SIG_IGN && !is_sent(unsafe { (*info).si_code })) {
+                // Nobody else handles it: the process dies of this fault.
+                unsafe { finish_fatal(tid, path, sig, info, regs, generation) };
+                end_flight();
+                unsafe { die_of(sig, info) };
+                return;
+            }
+            let outcome = if h != libc::SIG_IGN {
+                unsafe { call_host(prev, tid, sig, info, uc, regs, generation) }
+            } else {
+                HostOutcome::Unknown
+            };
+            let did_nothing =
+                is_noop_loop(tid, regs.pc, unsafe { fault_address(info, sig) }, outcome);
+            // Judge THIS fault by what its own host did. The disposition is shared
+            // by every thread: another thread's host (or `die_of`) may have put the
+            // default back while this one's host was fixing its page.
+            //
+            //
+            // `Retry` (a mapped page the host may have just made writable, a write
+            // barrier) says nothing by itself: the shared default may have been put
+            // back by another thread's host. It is fatal only once the same fault
+            // has repeated (`did_nothing`), or when THIS call reset a one-shot host
+            // (`RetryOneShot`) and the default is indeed back.
+            let fatal = did_nothing
+                || match outcome {
+                    HostOutcome::Changed | HostOutcome::Retry => false,
+                    HostOutcome::DidNothing | HostOutcome::RetryOneShot | HostOutcome::Unknown => unsafe {
+                        host_declined(sig, info)
+                    },
+                };
+            if fatal {
+                // The process is about to die of this fault: finish the report.
+                unsafe { finish_fatal(tid, path, sig, info, regs, generation) };
+                end_flight();
+                if did_nothing {
+                    // The retry would fault the same way forever: let it die.
+                    unsafe { die_of(sig, info) };
+                }
+            } else {
+                if generation != 0 {
+                    unsafe { drop_marker(tid, path, generation) };
+                }
+                end_flight();
+            }
+        }
     }
 
     #[cfg(test)]

@@ -11,16 +11,16 @@ description = "Native fatal-crash handler (signal/exception) for the Bugsee Rust
 [dependencies]
 bugsee-core = { workspace = true }
 
-# `crash-handler` has no iOS/tvOS/watchOS backend (its `CrashContext` does not
-# exist there), so it is only pulled in where it can compile; every other target
-# gets the stub in `lib.rs`.
-[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))'.dependencies]
+# Windows only. Unix (Linux, Android, macOS) uses the SDK's own signal handler,
+# which chains to the host's handlers itself so a fault the host recovers from is
+# not reported; every other target gets the stub in `lib.rs`.
+[target.'cfg(target_os = "windows")'.dependencies]
 crash-handler = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Apple: read the crashed thread's registers/stack from the handler thread.
+# Apple: fault-safe reads of the crashed thread's stack.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 mach2 = "0.4"
 
