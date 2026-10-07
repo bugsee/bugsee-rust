@@ -315,6 +315,31 @@ fn check(expect: Expect, crash: &Value) -> Result<(), String> {
     }
 }
 
+/// Every `crash.info` under `dir`, flattened onto one line (diagnostics only).
+fn crash_info_files(dir: &std::path::Path) -> String {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.file_name().is_some_and(|n| n == "crash.info") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                out.push(text.replace('\n', " | "));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, &mut found);
+    if found.is_empty() {
+        "<none>".into()
+    } else {
+        found.join(" ;; ")
+    }
+}
+
 fn run_case(case: &Case) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!(
         "bugsee-crash-e2e-{}-{}",
@@ -337,6 +362,11 @@ fn run_case(case: &Case) -> Result<(), String> {
             ));
         }
 
+        // What the dying child left on disk, kept for the failure message:
+        // recovery consumes it, and "no frames" alone does not say whether the
+        // handler never ran, ran without unwinding, or was killed mid-write.
+        let left_behind = crash_info_files(&dir);
+
         // --- relaunch: exactly one usable report ---------------------------
         let bundles = relaunch_and_collect(&dir);
         if bundles.len() != 1 {
@@ -347,7 +377,13 @@ fn run_case(case: &Case) -> Result<(), String> {
             ));
         }
         let crash = crash_json_from(&bundles[0]);
-        check(case.expect, &crash)?;
+        check(case.expect, &crash).map_err(|e| {
+            format!(
+                "{e}\n    crash.info left by the child: {left_behind}\n    child status: {:?}, stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        })?;
 
         // Common to every report, however the process died.
         if crash["source_sdk"] != "rust" {

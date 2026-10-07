@@ -132,6 +132,26 @@ fn child() {
             // SAFETY: deliberate null write.
             unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
         }
+        // The thread already has a SMALL alternate stack (Rust gives its threads
+        // one sized for its own tiny handler). Unwinding in our handler must not
+        // overflow it, or the crash arrives without frames.
+        "small_altstack" => {
+            // SAFETY: leaks an 8 KiB buffer as this thread's alternate stack.
+            unsafe {
+                let buf = Box::leak(vec![0u8; 8 * 1024].into_boxed_slice());
+                let st = libc::stack_t {
+                    ss_sp: buf.as_mut_ptr().cast(),
+                    ss_flags: 0,
+                    ss_size: buf.len(),
+                };
+                assert_eq!(libc::sigaltstack(&st, std::ptr::null_mut()), 0);
+            }
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            // SAFETY: deliberate null write.
+            unsafe {
+                std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+            };
+        }
         other => panic!("unknown kind {other}"),
     }
     std::process::exit(0);
@@ -199,4 +219,23 @@ fn a_sent_signal_swallowed_by_the_host_leaves_no_marker() {
         out.status
     );
     assert!(marker.contains("address=0x0\n"), "{marker:?}");
+}
+
+#[test]
+fn a_small_existing_alternate_stack_still_yields_frames() {
+    child();
+    let (out, marker) = run(
+        "small_altstack",
+        "a_small_existing_alternate_stack_still_yields_frames",
+    );
+    assert!(
+        matches!(out.status.signal(), Some(libc::SIGSEGV | libc::SIGBUS)),
+        "{:?}",
+        out.status
+    );
+    assert!(marker.contains("signal=11"), "{marker:?}");
+    assert!(
+        marker.contains("frame=0x"),
+        "the handler must not overflow a small alternate stack: {marker:?}"
+    );
 }
