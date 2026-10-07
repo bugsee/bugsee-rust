@@ -1927,6 +1927,16 @@ mod imp {
         /// report twice (eagerly for a stack overflow, then again from the
         /// `abort()` that follows it) appends them once.
         static FRAMED: AtomicU64 = AtomicU64::new(0);
+        /// The thread and PC of the last fault a host returned from without doing
+        /// anything, and how many times in a row that has happened. One such return
+        /// is normal (a swallowed `raise`, which macOS delivers looking exactly like
+        /// a fault); the same fault coming straight back is a loop.
+        static NOOP_TID: AtomicI32 = AtomicI32::new(0);
+        static NOOP_PC: AtomicUsize = AtomicUsize::new(0);
+        static NOOP_RUN: AtomicUsize = AtomicUsize::new(0);
+        /// Consecutive no-op returns at one PC after which the process is ended.
+        const NOOP_LIMIT: usize = 3;
+
         /// How many faults are between "header written" and "outcome known". Only
         /// the first writes `crash.info` up front (see `record_header`).
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -2223,11 +2233,36 @@ mod imp {
             (first, generation)
         }
 
+        /// Record whether the host did nothing about this fault; `true` once the same
+        /// fault has come back `NOOP_LIMIT` times with the host doing nothing.
+        fn is_noop_loop(tid: i32, pc: usize, noop: bool) -> bool {
+            if !noop {
+                NOOP_RUN.store(0, Ordering::Release);
+                return false;
+            }
+            if NOOP_TID.load(Ordering::Acquire) == tid && NOOP_PC.load(Ordering::Acquire) == pc {
+                NOOP_RUN.fetch_add(1, Ordering::AcqRel) + 1 >= NOOP_LIMIT
+            } else {
+                NOOP_TID.store(tid, Ordering::Release);
+                NOOP_PC.store(pc, Ordering::Release);
+                NOOP_RUN.store(1, Ordering::Release);
+                false
+            }
+        }
+
         /// This fault is decided (recovered or about to be fatal): it is no longer
         /// in flight.
         fn end_flight() {
-            let _ =
-                IN_FLIGHT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            // (`fetch_update` is deprecated on newer toolchains and its replacement
+            // is newer than the MSRV, so spell the loop out.)
+            let mut n = IN_FLIGHT.load(Ordering::Acquire);
+            while n > 0 {
+                match IN_FLIGHT.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => break,
+                    Err(now) => n = now,
+                }
+            }
         }
 
         /// A fault that did not write its header up front and has turned out fatal:
@@ -2564,8 +2599,9 @@ mod imp {
                 unsafe { die_of(sig, info) };
                 return;
             }
-            let did_nothing = h != libc::SIG_IGN
+            let noop = h != libc::SIG_IGN
                 && unsafe { call_host(prev, tid, sig, info, uc, regs, generation) };
+            let did_nothing = is_noop_loop(tid, regs.pc, noop);
             if did_nothing || unsafe { host_declined(sig, info) } {
                 // The process is about to die of this fault: finish the report.
                 unsafe { finish_fatal(tid, path, sig, info, regs, generation) };
