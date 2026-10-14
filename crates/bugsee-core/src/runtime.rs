@@ -1280,6 +1280,13 @@ fn recover_one(
                 true
             } else {
                 hold_in_memory(shared, assembled);
+                // A failed WRITE says nothing about the evidence (the volume is
+                // full or read-only), unlike an assemble failure, so it must not
+                // use up the session's attempts: a supervisor crash loop would
+                // kill the process before the memory copy is sent, and three such
+                // launches would discard a crash that was never delivered. The
+                // launch pass keeps its claim so the worker does not hold it twice.
+                recovery::undo_attempt(data_dir, pending);
                 false
             }
         }
