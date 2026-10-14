@@ -395,8 +395,13 @@ pub(crate) fn newest_mtime(dir: &Path, depth: u32) -> Option<i64> {
         let name = entry.file_name();
         if matches!(
             name.to_str(),
-            Some("panic.info" | "crash.info" | "crash.modules")
+            Some("panic.info" | "panic.unwinding" | "crash.info" | "crash.modules")
         ) {
+            continue;
+        }
+        // Rotation creates empty part directories whether or not anything was
+        // captured; only files are capture activity.
+        if meta.is_dir() && depth == 0 {
             continue;
         }
         let mut t = meta

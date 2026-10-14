@@ -853,6 +853,15 @@ impl Drop for Recorder {
         // thread leaves the marker, so the next launch recovers the session
         // too, and finds this record already there (`finalize_dead` is
         // idempotent), so the clean end is counted once and as what it was.
+        if std::thread::panicking() && self.session.is_some() {
+            // Dying of a panic: say so beside the parts, so recovery does not
+            // have to guess from the clock whether the panic snapshot is stale
+            // (a slow unwind keeps the worker capturing for a while).
+            let _ = std::fs::write(
+                self.gen_dir().join(crate::panic_info::PANIC_UNWINDING_NAME),
+                b"",
+            );
+        }
         if !std::thread::panicking() {
             if let Some(health) = self.shared.health.lock().take() {
                 health.finish_clean(self.shared.health_errors.load(Ordering::SeqCst));

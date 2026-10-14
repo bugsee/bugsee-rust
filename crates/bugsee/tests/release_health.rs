@@ -95,6 +95,19 @@ fn run_child(kind: &str, dir: &str) -> ! {
             let _keep = &guard;
             panic!("health-e2e-deliberate-panic");
         }
+        // A destructor that takes longer than the panic-snapshot freshness tail
+        // runs before the guard drops, with the recorder still capturing.
+        "slow_unwinding_panic" => {
+            struct SlowDrop;
+            impl Drop for SlowDrop {
+                fn drop(&mut self) {
+                    std::thread::sleep(Duration::from_millis(6500));
+                }
+            }
+            let _keep = &guard;
+            let _slow = SlowDrop;
+            panic!("health-e2e-slow-panic");
+        }
         "exit_without_shutdown" => std::process::exit(3),
         other => panic!("unknown kind {other}"),
     }
@@ -148,6 +161,12 @@ fn cases() -> Vec<Case> {
         },
         Case {
             kind: "unwinding_panic",
+            dies: true,
+            status: SessionStatus::Crashed,
+            min_errors: 0,
+        },
+        Case {
+            kind: "slow_unwinding_panic",
             dies: true,
             status: SessionStatus::Crashed,
             min_errors: 0,

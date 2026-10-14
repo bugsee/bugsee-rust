@@ -437,8 +437,20 @@ const PANIC_TAIL_MS: i64 = 5_000;
 /// boundary of ours catches it (or the hook reports a worker-thread panic), so
 /// one left by a panic the app survived, caught by a foreign `catch_unwind`, is
 /// still there when the process is later SIGKILLed. A session that kept
-/// capturing long after the snapshot was not killed by it.
+/// capturing long after the snapshot was not killed by it. A slow unwind keeps
+/// the worker capturing too, so the recorder marks that case explicitly
+/// ([`crate::panic_info::PANIC_UNWINDING_NAME`]) and the clock only decides when
+/// there is no such mark.
 fn panic_is_recent(pending: &PendingSession, info: &PanicInfo) -> bool {
+    // The recorder was dropped while unwinding from a panic: the process died of
+    // it, however long the unwind took.
+    if pending
+        .parts_dir
+        .join(crate::panic_info::PANIC_UNWINDING_NAME)
+        .exists()
+    {
+        return true;
+    }
     match crate::health::newest_mtime(&pending.parts_dir, 3) {
         Some(last) => info.timestamp == 0 || last - info.timestamp <= PANIC_TAIL_MS,
         None => true,
@@ -979,6 +991,12 @@ mod tests {
         assert_eq!(dead_status(&pending), SessionStatus::Abnormal);
         let report = build_report(&pending, 5_000);
         assert!(String::from_utf8_lossy(&report.crash_json).contains("AppExit"));
+
+        // A slow unwind (the recorder dropped while panicking, long after the
+        // panic) is marked, and the mark settles it without the clock.
+        std::fs::write(parts.join(crate::panic_info::PANIC_UNWINDING_NAME), b"").unwrap();
+        assert_eq!(dead_status(&pending), SessionStatus::Crashed);
+        std::fs::remove_file(parts.join(crate::panic_info::PANIC_UNWINDING_NAME)).unwrap();
 
         // A fresh snapshot (the panic that killed it) is still a crash.
         PanicInfo {
