@@ -648,7 +648,7 @@ impl Drop for Recorder {
                 let _ = handle.join();
             }
         }
-        // Only mark a genuinely clean shutdown. If either thread merely DETACHED
+        // Only mark a genuinely clean shutdown. If the capture worker merely DETACHED
         // (didn't ack in time — e.g. a slow flush), it may still be writing this
         // session's data, so removing the marker now would make next-launch
         // recovery miss the generation entirely if the process then dies mid-tail.
@@ -666,7 +666,13 @@ impl Drop for Recorder {
         // A panic that was merely *contained* never reaches here while
         // unwinding, and its snapshot is deleted by `report_caught`, so this
         // cannot turn a handled panic into a phantom crash.
-        if worker_acked && uploader_acked && !std::thread::panicking() {
+        // The uploader is deliberately NOT part of this condition: it never
+        // writes session parts, and it can be inside an HTTP call that no signal
+        // can interrupt (connect/read timeouts are tens of seconds). Waiting on
+        // it would turn every stop during a slow upload into a false
+        // abnormal-exit report. The cost is at-least-once delivery: a report
+        // whose upload was cut short is re-sent next launch.
+        if worker_acked && !std::thread::panicking() {
             if let Some(session) = &self.session {
                 session.end();
             }
@@ -1621,7 +1627,7 @@ fn drain_memory(
     // Each entry is tried once per call, whatever its outcome.
     let mut tried: Vec<u64> = Vec::new();
     loop {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(|d| Instant::now() >= d) || shared.stopping.load(Ordering::SeqCst) {
             break;
         }
         let now = epoch_ms();
@@ -1717,7 +1723,7 @@ fn drain_until_empty(
         }
         let now = epoch_ms();
         drain_memory(shared, backoff_base, true, false, Some(start + deadline));
-        for &data_dir in dirs {
+        'dirs: for &data_dir in dirs {
             for report in queue::list_pending(data_dir) {
                 let Some(_claim) = queue::try_claim(&report) else {
                     continue; // a peer is delivering it; the loop below waits it out
@@ -1737,7 +1743,7 @@ fn drain_until_empty(
                     false,
                 );
                 if start.elapsed() >= deadline || shared.stopping.load(Ordering::SeqCst) {
-                    break;
+                    break 'dirs;
                 }
             }
         }

@@ -16,23 +16,31 @@
 //! work on an ordinary thread, where taking locks, allocating and joining
 //! threads are all fine:
 //!
-//! - the previous disposition was the default (terminate): `shutdown` (flush,
-//!   then a clean stop, because the exit is deliberate), restore the default
-//!   disposition and re-raise the signal, so the process ends exactly as it
-//!   would have — same exit status — only later;
-//! - the previous disposition was a host handler, or "ignore": flush only. The
-//!   host decides whether and how to exit; it ends the session cleanly by
-//!   dropping the launch guard (or calling `stop`) on its way out.
+//! - the previous disposition was the default (terminate) and ours is still in
+//!   force: `shutdown` (flush, then a clean stop, because the exit is
+//!   deliberate), restore the default disposition and re-raise the signal, so
+//!   the process ends exactly as it would have — same exit status — only later;
+//! - anything else — the previous disposition was a host handler, or the host
+//!   installed its own handler AFTER ours (tokio, `signal-hook`), which is
+//!   detected by asking the kernel what is in force before acting: flush only,
+//!   never terminate. The host decides whether and how to exit; it ends the
+//!   session cleanly by dropping the launch guard (or calling `stop`);
+//! - a signal that was ignored at install time (`SIG_IGN`: a background job,
+//!   `nohup`) is left alone and never armed.
 //!
-//! A second signal while the default-disposition shutdown is still running
-//! terminates immediately: an operator pressing Ctrl+C twice is not made to
-//! wait out the flush timeout.
+//! A second terminating signal while the first is still being served, or any
+//! signal when the watcher is gone (or in a `fork` child), terminates at once:
+//! an operator pressing Ctrl+C twice is not made to wait out the flush timeout.
 //!
 //! # Windows
 //!
 //! A console control handler. Windows runs it on a thread of its own, so it
 //! flushes in place, then returns `FALSE` so the next handler (the host's, or
-//! the default) still runs.
+//! the default) still runs. Close, logoff and shutdown also stop the SDK, as
+//! the process ends regardless. Ctrl+C and Ctrl+Break only flush: with no host
+//! handler the default one ends the process without a clean stop, so the next
+//! launch reports an abnormal exit (an earlier handler may instead swallow the
+//! event and keep running, which a stop here would wrongly cut short).
 
 use std::io;
 use std::time::Duration;
@@ -44,54 +52,63 @@ pub(crate) fn install(timeout: Duration) -> io::Result<()> {
 
 #[cfg(unix)]
 mod imp {
-    use std::cell::UnsafeCell;
     use std::io;
-    use std::mem::MaybeUninit;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use bugsee_core::fork::ForkMutex;
     use libc::{c_int, c_void};
 
     use crate::Bugsee;
 
     const SIGNALS: [c_int; 2] = [libc::SIGTERM, libc::SIGINT];
 
-    /// The dispositions in force before ours, indexed like [`SIGNALS`].
-    ///
-    /// Written only by `install`, before the `sigaction` that arms the handler,
-    /// and read by the handler afterwards — the same discipline the native crash
-    /// handler uses for its table.
-    struct Previous(UnsafeCell<[MaybeUninit<libc::sigaction>; 2]>);
-    // SAFETY: see above; there is no concurrent write once the handler is armed.
-    unsafe impl Sync for Previous {}
-    static PREVIOUS: Previous = Previous(UnsafeCell::new([MaybeUninit::uninit(); 2]));
+    /// What was in force before ours for one signal. Atomics, because the
+    /// handler itself may reset the handler (`SA_RESETHAND` emulation). The
+    /// host's signal mask is not kept here: it is installed as ours.
+    struct Slot {
+        handler: AtomicUsize,
+        flags: AtomicI32,
+    }
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const SLOT: Slot = Slot {
+        handler: AtomicUsize::new(libc::SIG_DFL),
+        flags: AtomicI32::new(0),
+    };
+    static SLOTS: [Slot; 2] = [SLOT; 2];
 
     /// Write end of the self-pipe; `-1` until installed.
     static PIPE_W: AtomicI32 = AtomicI32::new(-1);
     /// The process that owns the watcher thread. A `fork` child inherits the
-    /// handler but not the thread.
+    /// handler but not the thread. Stored AFTER `PIPE_W` (release) and loaded
+    /// before it (acquire), so an owner always sees its own pipe.
     static OWNER_PID: AtomicU32 = AtomicU32::new(0);
+    /// Whether the watcher thread is running to act on a pipe byte.
+    static WATCHER_ALIVE: AtomicBool = AtomicBool::new(false);
+    /// Terminating signals seen since the watcher last handled one. A second
+    /// one means the operator is impatient: die at once.
+    static PENDING: AtomicU32 = AtomicU32::new(0);
     static TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
-    /// Set by the watcher once a terminating shutdown has begun.
-    static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
-    /// Serialises `install` (never taken by the handler).
-    static INSTALL: Mutex<bool> = Mutex::new(false);
+    /// Whether the handler is armed. Serialises `install`; the lock is never
+    /// taken by the handler, and being a fork-aware lock a child never inherits
+    /// it held by a vanished thread.
+    static INSTALL: ForkMutex<bool> = ForkMutex::new(|| false);
 
     fn index(sig: c_int) -> Option<usize> {
         SIGNALS.iter().position(|s| *s == sig)
     }
 
-    /// The disposition that was in force before ours for `SIGNALS[idx]`.
-    ///
-    /// # Safety
-    /// The table must have been filled in (the handler only runs after that).
-    unsafe fn previous(idx: usize) -> libc::sigaction {
-        unsafe { (*PREVIOUS.0.get())[idx].assume_init() }
-    }
-
-    fn is_default(prev: &libc::sigaction) -> bool {
-        prev.sa_sigaction == libc::SIG_DFL
+    /// Whether our handler is still the one in force for `sig`. If not, someone
+    /// installed over us (the host after launch, e.g. tokio or `signal-hook`) and
+    /// owns the signal: we then only flush and never terminate the process.
+    fn current_is_ours(sig: c_int) -> bool {
+        // SAFETY: querying with a null new-action; async-signal-safe.
+        unsafe {
+            let mut cur: libc::sigaction = core::mem::zeroed();
+            libc::sigaction(sig, core::ptr::null(), &mut cur) == 0
+                && cur.sa_sigaction == handler as *const () as usize
+        }
     }
 
     /// Restore the default disposition and send ourselves `sig`. Every call is
@@ -123,25 +140,26 @@ mod imp {
     /// call into the previous handler.
     extern "C" fn handler(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
         // SAFETY: errno access and the calls below are async-signal-safe; the
-        // table is filled in before this handler is armed.
+        // slot is filled in before this handler is armed.
         unsafe {
             let saved_errno = *errno_location();
             let Some(idx) = index(sig) else { return };
-            let prev = previous(idx);
-            let prev_default = is_default(&prev);
-            let owner = libc::getpid() as u32 == OWNER_PID.load(Ordering::Relaxed);
+            let slot = &SLOTS[idx];
+            let prev = slot.handler.load(Ordering::SeqCst);
+            let prev_default = prev == libc::SIG_DFL;
+            let owner = OWNER_PID.load(Ordering::Acquire) == libc::getpid() as u32;
+            let live = owner && WATCHER_ALIVE.load(Ordering::SeqCst);
 
-            if !owner {
-                // A fork child: no watcher thread here. Behave as if we were not
-                // installed.
-                if prev_default {
+            if prev_default && current_is_ours(sig) {
+                // Nobody to flush (a fork child, or the watcher is gone), or a
+                // second signal while the first is still being served: behave
+                // as if we were not installed.
+                if !live || PENDING.fetch_add(1, Ordering::SeqCst) >= 1 {
                     die(sig);
                 }
-            } else {
-                if prev_default && SHUTTING_DOWN.load(Ordering::SeqCst) {
-                    die(sig);
-                }
-                let fd = PIPE_W.load(Ordering::Relaxed);
+            }
+            if live {
+                let fd = PIPE_W.load(Ordering::Acquire);
                 if fd >= 0 {
                     let byte = sig as u8;
                     // A full pipe means wake-ups are already pending: ignore.
@@ -149,13 +167,19 @@ mod imp {
                 }
             }
 
-            if !prev_default && prev.sa_sigaction != libc::SIG_IGN {
-                if prev.sa_flags & libc::SA_SIGINFO != 0 {
+            if !prev_default && prev != libc::SIG_IGN {
+                let flags = slot.flags.load(Ordering::SeqCst);
+                if flags & libc::SA_RESETHAND != 0 {
+                    // The host's one-shot handler has now fired: from here on
+                    // the previous disposition is the default again.
+                    slot.handler.store(libc::SIG_DFL, Ordering::SeqCst);
+                }
+                if flags & libc::SA_SIGINFO != 0 {
                     let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
-                        core::mem::transmute(prev.sa_sigaction);
+                        core::mem::transmute(prev);
                     f(sig, info, ctx);
                 } else {
-                    let f: extern "C" fn(c_int) = core::mem::transmute(prev.sa_sigaction);
+                    let f: extern "C" fn(c_int) = core::mem::transmute(prev);
                     f(sig);
                 }
             }
@@ -163,7 +187,16 @@ mod imp {
         }
     }
 
+    /// Clears [`WATCHER_ALIVE`] however the watcher thread ends.
+    struct AliveGuard;
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            WATCHER_ALIVE.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn watcher(read_fd: c_int) {
+        let _alive = AliveGuard;
         let mut byte = 0u8;
         loop {
             // SAFETY: reading one byte into a local.
@@ -179,19 +212,22 @@ mod imp {
             }
             let sig = byte as c_int;
             let Some(idx) = index(sig) else { continue };
-            // SAFETY: the table is filled in before the pipe can carry anything.
-            let prev = unsafe { previous(idx) };
             let timeout = Duration::from_millis(TIMEOUT_MS.load(Ordering::Relaxed));
-            if is_default(&prev) {
+            let prev_default = SLOTS[idx].handler.load(Ordering::SeqCst) == libc::SIG_DFL;
+            if prev_default && current_is_ours(sig) {
                 // The process is about to end because of this signal: finish
                 // cleanly, then let it end the way it would have.
-                SHUTTING_DOWN.store(true, Ordering::SeqCst);
                 let _ = std::panic::catch_unwind(|| Bugsee::shutdown(timeout));
-                die(sig);
-                // Still here: the signal did not kill us (blocked or ignored
-                // elsewhere). Carry on serving later signals.
-                SHUTTING_DOWN.store(false, Ordering::SeqCst);
+                // The host may have taken the signal over meanwhile.
+                if current_is_ours(sig) {
+                    die(sig);
+                }
+                // Still here: the signal did not kill us (blocked or taken over).
+                // Carry on serving later signals.
+                PENDING.store(0, Ordering::SeqCst);
             } else {
+                // Host-handled (its handler was before ours, or replaced ours):
+                // the host decides whether and how to exit.
                 let _ = std::panic::catch_unwind(|| Bugsee::flush(timeout));
             }
         }
@@ -201,23 +237,34 @@ mod imp {
     fn start_watcher() -> io::Result<()> {
         let mut fds = [0 as c_int; 2];
         // SAFETY: `fds` has room for the two descriptors `pipe` writes.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+        unsafe {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                if libc::pipe(fds.as_mut_ptr()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                for fd in fds {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
         }
         let (r, w) = (fds[0], fds[1]);
-        // SAFETY: fcntl on descriptors this function owns.
+        // SAFETY: fcntl on a descriptor this function owns. The handler must
+        // never block on a full pipe (the read end stays blocking).
         unsafe {
-            for fd in [r, w] {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            // The handler must never block on a full pipe.
             let flags = libc::fcntl(w, libc::F_GETFL);
             libc::fcntl(w, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+        WATCHER_ALIVE.store(true, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name("bugsee-termination".into())
             .spawn(move || watcher(r));
         if let Err(e) = spawned {
+            WATCHER_ALIVE.store(false, Ordering::SeqCst);
             // SAFETY: closing the descriptors created above.
             unsafe {
                 libc::close(r);
@@ -227,60 +274,71 @@ mod imp {
         }
         // The old write end (a fork child's inherited copy, or none) is left
         // open on purpose: closing a descriptor the handler may be using races.
-        OWNER_PID.store(std::process::id(), Ordering::SeqCst);
-        PIPE_W.store(w, Ordering::SeqCst);
+        PIPE_W.store(w, Ordering::Release);
+        OWNER_PID.store(std::process::id(), Ordering::Release);
         Ok(())
     }
 
     pub(super) fn install(timeout: Duration) -> io::Result<()> {
-        let mut installed = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut installed = INSTALL.lock();
         TIMEOUT_MS.store(
             timeout.as_millis().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
+        // First install, a retry after a failed one, or a fork child that
+        // inherited the handler without its watcher thread.
+        if OWNER_PID.load(Ordering::Acquire) != std::process::id() {
+            PENDING.store(0, Ordering::SeqCst);
+            start_watcher()?;
+        }
         if *installed {
-            // Already armed. In a fork child the watcher thread is gone: start one.
-            if OWNER_PID.load(Ordering::SeqCst) != std::process::id() {
-                SHUTTING_DOWN.store(false, Ordering::SeqCst);
-                start_watcher()?;
-            }
             return Ok(());
         }
 
-        // Record what is in force now, BEFORE arming.
+        let mut armed: Vec<(c_int, libc::sigaction)> = Vec::new();
         for (i, sig) in SIGNALS.iter().enumerate() {
-            // SAFETY: querying with a null new-action fills the old one.
-            unsafe {
+            // SAFETY: querying, then arming, with zeroed + filled structs. The
+            // slot is filled in before the `sigaction` that arms the handler.
+            let result = unsafe {
                 let mut cur: libc::sigaction = core::mem::zeroed();
                 if libc::sigaction(*sig, core::ptr::null(), &mut cur) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                (*PREVIOUS.0.get())[i] = MaybeUninit::new(cur);
-            }
-        }
-        start_watcher()?;
+                    Err(io::Error::last_os_error())
+                } else if cur.sa_sigaction == libc::SIG_IGN {
+                    // Ignored on purpose (a shell running us in the background,
+                    // `nohup`): that is the host's choice, leave it.
+                    continue;
+                } else {
+                    let slot = &SLOTS[i];
+                    slot.handler.store(cur.sa_sigaction, Ordering::SeqCst);
+                    slot.flags.store(cur.sa_flags, Ordering::SeqCst);
 
-        for (i, sig) in SIGNALS.iter().enumerate() {
-            // SAFETY: arming our handler with a zeroed + filled struct.
-            unsafe {
-                let prev = previous(i);
-                let mut sa: libc::sigaction = core::mem::zeroed();
-                sa.sa_sigaction = handler as *const () as usize;
-                // Keep the restart semantics the host chose; with no host
-                // handler there is nothing to preserve, and EINTR on every
-                // blocking call of every thread would only be a side effect of
-                // ours.
-                let host_handler = !is_default(&prev) && prev.sa_sigaction != libc::SIG_IGN;
-                sa.sa_flags = libc::SA_SIGINFO
-                    | if !host_handler || prev.sa_flags & libc::SA_RESTART != 0 {
-                        libc::SA_RESTART
+                    let host_handler = cur.sa_sigaction != libc::SIG_DFL;
+                    let mut sa: libc::sigaction = core::mem::zeroed();
+                    sa.sa_sigaction = handler as *const () as usize;
+                    // The host's mask, stack and restart choices carry over to
+                    // the chained call. With no host handler there is nothing to
+                    // preserve, and EINTR on every blocking call of every thread
+                    // would only be a side effect of ours.
+                    sa.sa_flags = libc::SA_SIGINFO
+                        | (cur.sa_flags & (libc::SA_RESTART | libc::SA_ONSTACK | libc::SA_NODEFER))
+                        | if host_handler { 0 } else { libc::SA_RESTART };
+                    sa.sa_mask = cur.sa_mask;
+                    if libc::sigaction(*sig, &sa, core::ptr::null_mut()) != 0 {
+                        Err(io::Error::last_os_error())
                     } else {
-                        0
-                    };
-                libc::sigemptyset(&mut sa.sa_mask);
-                if libc::sigaction(*sig, &sa, core::ptr::null_mut()) != 0 {
-                    return Err(io::Error::last_os_error());
+                        armed.push((*sig, cur));
+                        Ok(())
+                    }
                 }
+            };
+            if let Err(e) = result {
+                // Leave nothing half-armed, or a retry would record our own
+                // handler as "the previous one" and recurse into itself.
+                for (sig, old) in armed {
+                    // SAFETY: restoring what was read above.
+                    unsafe { libc::sigaction(sig, &old, core::ptr::null_mut()) };
+                }
+                return Err(e);
             }
         }
         *installed = true;

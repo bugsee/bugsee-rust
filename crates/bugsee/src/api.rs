@@ -11,7 +11,7 @@
 //! and after stop.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bugsee_core::errors::{self, Cause};
@@ -271,15 +271,20 @@ impl Bugsee {
     /// | `SIGTERM`/`SIGINT` without the hook, `SIGKILL`, OOM kill, power loss | Records are appended as the worker drains them, so completed records and queued reports survive; the last few in flight may not | One abnormal-exit report, carrying the recovered window |
     /// | Fatal signal, aborting panic, unwinding panic out of `main` | See the crash capture docs | One crash report |
     ///
-    /// Nothing is reported twice: a stopped session's marker is gone, and a
-    /// recovered one is consumed when its report is queued. In memory mode
+    /// A stopped session's marker is gone and a recovered one is consumed when
+    /// its report is queued, so a graceful stop followed by a restart reports
+    /// nothing twice. Delivery itself is **at-least-once**: a process killed
+    /// while a report's upload was in flight may send it again next launch. In
+    /// memory mode
     /// (see [`StorageMode`]) nothing survives the process, so `flush` before
     /// exiting is the only delivery guarantee.
     ///
     /// Bounds: `stop` waits at most 2 s each for the capture worker and the
-    /// uploader to acknowledge. If one does not (a host callback wedged), the
-    /// marker is deliberately left, so the session is recovered rather than
-    /// lost. It is not async-signal-safe and must not be called from a signal
+    /// uploader to acknowledge. If the worker does not (a host callback
+    /// wedged), the marker is deliberately left, so the session is recovered
+    /// rather than lost. The uploader does not gate the marker: an upload in
+    /// flight (an HTTP call can outlast the 2 s) is abandoned and its report
+    /// re-sent next launch. It is not async-signal-safe and must not be called from a signal
     /// handler (use [`Bugsee::install_termination_flush`]). In a `fork` child
     /// it acts on that child's own recorder.
     pub fn stop() {
@@ -304,8 +309,8 @@ impl Bugsee {
     /// the session cleanly whatever the flush returned. Returns the flush
     /// result: `true` if every report was delivered. `false` is not a loss —
     /// undelivered reports stay in the durable queue for the next launch (in
-    /// disk mode) — and also covers "not launched". Idempotent. Total time is
-    /// bounded by `timeout` plus the bounds documented on `stop`.
+    /// disk mode) — and also covers "not launched". Idempotent. Worst-case time is
+    /// `timeout` plus about 4 s (the two 2 s acknowledgement bounds on `stop`).
     pub fn shutdown(timeout: Duration) -> bool {
         let flushed = Self::flush(timeout);
         Self::stop();
@@ -340,9 +345,18 @@ impl Bugsee {
     ///   `timeout`. A service-control stop is not a console event and is not
     ///   covered; call [`Bugsee::shutdown`] from your stop handler.
     ///
+    ///
+    /// If the signal is ignored (`SIG_IGN`) when this is called, it is left
+    /// alone. If the host installs its own handler **after** this call, the SDK
+    /// notices (it asks the kernel what is in force) and only flushes, never
+    /// terminating the process; a host handler that itself calls `exit` while
+    /// [`LaunchOptions::flush_at_exit`] is on would run `shutdown` in signal
+    /// context and can deadlock, so end the process from a normal thread.
+    ///
     /// Idempotent; a second call only updates `timeout`. Works before `launch`
     /// (it flushes nothing until there is something to flush). Choose `timeout`
-    /// below your orchestrator's grace period (Kubernetes defaults to 30 s).
+    /// below your orchestrator's grace period (Kubernetes defaults to 30 s) by
+    /// at least the ~4 s stop bounds.
     pub fn install_termination_flush(timeout: Duration) -> io::Result<()> {
         crate::termination::install(timeout)
     }
@@ -565,24 +579,36 @@ impl Bugsee {
 
 /// Exit-time flush timeout in milliseconds, `0` when not requested.
 static EXIT_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+/// The process that registered the `atexit` handler. A `fork` child inherits
+/// the registration, and running `shutdown` there would revive the SDK in a
+/// process that may be mid-`fork`-and-`exec`; the child must do its own stop.
+static EXIT_FLUSH_PID: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(unix)]
 extern "C" {
     fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
 }
 
+#[cfg(unix)]
 extern "C" fn flush_at_exit() {
     let ms = EXIT_FLUSH_MS.load(Ordering::SeqCst);
-    if ms > 0 {
+    if ms > 0 && EXIT_FLUSH_PID.load(Ordering::SeqCst) == std::process::id() {
         let _ = std::panic::catch_unwind(|| Bugsee::shutdown(Duration::from_millis(ms)));
     }
 }
 
 /// Arm (or, with `None`, disarm) the `atexit` handler. libc cannot unregister
 /// it, so it is registered once per process and consults the timeout.
+///
+/// Unix only: on Windows `std::process::exit` calls `ExitProcess` directly and
+/// never runs CRT `atexit` handlers, and in a `cdylib` such a handler would run
+/// at DLL detach under the loader lock. Windows hosts call `shutdown`.
+#[cfg(unix)]
 fn register_exit_flush(timeout: Option<Duration>) {
     static REGISTERED: AtomicBool = AtomicBool::new(false);
     let ms = timeout.map_or(0, |t| t.as_millis().clamp(1, u64::MAX as u128) as u64);
     EXIT_FLUSH_MS.store(ms, Ordering::SeqCst);
+    EXIT_FLUSH_PID.store(std::process::id(), Ordering::SeqCst);
     if ms > 0 && !REGISTERED.swap(true, Ordering::SeqCst) {
         // SAFETY: registering a plain `extern "C"` function.
         unsafe {
@@ -590,6 +616,9 @@ fn register_exit_flush(timeout: Option<Duration>) {
         }
     }
 }
+
+#[cfg(not(unix))]
+fn register_exit_flush(_timeout: Option<Duration>) {}
 
 /// If this process was `fork()`ed since the SDK last looked, rebuild what the
 /// fork did not carry over. Cheap on the hot path: one atomic load.

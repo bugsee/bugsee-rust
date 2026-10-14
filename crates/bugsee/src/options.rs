@@ -137,7 +137,10 @@ impl LaunchOptions {
     ///
     /// It registers a libc `atexit` handler, so it does not run on `abort`, a
     /// fatal signal or `_exit` — those stay abnormal terminations, as they
-    /// should. Caveat: a panic that unwinds out of `main` while the launch
+    /// should — nor in a `fork` child (which must stop for itself). **Unix
+    /// only**: on Windows `process::exit` never runs CRT `atexit` handlers, so
+    /// the option is ignored there; call [`crate::Bugsee::shutdown`] before
+    /// exiting. Caveat: a panic that unwinds out of `main` while the launch
     /// guard has been leaked (`mem::forget`, a `static`) would be treated as a
     /// deliberate exit; keep the guard as a local in `main`.
     ///
