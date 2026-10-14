@@ -55,7 +55,7 @@ pub trait Transport: Send + Sync {
 ///
 /// `cached_endpoint` is a presigned upload URL a prior attempt obtained but
 /// failed to PUT to; when set, delivery resumes at the PUT instead of re-creating
-/// the issue (avoiding a duplicate issue / a `12003` drop of an un-uploaded
+/// the issue (avoiding a duplicate issue / a duplicate-verdict drop of an un-uploaded
 /// bundle). On a *transient* PUT failure the endpoint that should be persisted
 /// for the next retry is written to `endpoint_out`; on any other outcome
 /// `endpoint_out` is left `None` (the caller then clears any stale cache).
@@ -106,7 +106,7 @@ pub fn deliver(
                 return match transport.upload_bundle(&endpoint, &report.zip) {
                     Ok(()) => Ok(()),
                     // Persist the endpoint so the retry resumes at the PUT rather
-                    // than re-POSTing create_issue (duplicate issue / 12003 drop).
+                    // than re-POSTing create_issue (duplicate issue / duplicate-verdict drop).
                     Err(TransportError::Transient(e)) => {
                         *endpoint_out = Some(endpoint);
                         Err(TransportError::Transient(e))
