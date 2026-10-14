@@ -88,6 +88,7 @@ impl Bugsee {
             source,
             skipped,
             explicit_rejected,
+            recovery_dir,
             legacy_dir,
         } = options.resolve_data_dir();
         let memory_only = dir.is_none().then(|| {
@@ -96,9 +97,9 @@ impl Bugsee {
                 .or_else(|| (!skipped.is_empty()).then(|| skipped.join("; ")))
                 .unwrap_or_else(|| "no usable data directory".to_string())
         });
-        // Memory mode never touches the path; an empty one avoids resolving a
-        // temp directory just to ignore it.
-        let data_dir = dir.unwrap_or_default();
+        // In memory mode no new file is written there, but an existing directory
+        // is still drained and recovered from; with none, an empty path.
+        let data_dir = dir.or(recovery_dir).unwrap_or_default();
         if memory_only.is_none() && !skipped.is_empty() {
             static WARNED: AtomicBool = AtomicBool::new(false);
             bugsee_core::util::warn_once(

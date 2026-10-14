@@ -392,3 +392,36 @@ fn structural_report_fields_survive_scrubbing_unchanged() {
     };
     assert_eq!(req(&scrubbed), req(&plain));
 }
+
+#[test]
+fn recovered_crash_from_a_dead_session_is_scrubbed() {
+    use bugsee_core::capture::record;
+    let dir = TempDir::new();
+    // A session that died (marker left behind, owner gone) with a dirty log line.
+    let part = dir.0.join("parts").join("1").join("0");
+    std::fs::create_dir_all(&part).unwrap();
+    let payload = serde_json::to_vec(&json!({
+        "timestamp": 100, "level": 1, "source": 2, "message": dirty()
+    }))
+    .unwrap();
+    let mut bytes = Vec::new();
+    record::frame(100, &payload, &mut bytes);
+    std::fs::write(part.join("log.part"), &bytes).unwrap();
+    std::fs::create_dir_all(dir.0.join("sessions")).unwrap();
+    std::fs::write(dir.0.join("sessions").join("1.alive"), "0").unwrap();
+    std::fs::write(dir.0.join("gen"), "1").unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    let r = Recorder::launch(config(&dir), transport.clone()).unwrap();
+    assert!(r.flush(Duration::from_secs(10)));
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1, "the recovered crash");
+    let files = unzip_all(&bundles[0]);
+    let log = files.iter().find(|f| f.0.ends_with(".log.json")).unwrap();
+    assert!(log.1.contains("[email]"), "{}", log.1);
+    for (name, body) in files.iter().filter(|f| f.0 != ".apptoken") {
+        for secret in secrets() {
+            assert!(!body.contains(&secret), "{secret:?} survived in {name}");
+        }
+    }
+}

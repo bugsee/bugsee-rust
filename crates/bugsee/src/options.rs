@@ -333,6 +333,10 @@ pub(crate) struct DataDirResolution {
     pub skipped: Vec<String>,
     /// Why an explicit / environment directory was rejected (it is final).
     pub explicit_rejected: Option<String>,
+    /// A rejected candidate that nevertheless EXISTS as a directory (full or
+    /// read-only). It may hold reports and crashes a previous run persisted, so
+    /// it is still drained and recovered from; no new files are written to it.
+    pub recovery_dir: Option<PathBuf>,
     /// The location earlier SDK versions used by default
     /// (`<temp>/bugsee/<token>`), if it exists, is trustworthy and is not `dir`.
     /// Its leftovers are recovered once at launch.
@@ -363,13 +367,15 @@ pub(crate) fn resolve_data_dir(
                 source,
                 skipped: Vec::new(),
                 explicit_rejected: None,
+                recovery_dir: None,
                 legacy_dir: None,
             },
             Err(e) => DataDirResolution {
+                explicit_rejected: Some(format!("{}: {e}", dir.display())),
+                recovery_dir: dir.is_dir().then_some(dir),
                 dir: None,
                 source: DataDirSource::None,
                 skipped: Vec::new(),
-                explicit_rejected: Some(format!("{}: {e}", dir.display())),
                 legacy_dir: None,
             },
         };
@@ -393,27 +399,36 @@ pub(crate) fn resolve_data_dir(
 
     let mut skipped = Vec::new();
     let mut found = None;
+    let mut recovery_dir = None;
     for (source, dir, private) in candidates {
         match prepare_dir(&dir, private) {
             Ok(()) => {
                 found = Some((source, dir));
                 break;
             }
-            Err(e) => skipped.push(format!("{}: {e}", dir.display())),
+            Err(e) => {
+                skipped.push(format!("{}: {e}", dir.display()));
+                // Only the user's own default location: the shared temp area is
+                // exactly where a planted directory would be refused.
+                if !private && recovery_dir.is_none() && dir.is_dir() {
+                    recovery_dir = Some(dir);
+                }
+            }
         }
     }
 
     let legacy = temp.join("bugsee").join(&token);
-    let legacy_dir = found
-        .as_ref()
-        .filter(|(_, dir)| legacy_is_adoptable(&legacy, dir))
-        .map(|_| legacy);
+    // Also with no usable directory: leftovers there are exactly what a launch
+    // that cannot write anywhere new should still deliver.
+    let chosen = found.as_ref().map(|(_, dir)| dir.as_path());
+    let legacy_dir = legacy_is_adoptable(&legacy, chosen).then_some(legacy);
     match found {
         Some((source, dir)) => DataDirResolution {
             dir: Some(dir),
             source,
             skipped,
             explicit_rejected: None,
+            recovery_dir: None,
             legacy_dir,
         },
         None => DataDirResolution {
@@ -421,7 +436,8 @@ pub(crate) fn resolve_data_dir(
             source: DataDirSource::None,
             skipped,
             explicit_rejected: None,
-            legacy_dir: None,
+            recovery_dir,
+            legacy_dir,
         },
     }
 }
@@ -533,16 +549,20 @@ fn owned_by_us(_meta: &std::fs::Metadata) -> bool {
 /// would let someone else's tree, or our own live data directory, be processed
 /// (recovering our live session as a crash). Paths are compared canonicalised,
 /// not as strings, so another spelling of our own directory is rejected too.
-fn legacy_is_adoptable(legacy: &Path, chosen: &Path) -> bool {
+fn legacy_is_adoptable(legacy: &Path, chosen: Option<&Path>) -> bool {
     let Some(parent) = legacy.parent() else {
         return false;
     };
     if !trusted_existing_dir(parent) || !trusted_existing_dir(legacy) {
         return false;
     }
-    match (legacy.canonicalize(), chosen.canonicalize()) {
-        (Ok(a), Ok(b)) => a != b,
-        _ => false,
+    let Ok(legacy) = legacy.canonicalize() else {
+        return false;
+    };
+    match chosen {
+        // No live directory of ours to collide with.
+        None => true,
+        Some(chosen) => chosen.canonicalize().is_ok_and(|c| c != legacy),
     }
 }
 
@@ -845,6 +865,50 @@ mod tests {
             r.legacy_dir.is_none(),
             "our live data directory must not be recovered as a legacy one"
         );
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_directory_that_exists_is_kept_for_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch();
+        let ro = s.join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(ro.join("p"), b"x").is_ok() {
+            let _ = std::fs::remove_dir_all(&s);
+            return; // permission bits not enforced (root)
+        }
+        let r = resolve_data_dir(Some(&ro), "tok", &env_of(&[]), &|| s.join("tmp"));
+        assert!(r.dir.is_none() && r.explicit_rejected.is_some());
+        assert_eq!(
+            r.recovery_dir.as_deref(),
+            Some(ro.as_path()),
+            "its queue and crashed sessions must still be drained"
+        );
+
+        // A missing directory has nothing to recover.
+        let r = resolve_data_dir(Some(&blocked(&s, "f5")), "tok", &env_of(&[]), &|| {
+            s.join("tmp")
+        });
+        assert!(r.recovery_dir.is_none());
+        let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_location_is_adopted_even_when_no_new_default_is_usable() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let legacy = tmp.join("bugsee").join("tok");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // The private temp name is occupied by a symlink, and there is no home.
+        std::os::unix::fs::symlink(s.join("elsewhere"), tmp.join(private_temp_name())).unwrap();
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
+        assert!(r.dir.is_none(), "no new directory is usable");
+        assert_eq!(r.legacy_dir, Some(legacy));
         let _ = std::fs::remove_dir_all(&s);
     }
 
