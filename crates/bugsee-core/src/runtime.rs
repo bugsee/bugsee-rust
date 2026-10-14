@@ -424,11 +424,14 @@ impl Recorder {
             config.upload_backoff_base,
             config.sampler,
             true,
-            config
-                .legacy_data_dir
-                .into_iter()
-                .chain(config.extra_data_dirs)
-                .collect(),
+            distinct_extra_dirs(
+                &data_dir,
+                config
+                    .legacy_data_dir
+                    .into_iter()
+                    .chain(config.extra_data_dirs)
+                    .collect(),
+            ),
         )?;
 
         Ok(Recorder {
@@ -841,6 +844,23 @@ fn report_into(
     }
 }
 
+/// `extra` without duplicates and without `data_dir` itself, compared by
+/// canonical path. Recovering one directory twice in a launch would deliver its
+/// sessions twice and burn their attempt cap.
+fn distinct_extra_dirs(data_dir: &Path, extra: Vec<PathBuf>) -> Vec<PathBuf> {
+    let key = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut seen = vec![key(data_dir)];
+    let mut out = Vec::new();
+    for dir in extra {
+        let k = key(&dir);
+        if !seen.contains(&k) {
+            seen.push(k);
+            out.push(dir);
+        }
+    }
+    out
+}
+
 /// Claim a session and open its part store, or fail without leaving a liveness
 /// marker behind (a marker with no store would be recovered as a phantom crash).
 fn open_disk(data_dir: &Path, caps: WindowCaps) -> std::io::Result<(Session, PartStore)> {
@@ -937,6 +957,10 @@ fn spawn_pipeline(
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 for dir in &legacy_data_dirs {
+                    let known = queue::blacklisted_signatures(dir);
+                    if !known.is_empty() {
+                        worker_shared.mem_blacklist.lock().extend(known);
+                    }
                     queue::gc_orphans(dir);
                     run_recovery(&worker_shared, dir, u64::MAX);
                 }
