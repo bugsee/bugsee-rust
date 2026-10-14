@@ -317,9 +317,21 @@ fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
         let excluded = match stem {
             // `author`/`authority` (but not `authorization`), and
             // `www-authenticate`/`authentication`.
+            // Public OIDC/OAuth metadata is excluded too: `authorization_endpoint`
+            // /`_url`/`_uri`, `oauth*` names (`oauth_client_id`; token- and
+            // secret-bearing ones such as `oauth_token`/`oauth_client_secret`
+            // still hit the `token`/`secret` stems), and `auth_method`/
+            // `token_endpoint_auth_signing_alg`.
             b"auth" => {
                 (rest.starts_with(b"or") && !rest.starts_with(b"oriz"))
                     || rest.starts_with(b"enticat")
+                    || (rest.starts_with(b"orization")
+                        && [&b"endpoint"[..], b"url", b"uri"]
+                            .iter()
+                            .any(|x| rest[9..].starts_with(x)))
+                    || before.ends_with(b"o")
+                    || rest.starts_with(b"method")
+                    || rest.starts_with(b"signingalg")
             }
             // `tokenizer`, `token_type`/`_count`/`_ttl`/`_endpoint`/`_url`, and
             // `cancellation_token` (a cooperative-cancel handle, not a secret).
@@ -2043,6 +2055,20 @@ mod tests {
             "session_timeout",
             "keyboard",
             "monkey",
+            "authorization_endpoint",
+            "authorization_url",
+            "authorization_uri",
+            "oauth",
+            "oauth_client_id",
+            "oauth2_redirect_uri",
+            "token_endpoint_auth_method",
+            "token_endpoint_auth_signing_alg_values_supported",
+            "auth_method",
+            "client_id",
+            "redirect_uri",
+            "issuer",
+            "jwks_uri",
+            "scope",
             "cancellation_token",
             "CancellationToken",
             "www-authenticate",
@@ -2061,6 +2087,10 @@ mod tests {
         }
         for k in [
             "authorization",
+            "oauth_token",
+            "oauth_client_secret",
+            "oauth_access_token",
+            "id_token",
             "auth",
             "oauth_token",
             "access_token",

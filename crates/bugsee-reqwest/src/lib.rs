@@ -421,6 +421,26 @@ mod tests {
         assert!(s.contains("token_ttl=9") && !s.contains("zzz"), "{s}");
         assert!(!is_sensitive_header("WWW-Authenticate"));
         assert!(!is_sensitive_header("token_url"));
+        // Public OIDC/OAuth metadata stays readable; credentials do not.
+        let url = reqwest::Url::parse(
+            "https://idp.example.com/cb?authorization_endpoint=a&oauth_client_id=b\
+             &token_endpoint_auth_method=c&client_id=d&redirect_uri=e&oauth_token=zzz\
+             &oauth_client_secret=yyy",
+        )
+        .unwrap();
+        let s = sanitize_url(&url);
+        for keep in [
+            "authorization_endpoint=a",
+            "oauth_client_id=b",
+            "token_endpoint_auth_method=c",
+            "client_id=d",
+            "redirect_uri=e",
+        ] {
+            assert!(s.contains(keep), "{keep} in {s}");
+        }
+        assert!(!s.contains("zzz") && !s.contains("yyy"), "{s}");
+        assert!(!is_sensitive_header("authorization_endpoint"));
+        assert!(is_sensitive_header("oauth_client_secret"));
         assert!(is_sensitive_header("Authorization"));
     }
 
