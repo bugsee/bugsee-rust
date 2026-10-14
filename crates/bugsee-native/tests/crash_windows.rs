@@ -6,7 +6,8 @@
 //
 //! Windows fatal-crash cases beyond the plain access violation covered by
 //! `crash_subprocess.rs`: a real stack overflow (the handler runs with almost no
-//! stack) and a wedged handler (the watchdog must end the process).
+//! stack), a wedged handler (the watchdog must end the process), and the abort
+//! paths: the CRT `abort()` (observable) versus Rust's fast-fail `abort()` (not).
 //!
 //! Each case runs in a child process that re-enters the same test function.
 
@@ -48,6 +49,20 @@ fn run_as_child_if_requested() {
             })
             .join()
             .unwrap();
+        }
+        "crt_abort" => {
+            // The CRT's `abort()` (C/C++ code, `std::terminate`): raises SIGABRT,
+            // which the SDK's handler hooks.
+            unsafe extern "C" {
+                fn abort() -> !;
+            }
+            // SAFETY: deliberately aborting.
+            unsafe { abort() }
+        }
+        "rust_abort" => {
+            // Rust's `abort()` (and so an aborting panic) is a fast-fail
+            // (`int 0x29`), which no in-process handler can see.
+            std::process::abort()
         }
         "wedged_handler" => {
             bugsee_native::wedge_handler_for_test();
@@ -129,6 +144,30 @@ fn windows_crashes() {
             "[{kind}] no frames recorded: {marker:?}"
         );
     }
+
+    // The CRT abort() IS observable: SIGABRT, reported as the abort family.
+    let (output, marker) = spawn_child("crt_abort");
+    assert!(!output.status.success(), "[crt_abort] child must die");
+    assert!(
+        marker.contains("signal=6"),
+        "[crt_abort] no SIGABRT marker: {marker:?}"
+    );
+
+    // Rust's abort() is NOT: the kernel ends the process with the fast-fail
+    // status and nothing in-process runs, so there is no marker. This pins the
+    // documented limit (DESIGN.md section 12) - recovery falls back to the panic
+    // snapshot, or an abnormal-exit report.
+    let (output, marker) = spawn_child("rust_abort");
+    assert_eq!(
+        output.status.code().map(|c| c as u32),
+        Some(0xC000_0409),
+        "Rust abort() is a fast-fail (STATUS_STACK_BUFFER_OVERRUN): {:?}",
+        output.status
+    );
+    assert!(
+        marker.is_empty(),
+        "a fast-fail must not reach an in-process handler: {marker:?}"
+    );
 
     // A handler that never returns must be ended by the watchdog.
     let started = std::time::Instant::now();

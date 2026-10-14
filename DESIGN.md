@@ -258,6 +258,25 @@ That last case previously produced **no report whatsoever** — the SDK shut dow
 **Recursion guard:** `NORMAL→PANICKING→HANDLING_FATAL→SECONDARY`; second fatal → tiny marker + terminate, no re-entry.
 **Quarantine:** Class A (continue) / B (restart) / C (rebuild instance) / D (disable); restart budget (1 immediate, 3/10 min, then disable) — never infinite.
 **Coexistence:** chain prior hook + signal handlers; never destructive-uninstall; `native_crash_capture=false` when host owns native.
+**Windows termination paths (what each yields).** `bugsee-native` hooks, through `crash-handler`, the unhandled-exception filter, a first-position vectored handler (heap corruption only), the CRT invalid-parameter and purecall handlers, and CRT `SIGABRT`. Anything the kernel ends without dispatching an exception to the process cannot be seen in-process; the result is then whatever the panic observer or session marker left behind.
+
+| Termination path | Observable in-process? | Next-launch report |
+|---|---|---|
+| Access violation, illegal/privileged instruction, divide/overflow, alignment, in-page error, breakpoint | yes (unhandled-exception filter) | native crash with frames (`SIGSEGV`/`SIGILL`/`SIGFPE`/`SIGBUS`/`SIGTRAP`) |
+| Stack overflow (main or other thread) | yes (handler runs on the guard-page remainder; header written first) | native crash, `SIGSEGV` |
+| Heap corruption (`0xC0000374`) | yes (vectored handler) | native crash, `SIGABRT` |
+| CRT `abort()` / C++ `std::terminate` / failed C `assert` | yes (CRT `SIGABRT` hook) | native crash, `SIGABRT` (correlated with the panic snapshot if one is fresh) |
+| CRT invalid-parameter, pure virtual call | yes (CRT handlers) | native crash, `SIGABRT` |
+| Exception with a fast-fail code (`0xC0000409`, `0xC0000602`, `0xC0000420`) raised as an ordinary exception (e.g. old `/GS` reporter via the filter) | yes, if it reaches the filter | native crash, `SIGABRT` |
+| Rust `std::process::abort()` and `panic = "abort"` (`int 0x29`, exit status `0xC0000409`) | **no** | with a panic snapshot (`panic = "abort"`): the panic report. Without one (bare `abort()`): abnormal exit |
+| Native `__fastfail` / `/GS` stack-cookie failure / `RaiseFailFastException` with no debugger (bypass all handlers) | **no** | abnormal exit |
+| `TerminateProcess` / task-manager kill / job-object kill / OOM kill / power loss | **no** | abnormal exit |
+| Handler wedged or faulting | watchdog thread ends the process (exit `0x42554753`) | header-only or no marker; abnormal exit |
+| A DLL with its own *static* CRT calling its `abort()` | no (each CRT has its own `SIGABRT` table) | abnormal exit |
+| Host replaces the unhandled-exception filter after install | no for faults that reach the filter | abnormal exit |
+
+Tests: `crates/bugsee-native/tests/crash_windows.rs` pins the stack-overflow, CRT-abort, Rust-abort (no marker, status `0xC0000409`) and wedged-handler rows; the exception-code mapping is unit-tested on every platform. Rows marked "no" cannot be closed in-process: they need the **out-of-process monitor** (issue #17), which observes the death from outside. Until then the abnormal-exit report is the floor, and an aborting panic stays attributable through the panic snapshot written before `abort()`.
+
 **Edge cases:** double-panic in `Drop`; foreign C++/ObjC exceptions (shim, never `catch_unwind`); stack overflow (alt-stack); OOM/OS-kill (inferred); disk-full (drop + internal log); multi-process sharing the data dir (per-pid `gen` subdirs + dir lock).
 
 ## 13. Testing strategy — red-green TDD, E2E per flow
