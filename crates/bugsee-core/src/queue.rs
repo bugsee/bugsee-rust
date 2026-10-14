@@ -186,6 +186,11 @@ fn blacklist_path(data_dir: &Path) -> PathBuf {
     queue_dir(data_dir).join(".blacklist")
 }
 
+/// The locally blacklisted signatures in `data_dir` (empty if none or unreadable).
+pub fn blacklisted_signatures(data_dir: &Path) -> BTreeSet<String> {
+    load_blacklist(data_dir)
+}
+
 fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
     std::fs::read_to_string(blacklist_path(data_dir))
         .map(|s| {

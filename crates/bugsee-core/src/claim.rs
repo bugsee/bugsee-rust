@@ -86,7 +86,14 @@ fn claim_state(path: &Path) -> ClaimState {
                 // Take over a claim whose owner is gone, then retry the create.
                 // Losing the race to another taker just means `create_new` fails
                 // again and we report the claim as held.
-                let _ = std::fs::remove_file(path);
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    // Someone else took it over first: retry the create.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // A read-only or full volume will not let us clear it, so no
+                    // claim can ever be made here: not "held by someone else".
+                    Err(_) => return ClaimState::Unavailable,
+                }
             }
             // Directory missing / unwritable: nothing can be claimed, and the
             // caller's own I/O will fail more usefully than we can here.
@@ -148,6 +155,25 @@ mod tests {
         assert!(try_claim(&path).is_none());
         #[cfg(not(unix))]
         assert!(try_claim(&path).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_claim_that_cannot_be_removed_is_unavailable_not_taken() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let path = dir.join("x.claim");
+        std::fs::write(&path, "4294967290").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(dir.join("nonexistent-probe")).is_ok()
+            || std::fs::write(dir.join("probe"), b"x").is_ok()
+        {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            return; // permission bits not enforced (root)
+        }
+        // Proceed unclaimed instead of skipping the work as "held elsewhere".
+        assert!(matches!(try_claim_lenient(&path), Some(None)));
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     }
 
     #[test]
