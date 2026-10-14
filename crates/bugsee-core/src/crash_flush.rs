@@ -386,19 +386,12 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::{serve_request, ACKED, REQUESTED};
+    use crate::win32::{
+        CreateEventW, GetCurrentThreadId, Handle, QueryPerformanceCounter,
+        QueryPerformanceFrequency, SetEvent, WaitForSingleObject, WAIT_OBJECT_0,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-
-    type Hnd = usize;
-
-    extern "system" {
-        fn CreateEventW(attrs: *const u8, manual: i32, initial: i32, name: *const u16) -> Hnd;
-        fn SetEvent(h: Hnd) -> i32;
-        fn WaitForSingleObject(h: Hnd, ms: u32) -> u32;
-        fn GetCurrentThreadId() -> u32;
-        fn QueryPerformanceCounter(v: *mut i64) -> i32;
-        fn QueryPerformanceFrequency(v: *mut i64) -> i32;
-    }
 
     /// Auto-reset events, never closed: the handler signals `WAKE`, the helper
     /// signals `ACK`. (`0` when none.)
@@ -418,16 +411,18 @@ mod imp {
                 CreateEventW(core::ptr::null(), 0, 0, core::ptr::null()),
             )
         };
-        if wake == 0 || ack == 0 {
+        if wake.is_null() || ack.is_null() {
             return Err(std::io::Error::last_os_error());
         }
+        // Raw handles are not `Send`; carry them as integers.
+        let (wake, ack) = (wake as usize, ack as usize);
         std::thread::Builder::new()
             .name("bugsee-crash-flush".into())
             .spawn(move || {
                 let _me = super::register_pipeline_thread();
                 loop {
                     // SAFETY: waits on an event that is never closed.
-                    if unsafe { WaitForSingleObject(wake, u32::MAX) } != 0 {
+                    if unsafe { WaitForSingleObject(wake as Handle, u32::MAX) } != WAIT_OBJECT_0 {
                         break;
                     }
                     serve_request();
@@ -442,7 +437,7 @@ mod imp {
         let h = ACK.load(Ordering::Acquire);
         if h != 0 {
             // SAFETY: signals a live event.
-            unsafe { SetEvent(h) };
+            unsafe { SetEvent(h as Handle) };
         }
     }
 
@@ -468,7 +463,7 @@ mod imp {
         let (start, freq) = now_ticks();
         let budget_ms = budget.as_millis().min(i64::MAX as u128 / freq as u128 / 2) as i64;
         // SAFETY: SetEvent/WaitForSingleObject take no locks we could be holding.
-        unsafe { SetEvent(wake) };
+        unsafe { SetEvent(wake as Handle) };
         while ACKED.load(Ordering::Acquire) < ticket {
             let (now, _) = now_ticks();
             let elapsed_ms = (now - start).saturating_mul(1000) / freq;
@@ -480,7 +475,7 @@ mod imp {
             // consumed the (auto-reset) signal.
             let ms = left_ms.clamp(1, 5) as u32;
             // SAFETY: as above.
-            unsafe { WaitForSingleObject(ack, ms) };
+            unsafe { WaitForSingleObject(ack as Handle, ms) };
         }
         true
     }

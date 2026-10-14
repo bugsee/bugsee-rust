@@ -98,22 +98,7 @@ pub(crate) fn is_alive(_pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-mod win {
-    //! The few kernel32 calls needed, declared directly: kernel32 is always
-    //! linked, so this avoids a dependency for three functions.
-    use std::ffi::c_void;
-
-    pub type Handle = *mut c_void;
-    pub const SYNCHRONIZE: u32 = 0x0010_0000;
-    pub const WAIT_TIMEOUT: u32 = 258;
-    pub const ERROR_ACCESS_DENIED: i32 = 5;
-
-    extern "system" {
-        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
-        pub fn CloseHandle(handle: Handle) -> i32;
-        pub fn WaitForSingleObject(handle: Handle, millis: u32) -> u32;
-    }
-}
+use crate::win32 as win;
 
 #[cfg(test)]
 mod tests {
