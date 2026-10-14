@@ -40,5 +40,7 @@ name = "crash_e2e_matrix"
 harness = false
 required-features = ["native"]
 
-[target.'cfg(unix)'.dev-dependencies]
+# Local UTC offset and the hardware model are libc calls on unix; `libc` is
+# already in the tree via `bugsee-core` / `bugsee-native`, so this adds nothing.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

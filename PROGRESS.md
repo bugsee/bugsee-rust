@@ -426,14 +426,19 @@ can fix.
    browser SDK is also the remaining producer exposed to the
    `platform.jailbreak` class of bug — the appserver fix protects it now, but its
    `EnvironmentPlatform` is still `{type, os, locale}`.
-3. **Two environment fields remain unpopulated**, both needing a decision rather
-   than effort. `utc_offset`: the `time` crate refuses a local offset in a
-   multithreaded process (an SDK always is one), so it needs `localtime_r`/Win32
-   and a small `unsafe` — which belongs in the host crate, not core.
-   `hardware.model`: no `sysinfo` API, per-platform work, and on desktop it
-   yields a mainboard string worth little until Phase 6 puts this SDK on mobile.
-   Windows `locale` is likewise unset — `GetUserDefaultLocaleName` needs a
-   binding or a crate, and this SDK still takes no new dependencies.
+3. **Environment fields `utc_offset`, `hardware.model` and Windows `locale` are
+   now populated** (#16), in `crates/bugsee/src/hostinfo.rs` — the one place in
+   the host crate that calls the OS, so the `unsafe` stays out of core. No new
+   dependencies: `libc` (already in the tree) on unix, hand-declared
+   `kernel32`/`advapi32` calls on Windows. `utc_offset` is `localtime_r`
+   `tm_gmtoff` / `GetTimeZoneInformation` (the `time` crate refuses a local
+   offset in a multithreaded process). `hardware.model` is `sysctl hw.model` on
+   macOS/iOS, DMI `product_name` then the device-tree `model` on Linux, and the
+   SMBIOS `SystemProductName` registry value on Windows; firmware placeholders
+   ("To Be Filled By O.E.M.") are reported as absent, and Android reports none.
+   Windows `locale` falls back to `GetUserDefaultLocaleName` when the POSIX
+   variables are unset. Windows code is type-checked and clippy-clean but its
+   tests have not been run on real hardware.
 
 ### Decided against
 
