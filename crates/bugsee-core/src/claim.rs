@@ -116,7 +116,9 @@ pub(crate) enum Probe {
 }
 
 /// Is `path` currently claimed? A missing file is free. A file that cannot be
-/// inspected is reported held: the conservative answer never disturbs a peer.
+/// inspected is [`Probe::Unknown`], never assumed held: a crashed session's
+/// leftover lock file must not hide the crash on a volume that has become
+/// read-only.
 ///
 /// On unix this asks (`F_GETLK`) without taking the lock, so a probe can never
 /// steal the lock from a creator that has made the file but not yet locked it.
@@ -128,20 +130,24 @@ pub(crate) fn probe(path: &Path) -> Probe {
     if !registry().insert(&key) {
         return Probe::Held; // held by a thread of this process, or being probed
     }
-    let result = match OpenOptions::new().read(true).write(true).open(path) {
+    // Read-only: a querying lock call needs no write access, and a leftover lock
+    // file on a read-only volume (or with 0444 mode) must still be probeable.
+    let result = match OpenOptions::new().read(true).open(path) {
         Ok(file) => {
             let r = match test_is_locked(&file) {
                 Ok(Peek::Free) => Probe::Free,
                 Ok(Peek::Held) => Probe::Held,
-                Ok(Peek::Unsupported) => Probe::Unknown,
-                Err(_) => Probe::Held,
+                // Cannot tell (no lock support, or the call failed): let the
+                // caller use another liveness signal rather than assume a live
+                // holder and hide a crash forever.
+                Ok(Peek::Unsupported) | Err(_) => Probe::Unknown,
             };
             drop(file); // close before leaving the registry
             r
         }
         // Vanished since the existence check: nothing holds it.
         Err(_) if !path.exists() => Probe::Free,
-        Err(_) => Probe::Held,
+        Err(_) => Probe::Unknown,
     };
     registry().remove(&key);
     result
@@ -240,8 +246,6 @@ fn key_of(path: &Path) -> PathBuf {
 enum Lock {
     Got,
     Contended,
-    /// Only unix can tell "locks unsupported" apart from other errors.
-    #[cfg_attr(not(unix), allow(dead_code))]
     Unsupported,
 }
 
@@ -446,6 +450,10 @@ mod os {
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
     const ERROR_LOCK_VIOLATION: i32 = 33;
+    // The filesystem has no byte-range locking (some network shares, FAT shims).
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    const ERROR_CALL_NOT_IMPLEMENTED: i32 = 120;
 
     #[repr(C)]
     struct Overlapped {
@@ -493,6 +501,9 @@ mod os {
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(ERROR_LOCK_VIOLATION) => Ok(Lock::Contended),
+            Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_CALL_NOT_IMPLEMENTED) => {
+                Ok(Lock::Unsupported)
+            }
             _ => Err(err),
         }
     }

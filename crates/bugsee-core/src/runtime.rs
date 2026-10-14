@@ -1078,8 +1078,11 @@ fn worker_loop(
     // sampled (F17). Instead we recv with a timeout bounded by the next rotation
     // deadline and run the tick whenever that deadline passes, message or not.
     let mut next_rotate = Instant::now() + rotate_interval;
+    let mut next_heartbeat = Instant::now() + HEARTBEAT_EVERY;
     loop {
-        let timeout = next_rotate.saturating_duration_since(Instant::now());
+        let timeout = next_rotate
+            .saturating_duration_since(Instant::now())
+            .min(HEARTBEAT_EVERY);
         match rx.recv_timeout(timeout) {
             Ok(Msg::Capture(entry)) => {
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
@@ -1159,11 +1162,30 @@ fn worker_loop(
         // elapsed — via a message OR a timeout — so steady traffic can't starve it.
         if Instant::now() >= next_rotate {
             rotate_tick(store.as_mut(), &shared, &mut sampler);
-            if let Some(marker) = &marker {
-                ensure_marker(&shared, marker);
-            }
             next_rotate = Instant::now() + rotate_interval;
         }
+        // Independent of the rotation interval (which a host may set large).
+        if Instant::now() >= next_heartbeat {
+            if let Some(marker) = &marker {
+                ensure_marker(&shared, marker);
+                touch_heartbeat(marker);
+            }
+            next_heartbeat = Instant::now() + HEARTBEAT_EVERY;
+        }
+    }
+}
+
+/// How often the worker checks the liveness marker and, for a session that could
+/// not take a file lock, touches its heartbeat file.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
+
+/// Touch this session's heartbeat file, if it keeps one (see
+/// `recovery::heartbeat_path`). Never creates it: a session with a kernel lock has
+/// none, and one that has ended must not leave one behind.
+fn touch_heartbeat(marker: &Path) {
+    let beat = recovery::heartbeat_path(marker);
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&beat) {
+        let _ = file.set_modified(std::time::SystemTime::now());
     }
 }
 
