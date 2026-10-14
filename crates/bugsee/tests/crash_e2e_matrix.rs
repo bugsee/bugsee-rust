@@ -127,6 +127,17 @@ fn run_child(kind: &str, dir: &str) -> ! {
             }));
             panic!("{PANIC_TEXT}");
         }
+        // The same on a worker thread: the SDK reports it inline (the process
+        // "survives" as far as the hook knows) and must still keep the snapshot,
+        // or the abort is recovered as a thin SIGABRT without the panic.
+        "aborting_panic_thread" => {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                previous(info);
+                std::process::abort();
+            }));
+            let _ = std::thread::spawn(|| panic!("{PANIC_TEXT}")).join();
+        }
         // Dies without running any destructor: no clean shutdown, no signal.
         "exit_without_shutdown" => std::process::exit(3),
         other => panic!("unknown crash kind {other}"),
@@ -218,6 +229,10 @@ fn cases() -> Vec<Case> {
     // correlation on POSIX, the surviving snapshot on Windows.
     v.push(Case {
         kind: "aborting_panic",
+        expect: Expect::Panic,
+    });
+    v.push(Case {
+        kind: "aborting_panic_thread",
         expect: Expect::Panic,
     });
     v

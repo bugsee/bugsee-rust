@@ -430,7 +430,7 @@ fn dead_status(pending: &PendingSession) -> crate::health::SessionStatus {
 /// How long after a panic snapshot the session may keep writing and still be
 /// the one the panic killed: unwinding out of `main` and the recorder's final
 /// flush take well under this.
-const PANIC_TAIL_MS: i64 = 10_000;
+const PANIC_TAIL_MS: i64 = 5_000;
 
 /// Whether a panic snapshot with no native crash beside it can be what ended
 /// this session. A snapshot is written for every panic and deleted only when a

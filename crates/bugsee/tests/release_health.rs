@@ -87,7 +87,7 @@ fn run_child(kind: &str, dir: &str) -> ! {
                 .spawn(|| panic!("worker-thread-panic"))
                 .unwrap()
                 .join();
-            std::thread::sleep(Duration::from_millis(2500));
+            std::thread::sleep(Duration::from_millis(6500));
             std::process::exit(3);
         }
         "segv" => fault_null(),
