@@ -1756,7 +1756,7 @@ fn process_report(
         return Ok(());
     }
 
-    // Suppress reports the server blacklisted (12004 TooManySimilar), from the
+    // Suppress reports the server blacklisted (the too-many-similar verdict), from the
     // in-memory set (the only one with no usable disk) or the on-disk one.
     if mem_blacklisted(shared, &meta.signatures)
         || data_dir.is_some_and(|dir| queue::any_blacklisted(dir, &meta.signatures))
