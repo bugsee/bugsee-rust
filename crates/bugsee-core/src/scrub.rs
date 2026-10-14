@@ -305,6 +305,32 @@ pub fn is_sensitive_key(name: &str) -> bool {
     })
 }
 
+/// After `oauth` (the `o` is the stem's `before`), a name that is public
+/// metadata (`oauth_client_id`, `oauth2_redirect_uri`, `oauth_scope`), as opposed
+/// to `oauth_verifier`/`oauth_pin`/bare `oauth`, which stay secret. Token- and
+/// secret-bearing names are caught by their own stems regardless.
+fn public_oauth_suffix(rest: &[u8]) -> bool {
+    let rest = &rest[rest.iter().take_while(|c| c.is_ascii_digit()).count()..];
+    [
+        &b"clientid"[..],
+        b"clientname",
+        b"redirect",
+        b"callback",
+        b"scope",
+        b"issuer",
+        b"endpoint",
+        b"url",
+        b"uri",
+        b"version",
+        b"provider",
+        b"enabled",
+        b"flow",
+        b"config",
+    ]
+    .iter()
+    .any(|x| rest.starts_with(x))
+}
+
 /// Whether `stem` occurs in `n` in a sense that is not excluded by its context.
 fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
     let mut from = 0;
@@ -329,7 +355,10 @@ fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
                         && [&b"endpoint"[..], b"url", b"uri"]
                             .iter()
                             .any(|x| rest[9..].starts_with(x)))
-                    || before.ends_with(b"o")
+                    || (before.ends_with(b"o") && public_oauth_suffix(rest))
+                    || [&b"url"[..], b"uri", b"endpoint"]
+                        .iter()
+                        .any(|x| rest.starts_with(x))
                     || rest.starts_with(b"method")
                     || rest.starts_with(b"signingalg")
             }
@@ -2058,8 +2087,10 @@ mod tests {
             "authorization_endpoint",
             "authorization_url",
             "authorization_uri",
-            "oauth",
             "oauth_client_id",
+            "auth_url",
+            "auth_endpoint",
+            "oauth_scope",
             "oauth2_redirect_uri",
             "token_endpoint_auth_method",
             "token_endpoint_auth_signing_alg_values_supported",
@@ -2087,6 +2118,10 @@ mod tests {
         }
         for k in [
             "authorization",
+            "oauth",
+            "oauth_verifier",
+            "oauth_pin",
+            "oauth_signature",
             "oauth_token",
             "oauth_client_secret",
             "oauth_access_token",
