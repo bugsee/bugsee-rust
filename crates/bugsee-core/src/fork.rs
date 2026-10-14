@@ -195,6 +195,11 @@ impl<T: Send + 'static> ForkMutex<T> {
         }
     }
 
+    /// Register with the fork protocol without locking.
+    pub fn ensure_registered(&'static self) {
+        self.registered.call_once(|| register_static(&self.inner));
+    }
+
     /// Lock, registering with the fork protocol and initialising on first use.
     pub fn lock(&'static self) -> ForkMutexGuard<T> {
         self.registered.call_once(|| register_static(&self.inner));
@@ -295,12 +300,35 @@ pub fn register_weak(target: &Arc<impl ForkLockable + 'static>) {
     register(Entry::Weak(Arc::downgrade(&arc)));
 }
 
+/// Serialises the SDK's own stack walks. The `backtrace` crate guards symbol
+/// resolution with a process-wide `std::sync::Mutex`, which does not survive
+/// `fork()`: if a fork lands while another thread is inside it, the child
+/// inherits it locked with no owner and its next stack walk hangs. Holding this
+/// registered lock across every walk makes the `prepare` step wait the walk out,
+/// so the child inherits the backtrace mutex free. It is deliberately separate
+/// from the recorder lock, so a multi-millisecond symbolisation never stalls
+/// capture. Take it only around a walk, never while holding another SDK lock.
+static BACKTRACE: ForkMutex<()> = ForkMutex::new(|| ());
+
+/// Guard for [`lock_backtrace`].
+pub type BacktraceGuard = ForkMutexGuard<()>;
+
+/// Hold this across any use of the `backtrace` crate (see [`BACKTRACE`]).
+pub fn lock_backtrace() -> BacktraceGuard {
+    install_fork_hook();
+    BACKTRACE.lock()
+}
+
 /// Install the `pthread_atfork` hooks. Idempotent; a no-op off unix.
 pub fn install_fork_hook() {
     #[cfg(unix)]
     {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
+            // Register the backtrace lock now, not lazily on its first use: a
+            // fork racing that first use would otherwise run `prepare` before the
+            // lock is registered while its holder is mid-walk.
+            BACKTRACE.ensure_registered();
             extern "C" fn prepare() {
                 REGISTRY.lock.lock();
                 // SAFETY: registry lock held until `parent`/`child`.
