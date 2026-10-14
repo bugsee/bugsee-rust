@@ -240,6 +240,8 @@ fn key_of(path: &Path) -> PathBuf {
 enum Lock {
     Got,
     Contended,
+    /// Only unix can tell "locks unsupported" apart from other errors.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Unsupported,
 }
 
@@ -408,13 +410,16 @@ mod os {
     }
 
     /// Ask whether a peer holds the lock, without taking it.
+    // `l_type` and `F_UNLCK` are different integer types per platform; widening
+    // both to i32 is the portable spelling, a no-op cast on some of them.
+    #[allow(clippy::unnecessary_cast)]
     pub fn is_locked(file: &File) -> io::Result<Peek> {
         let mut fl = whole();
         loop {
             // SAFETY: as above; `F_GETLK` only writes the conflicting lock into `fl`.
             let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut fl) };
             if ret == 0 {
-                return Ok(if fl.l_type as i32 == libc::F_UNLCK as i32 {
+                return Ok(if i32::from(fl.l_type) == libc::F_UNLCK as i32 {
                     Peek::Free
                 } else {
                     Peek::Held
