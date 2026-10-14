@@ -33,7 +33,7 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 0 — Harness | ✅ | Workspace, mock 3-step API server, bundle validator, subprocess crash runner, CI **matrix across ubuntu/macOS/windows** (build/test/clippy per platform, fmt once) + pinned-MSRV job. |
 | 1 — Ingestible bundle (core) | ✅ | Sliding-window capture (time/byte/event caps), length-prefixed part streams, envelope/manifest, Zstd method-93 ZIP, signatures. |
 | 2 — Handled errors + caught panics | ✅ | `catch_unwind` guards, panic snapshot, error/cause chains. Follow-ups: `tracing` Layer + `log` adapter done. Subsystem quarantine still open. |
-| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** Windows native capture — SEH/VEH handler, PE CodeView module map, marker + frame capture — so all three desktop platforms report fatal crashes. Open: best-effort in-flight flush, full out-of-process minidump. |
+| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** Windows native capture — SEH/VEH handler, PE CodeView module map, marker + frame capture — so all three desktop platforms report fatal crashes. In-flight events are now flushed at crash (bounded 50 ms, signal-safe wake of the capture worker; #13). Open: full out-of-process minidump. |
 | 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. **New:** the environment is actually populated — OS version, kernel, memory, disk, locale, and app identity (`package_id`/`version`/`build`) via `LaunchOptions::app_version`. Open: sessions / release-health. |
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. **New:** `on_report_dropped` — delivery failure is observable at last; `flush()` alone never could distinguish delivered from discarded. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
@@ -538,7 +538,7 @@ Rust and are worth evaluating before building one.
 ### Remaining phase work
 
 - Phase 2: subsystem quarantine (auto-disable a repeatedly-faulting integration).
-- Phase 3: best-effort in-flight flush at crash; full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
+- Phase 3: full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
 - Phase 4: sessions / release-health.
 - Phase 5: general PII scrubber, rate limits.
 - Phase 6: iOS/Android target builds; Swift/Kotlin language wrappers.

@@ -19,6 +19,7 @@
 pub mod bundle;
 pub mod capture;
 pub mod claim;
+pub mod crash_flush;
 pub mod errors;
 pub mod fork;
 pub mod model;
@@ -33,6 +34,8 @@ pub mod session;
 pub mod signature;
 pub mod transport;
 pub mod util;
+#[cfg(windows)]
+mod win32;
 
 pub use model::{
     entry::{

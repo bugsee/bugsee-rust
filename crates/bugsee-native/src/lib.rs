@@ -225,6 +225,40 @@ mod imp {
     #[cfg(any(unix, windows))]
     const HANDLER_BUDGET_SECS: u32 = 5;
 
+    /// How long a dying process waits for the capture worker to write out the
+    /// entries still queued when it faulted (see `bugsee_core::crash_flush`), in
+    /// milliseconds. Small against [`HANDLER_BUDGET_SECS`] on purpose: it is a
+    /// courtesy, never something the process may be held for, and it runs only
+    /// AFTER the marker is complete, so giving up costs the last few events and
+    /// nothing else.
+    #[cfg(any(unix, windows))]
+    static INFLIGHT_FLUSH_BUDGET_MS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(
+            bugsee_core::crash_flush::DEFAULT_BUDGET.as_millis() as u64
+        );
+
+    /// Override the in-flight flush budget. Tests only: they use a long one to
+    /// prove the mechanism independent of how fast the machine drains.
+    #[cfg(any(unix, windows))]
+    #[doc(hidden)]
+    pub fn set_inflight_flush_budget_for_test(budget: std::time::Duration) {
+        INFLIGHT_FLUSH_BUDGET_MS.store(
+            budget.as_millis() as u64,
+            core::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Best-effort drain of in-flight capture entries. Async-signal-safe (atomics,
+    /// one non-blocking write, a bounded poll loop); the heavy lifting happens on
+    /// the capture worker. Call only once the marker is on disk. Also raises the
+    /// dying flag, so the runtime starts no new claims in the window.
+    #[cfg(any(unix, windows))]
+    #[inline(never)]
+    fn flush_inflight_events() {
+        let ms = INFLIGHT_FLUSH_BUDGET_MS.load(core::sync::atomic::Ordering::Relaxed);
+        let _ = bugsee_core::crash_flush::flush_for_crash(std::time::Duration::from_millis(ms));
+    }
+
     /// A `SIGALRM`-based deadline for the crash handler. Only async-signal-safe
     /// calls (`sigaction`, `pthread_sigmask`, `sigpending`, `sigwait`, `alarm`) are
     /// used.
@@ -878,6 +912,9 @@ mod imp {
         if n > 0 {
             unsafe { append_frames(path_cbytes, &frames[..n]) };
         }
+        // The marker is complete; now give the worker a moment to write out what
+        // was still queued.
+        flush_inflight_events();
     }
 
     /// Open the marker for writing, creating/truncating it. Returns the raw handle
@@ -2409,6 +2446,8 @@ mod imp {
                     report_unrecorded(tid, &*path, sig, info, regs);
                 }
             }
+            // Only now, with the marker complete and the latch released.
+            flush_inflight_events();
         }
 
         /// The interrupted registers, to tell whether a host changed anything.
@@ -2660,6 +2699,7 @@ mod imp {
             unsafe {
                 if generation != 0 {
                     complete_report(tid, &*path, regs, generation);
+                    flush_inflight_events();
                     return;
                 }
                 // The original fault was not the first in flight, so it wrote no
@@ -2681,6 +2721,7 @@ mod imp {
                     watchdog.disarm();
                 }
                 WRITING.store(0, Ordering::Release);
+                flush_inflight_events();
             }
         }
 

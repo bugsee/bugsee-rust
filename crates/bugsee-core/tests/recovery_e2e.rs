@@ -363,3 +363,69 @@ fn clean_shutdown_is_not_recovered() {
         "a cleanly-closed session is never recovered"
     );
 }
+
+/// A process that dies mid-`write` (or whose in-flight flush was cut short by the
+/// crash handler's budget) leaves a torn tail on the part it was appending to.
+/// Recovery must deliver every complete record before it and ignore whatever
+/// follows — never panic, never loop, never read past the buffer.
+#[test]
+fn a_torn_or_garbage_part_tail_is_ignored_on_recovery() {
+    let header = |len: u32| {
+        let mut t = Vec::new();
+        t.extend_from_slice(&300u64.to_le_bytes());
+        t.extend_from_slice(&len.to_le_bytes());
+        t
+    };
+    let mut cut = header(64);
+    cut.extend_from_slice(br#"{"timestamp":300,"lev"#);
+    let mut absurd = header(u32::MAX);
+    absurd.extend_from_slice(b"junk");
+    let tails: Vec<(&str, Vec<u8>)> = vec![
+        ("partial header", vec![0xAB; 5]),
+        ("header only, payload missing", header(64)),
+        ("payload cut mid-way", cut),
+        ("absurd length prefix", absurd),
+        ("zeroed tail of a grown file", vec![0u8; 4096]),
+        (
+            "random garbage",
+            (0..777u32).map(|i| (i * 31 + 7) as u8).collect(),
+        ),
+    ];
+
+    for (what, tail) in tails {
+        let dir = TempDir::new();
+        seed_crashed_session(&dir.path, 1);
+        let log = dir.path.join("parts/1/0/log.part");
+        let mut bytes = std::fs::read(&log).unwrap();
+        bytes.extend_from_slice(&tail);
+        std::fs::write(&log, &bytes).unwrap();
+
+        let transport = Arc::new(MockTransport::default());
+        let recorder =
+            Recorder::launch(RecorderConfig::new(&dir.path, "TOKEN"), transport.clone()).unwrap();
+        assert!(recorder.flush(Duration::from_secs(5)), "{what}");
+
+        let bundles = transport.uploaded_bundles.lock().unwrap();
+        assert_eq!(bundles.len(), 1, "{what}: the session was still delivered");
+        let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
+        let log_name = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .find(|n| n.ends_with(".log.json"))
+            .unwrap_or_else(|| panic!("{what}: no log file"));
+        let mut raw = Vec::new();
+        zip.by_name(&log_name)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        let log: Value = serde_json::from_slice(&raw).unwrap();
+        let msgs: Vec<&str> = log["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(msgs, vec!["pre-crash line A", "pre-crash line B"], "{what}");
+        drop(bundles);
+        drop(recorder);
+    }
+}

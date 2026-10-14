@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
+use crate::crash_flush::CrashFlush;
 use crate::fork::{ForkLock, ForkLockable};
 use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
@@ -375,6 +376,9 @@ pub struct Recorder {
     backoff_base: Duration,
     worker: Option<JoinHandle<()>>,
     uploader: Option<JoinHandle<()>>,
+    /// Lets a crash handler ask the worker to drain in-flight entries
+    /// ([`crate::crash_flush`]). `None` in memory mode (nothing to flush to).
+    crash_flush: Option<CrashFlush>,
 }
 
 /// The two pipeline threads and the channels that feed them.
@@ -383,6 +387,7 @@ struct Pipeline {
     upload_tx: Sender<UploadMsg>,
     worker: JoinHandle<()>,
     uploader: JoinHandle<()>,
+    crash_flush: Option<CrashFlush>,
 }
 
 impl Recorder {
@@ -520,6 +525,7 @@ impl Recorder {
             backoff_base: config.upload_backoff_base,
             worker: Some(pipeline.worker),
             uploader: Some(pipeline.uploader),
+            crash_flush: pipeline.crash_flush,
         })
     }
 
@@ -552,6 +558,9 @@ impl Recorder {
         // running anything.
         std::mem::forget(self.worker.take());
         std::mem::forget(self.uploader.take());
+        // Likewise the parent's crash-flush helper thread (and its wake handle,
+        // which the parent still uses).
+        std::mem::forget(self.crash_flush.take());
 
         // Entries queued to the dead worker will never be processed, so the
         // back-pressure counters they incremented would stay high forever and
@@ -607,6 +616,7 @@ impl Recorder {
         std::mem::forget(std::mem::replace(&mut self.upload_tx, pipeline.upload_tx));
         self.worker = Some(pipeline.worker);
         self.uploader = Some(pipeline.uploader);
+        self.crash_flush = pipeline.crash_flush;
         Ok(())
     }
 
@@ -766,6 +776,9 @@ impl Drop for Recorder {
                 let _ = handle.join();
             }
         }
+        // Only now stop answering crash handlers: until the worker has acked
+        // `Stop` it can still hold queued entries a crash flush must wait for.
+        drop(self.crash_flush.take());
         let (utx, urx) = channel();
         let uploader_acked = self.upload_tx.send(UploadMsg::Stop(utx)).is_ok()
             && urx.recv_timeout(Duration::from_secs(2)).is_ok();
@@ -1050,10 +1063,13 @@ fn spawn_pipeline(
     // session's heartbeat going meanwhile, as the worker loop is not yet running.
     let beat_marker = marker.clone();
     let worker_upload_tx = upload_tx.clone();
+    let crash_flush = store.is_some().then(|| install_crash_flush(&tx)).flatten();
 
     let worker = std::thread::Builder::new()
         .name("bugsee-capture".into())
         .spawn(move || {
+            // A crash on this thread cannot wait for itself to flush.
+            let _pipeline = crate::crash_flush::register_pipeline_thread();
             // Queue any crashed prior session before capturing this one.
             // Contained: a panic here (e.g. a host before_send on a recovered
             // crash) must not abort the thread before worker_loop starts.
@@ -1093,6 +1109,9 @@ fn spawn_pipeline(
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 for dir in &legacy_data_dirs {
+                    if crate::crash_flush::is_dying() {
+                        break;
+                    }
                     let known = queue::blacklisted_signatures(dir);
                     if !known.is_empty() {
                         worker_shared.mem_blacklist.lock().extend(known);
@@ -1123,7 +1142,27 @@ fn spawn_pipeline(
         upload_tx,
         worker,
         uploader,
+        crash_flush,
     })
+}
+
+/// How long the helper waits for the worker to acknowledge a crash-time flush.
+/// The crash handler gives up on its own, far sooner (its budget); this only
+/// bounds how long a permanently wedged worker can occupy the helper. It must
+/// outlast any legitimate drain (the queue is capped), or a slow-but-healthy
+/// worker would make the helper report failure for a request whose budget was
+/// longer than this.
+const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Register this pipeline as the process's crash-time flush target. A failure
+/// (no pipe/event available) just forgoes the best-effort flush.
+fn install_crash_flush(tx: &Sender<Msg>) -> Option<CrashFlush> {
+    let tx = tx.clone();
+    CrashFlush::install(move || {
+        let (ack, done) = channel();
+        tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(CRASH_FLUSH_ACK_TIMEOUT).is_ok()
+    })
+    .ok()
 }
 
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
@@ -1140,6 +1179,11 @@ fn run_recovery(
     heartbeat_of: Option<&Path>,
     skip_launch_pass: bool,
 ) {
+    // A dying process starts no scan or GC a kill cannot finish: the worker must
+    // reach its loop to answer the crash handler's in-flight flush (crash_flush).
+    if crate::crash_flush::is_dying() {
+        return;
+    }
     let beat = || {
         if let Some(marker) = heartbeat_of {
             touch_heartbeat(marker);
@@ -1147,6 +1191,9 @@ fn run_recovery(
     };
     beat();
     for pending in recovery::find_pending(data_dir, current_generation) {
+        if crate::crash_flush::is_dying() {
+            return;
+        }
         beat();
         if skip_launch_pass && shared.launch_attempted.lock().contains(&pending.generation) {
             continue;
@@ -1154,7 +1201,9 @@ fn run_recovery(
         recover_claimed(shared, data_dir, &pending, false);
     }
     // Reap parts/attempts left by cleanly-exited or already-recovered generations.
-    recovery::gc_orphans(data_dir, current_generation);
+    if !crate::crash_flush::is_dying() {
+        recovery::gc_orphans(data_dir, current_generation);
+    }
 }
 
 /// Claim one pending session and recover it. Returns whether this process won the
@@ -1206,7 +1255,13 @@ fn wait_for_launch_pass(shared: &Shared) {
     }
     let wait = Duration::from_millis(shared.launch_wait_ms.load(Ordering::SeqCst));
     let deadline = Instant::now() + wait + LAUNCH_PASS_GRACE;
-    while !shared.launch_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+    // A dying process stops waiting at once: the worker must be free to answer the
+    // crash handler's in-flight flush (crash_flush), which a crash INSIDE the
+    // launch pass would otherwise leave queued behind this wait.
+    while !shared.launch_done.load(Ordering::SeqCst)
+        && !crate::crash_flush::is_dying()
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -1231,6 +1286,10 @@ fn run_launch_recovery(shared: &Shared, plan: &LaunchPlan) {
     let started = Instant::now();
     let mut claimed = 0;
     for pending in recovery::find_pending_bounded(&plan.dir, plan.generation, plan.max_sessions) {
+        // A crash is in progress: start no more sessions (claims are refused too).
+        if crate::crash_flush::is_dying() {
+            break;
+        }
         if let Some(marker) = &plan.heartbeat_of {
             touch_heartbeat(marker);
         }
@@ -2053,6 +2112,10 @@ fn drain_memory(
     let mut tried: Vec<u64> = Vec::new();
     loop {
         if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        // A dying process starts no delivery it cannot finish (crash_flush).
+        if crate::crash_flush::is_dying() {
             break;
         }
         let now = epoch_ms();
