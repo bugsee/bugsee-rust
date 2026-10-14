@@ -48,6 +48,12 @@ name = "crash_e2e_matrix"
 harness = false
 required-features = ["native"]
 
+# Same reason: the session-health matrix kills real child processes.
+[[test]]
+name = "release_health"
+harness = false
+required-features = ["native"]
+
 # Dies for real after a burst of events; needs its own `main`, like the above.
 [[test]]
 name = "crash_inflight"

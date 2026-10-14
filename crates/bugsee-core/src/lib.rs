@@ -22,6 +22,8 @@ pub mod claim;
 pub mod crash_flush;
 pub mod errors;
 pub mod fork;
+#[doc(hidden)]
+pub mod health;
 pub mod model;
 pub mod origin;
 pub mod panic_info;

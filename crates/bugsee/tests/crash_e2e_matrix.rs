@@ -127,6 +127,17 @@ fn run_child(kind: &str, dir: &str) -> ! {
             }));
             panic!("{PANIC_TEXT}");
         }
+        // The same on a worker thread: the SDK reports it inline (the process
+        // "survives" as far as the hook knows) and must still keep the snapshot,
+        // or the abort is recovered as a thin SIGABRT without the panic.
+        "aborting_panic_thread" => {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                previous(info);
+                std::process::abort();
+            }));
+            let _ = std::thread::spawn(|| panic!("{PANIC_TEXT}")).join();
+        }
         // Dies without running any destructor: no clean shutdown, no signal.
         "exit_without_shutdown" => std::process::exit(3),
         other => panic!("unknown crash kind {other}"),
@@ -218,6 +229,10 @@ fn cases() -> Vec<Case> {
     // correlation on POSIX, the surviving snapshot on Windows.
     v.push(Case {
         kind: "aborting_panic",
+        expect: Expect::Panic,
+    });
+    v.push(Case {
+        kind: "aborting_panic_thread",
         expect: Expect::Panic,
     });
     v
@@ -368,7 +383,13 @@ fn run_case(case: &Case) -> Result<(), String> {
         let left_behind = crash_info_files(&dir);
 
         // --- relaunch: exactly one usable report ---------------------------
-        let bundles = relaunch_and_collect(&dir);
+        let mut bundles = relaunch_and_collect(&dir);
+        // A worker-thread panic is also reported inline as a handled error, and
+        // the crash-time flush (#13) now lets that report survive the abort. It
+        // is a separate, non-fatal issue; the crash is the unhandled one.
+        if case.kind == "aborting_panic_thread" {
+            bundles.retain(|b| crash_json_from(b)["handled"] != true);
+        }
         if bundles.len() != 1 {
             return Err(format!(
                 "expected exactly one report, got {} (child stderr: {})",

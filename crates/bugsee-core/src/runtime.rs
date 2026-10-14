@@ -198,6 +198,9 @@ pub struct RecorderConfig {
     /// `legacy_data_dir`: trusted trees that could not take new files (a full or
     /// read-only default) even though a later default was writable.
     pub extra_data_dirs: Vec<PathBuf>,
+    /// Record how this session ends (issue #12, see [`crate::health`]). Off by
+    /// default: nothing consumes it server-side yet.
+    pub release_health: bool,
 }
 
 impl RecorderConfig {
@@ -223,6 +226,7 @@ impl RecorderConfig {
             launch_recovery_budget: Duration::ZERO,
             launch_recovery_max_sessions: DEFAULT_LAUNCH_RECOVERY_SESSIONS,
             extra_data_dirs: Vec::new(),
+            release_health: false,
         }
     }
 }
@@ -294,6 +298,17 @@ struct Shared {
     /// worker that already did its one pass runs another.
     launch_deferred: AtomicBool,
     launch_wait_ms: AtomicU64,
+    /// This session's health record (issue #12); `None` unless release health is
+    /// on and the session is on disk (memory mode has no recovery, so a crash
+    /// would never be seen and every session would read as healthy).
+    health: ForkLock<Option<crate::health::HealthTracker>>,
+    /// Handled errors this session has seen. Counted with an atomic so the
+    /// reporting path (a caller's thread, under the facade's lock) never does
+    /// file I/O; the worker's tick persists it into `health`.
+    health_errors: AtomicU64,
+    /// Register the backend session at launch instead of with the first report
+    /// (release health on): see [`register_eagerly`].
+    eager_session: AtomicBool,
 }
 
 /// What the launch-path recovery pass needs, fixed at launch.
@@ -318,8 +333,10 @@ impl ForkLockable for Shared {
         self.delivered_stuck.fork_lock();
         self.launch_plan.fork_lock();
         self.launch_attempted.fork_lock();
+        self.health.fork_lock();
     }
     fn fork_unlock(&self) {
+        self.health.fork_unlock();
         self.launch_attempted.fork_unlock();
         self.launch_plan.fork_unlock();
         self.delivered_stuck.fork_unlock();
@@ -432,6 +449,9 @@ impl Recorder {
             launch_done: AtomicBool::new(false),
             launch_deferred: AtomicBool::new(false),
             launch_wait_ms: AtomicU64::new(0),
+            health: ForkLock::new(None),
+            health_errors: AtomicU64::new(0),
+            eager_session: AtomicBool::new(false),
         });
 
         crate::fork::install_fork_hook();
@@ -464,6 +484,20 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        // Only a session that can be recovered is registered eagerly: a memory-mode
+        // run could never contribute its crash, so counting it would read healthy.
+        shared
+            .eager_session
+            .store(config.release_health && session.is_some(), Ordering::SeqCst);
+        if config.release_health {
+            if let Some(session) = &session {
+                *shared.health.lock() = crate::health::HealthTracker::start(
+                    &data_dir,
+                    session.generation(),
+                    &shared.env,
+                );
+            }
+        }
         // A directory that cannot take NEW files may still hold reports and crashes
         // a previous run persisted (that is what a full disk looks like), and
         // recovering them only reads and deletes. So an existing directory is
@@ -591,6 +625,22 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        // The child is a session of its own: the parent's record stays the
+        // parent's (never finished or counted from here), and a child that fell
+        // back to memory tracks nothing.
+        {
+            let mut health = self.shared.health.lock();
+            self.shared.health_errors.store(0, Ordering::SeqCst);
+            let enabled = health.is_some();
+            *health = match (&session, enabled) {
+                (Some(s), true) => crate::health::HealthTracker::start(
+                    &self.data_dir,
+                    s.generation(),
+                    &self.shared.env,
+                ),
+                _ => None,
+            };
+        }
         let pipeline = spawn_pipeline(
             &self.shared,
             store.is_some().then_some(self.data_dir.as_path()),
@@ -710,6 +760,18 @@ impl Recorder {
         self.handle().flush(timeout)
     }
 
+    /// The running session's health record, when release health is on.
+    pub fn session_health(&self) -> Option<crate::health::SessionRecord> {
+        self.handle().session_health()
+    }
+
+    /// Finished sessions recorded in this data directory (clean ends and
+    /// recovered crashes), oldest first, until acknowledged. Empty unless the
+    /// session is tracked on disk.
+    pub fn finished_sessions(&self) -> Vec<crate::health::SessionRecord> {
+        self.handle().finished_sessions()
+    }
+
     /// Data directory root for this recorder.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -805,8 +867,30 @@ impl Drop for Recorder {
         // A panic that was merely *contained* never reaches here while
         // unwinding, and its snapshot is deleted by `report_caught`, so this
         // cannot turn a handled panic into a phantom crash.
+        //
+        // The health record is the exception: it is finished whenever the stop
+        // is not a death by panic, whatever the threads acked. A detached
+        // thread leaves the marker, so the next launch recovers the session
+        // too, and finds this record already there (`finalize_dead` is
+        // idempotent), so the clean end is counted once and as what it was.
+        if std::thread::panicking() && self.session.is_some() {
+            // Dying of a panic: say so beside the parts, so recovery does not
+            // have to guess from the clock whether the panic snapshot is stale
+            // (a slow unwind keeps the worker capturing for a while).
+            let _ = std::fs::write(
+                self.gen_dir().join(crate::panic_info::PANIC_UNWINDING_NAME),
+                b"",
+            );
+        }
+        if !std::thread::panicking() {
+            if let Some(health) = self.shared.health.lock().take() {
+                health.finish_clean(self.shared.health_errors.load(Ordering::SeqCst));
+            }
+        }
         if worker_acked && uploader_acked && !std::thread::panicking() {
             if let Some(session) = &self.session {
+                // The finished health record first, then the marker: a death in
+                // between leaves a marker that recovery settles idempotently.
                 session.end();
             }
         } else if !(worker_acked && uploader_acked) {
@@ -832,6 +916,38 @@ pub struct RecorderHandle {
 }
 
 impl RecorderHandle {
+    /// See [`Recorder::session_health`]. The error count is read live.
+    pub fn session_health(&self) -> Option<crate::health::SessionRecord> {
+        let mut record = self.shared.health.lock().as_ref()?.record().clone();
+        record.errors = self.shared.health_errors.load(Ordering::SeqCst);
+        Some(record)
+    }
+
+    /// The data directory of the tracked session, cloned out so file I/O runs
+    /// outside every lock. `None` when nothing is tracked (release health off,
+    /// or memory mode, whose recovery-less sessions could never show a crash).
+    fn health_dir(&self) -> Option<PathBuf> {
+        self.shared
+            .health
+            .lock()
+            .as_ref()
+            .map(|h| h.data_dir().to_path_buf())
+    }
+
+    /// See [`Recorder::finished_sessions`].
+    pub fn finished_sessions(&self) -> Vec<crate::health::SessionRecord> {
+        self.health_dir()
+            .map(|d| crate::health::finished(&d))
+            .unwrap_or_default()
+    }
+
+    /// Forget a finished session (see [`crate::health::acknowledge`]).
+    pub fn acknowledge_session(&self, generation: u64) {
+        if let Some(dir) = self.health_dir() {
+            crate::health::acknowledge(&dir, generation);
+        }
+    }
+
     /// See [`Recorder::recover_on_launch_path`].
     pub fn recover_on_launch_path(&self) {
         let Some(plan) = self.shared.launch_plan.lock().take() else {
@@ -961,6 +1077,13 @@ fn report_into(
     window_end: i64,
     crash_json: Option<Vec<u8>>,
 ) {
+    // A handled error counts against the session's health whatever becomes of
+    // the report (sampled out, dropped, rate limited): the session had an error.
+    // A panic on a non-main thread arrives here as an `Error` too, never as a
+    // crash: the process survives it.
+    if meta.issue_type == IssueType::Error {
+        shared.health_errors.fetch_add(1, Ordering::Relaxed);
+    }
     // Every enqueued report increments the counter (the worker decrements on
     // drain), but only NON-crash reports are subject to the drop-newest cap.
     let prev = shared.report_queued.fetch_add(1, Ordering::Relaxed);
@@ -1515,6 +1638,9 @@ fn worker_loop(
         // elapsed — via a message OR a timeout — so steady traffic can't starve it.
         if Instant::now() >= next_rotate {
             rotate_tick(store.as_mut(), &shared, &mut sampler);
+            if let Some(health) = shared.health.lock().as_mut() {
+                health.sync_errors(shared.health_errors.load(Ordering::SeqCst));
+            }
             next_rotate = Instant::now() + rotate_interval;
         }
         // The launch-path pass left a session for us (queue cap) after our one
@@ -1834,6 +1960,28 @@ fn assemble_from_disk(
     .ok()
 }
 
+/// Minimum spacing between eager session-registration attempts while offline.
+const EAGER_RETRY: Duration = Duration::from_secs(30);
+
+/// Register the backend session now, once: a no-op when a token is already held
+/// (an earlier attempt, or a delivery, got one), so there is exactly one
+/// session registration per launch that is online. Never fails the caller: errors
+/// are dropped and the lazy path in [`transport::deliver`] registers later. The
+/// lock is not held across the network call.
+fn register_eagerly(shared: &Shared) {
+    if shared.session.lock().is_some() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(token) = shared
+            .transport
+            .register_session(&shared.app_token, &shared.environment_json)
+        {
+            shared.session.lock().get_or_insert(token);
+        }
+    }));
+}
+
 fn uploader_loop(
     rx: Receiver<UploadMsg>,
     shared: Arc<Shared>,
@@ -1845,6 +1993,16 @@ fn uploader_loop(
 ) {
     let poll = Duration::from_secs(5);
     let mut legacy = legacy_data_dirs;
+    // Release health: the backend counts a session when it is registered, and
+    // registration is otherwise lazy (only a delivery registers), so a run that
+    // never uploads would never be counted. Best effort, on this thread, before
+    // anything else; failure (offline) is silent and retried at most every
+    // `EAGER_RETRY` from the poll below, falling back to the lazy path.
+    let eager = fresh_launch && shared.eager_session.load(Ordering::SeqCst);
+    let mut last_eager = Instant::now();
+    if eager {
+        register_eagerly(&shared);
+    }
     // A fresh launch retries any queued report immediately (force), ignoring
     // backoff scheduled by the prior session. A fork child skips this: the
     // parent's uploader is already working the shared queue. Guarded so a
@@ -1890,6 +2048,10 @@ fn uploader_loop(
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
+                if eager && last_eager.elapsed() >= EAGER_RETRY {
+                    last_eager = Instant::now();
+                    register_eagerly(&shared);
+                }
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drain_all(&shared, data_dir.as_deref(), &legacy, backoff_base, false)
                 }));

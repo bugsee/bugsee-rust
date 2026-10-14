@@ -142,6 +142,7 @@ impl Bugsee {
         config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
         config.launch_recovery_budget = options.launch_recovery_budget;
+        config.release_health = options.release_health;
         config.app_identity = bugsee_core::model::environment::AppIdentity {
             package_id: options.app_package_id.clone(),
             version: options.app_version.clone(),
@@ -265,6 +266,29 @@ impl Bugsee {
             reason: recorder.storage_reason().map(String::from),
             degraded: recorder.is_degraded(),
         })
+    }
+
+    // Release-health diagnostics (#12). Unstable and hidden: there is no backend
+    // contract for session health, so no stable API is promised for it. They
+    // clone a handle out first, so no file I/O runs under the global lock.
+
+    #[doc(hidden)]
+    pub fn __session_health() -> Option<bugsee_core::health::SessionRecord> {
+        Self::handle()?.session_health()
+    }
+
+    #[doc(hidden)]
+    pub fn __finished_sessions() -> Vec<bugsee_core::health::SessionRecord> {
+        Self::handle()
+            .map(|h| h.finished_sessions())
+            .unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn __acknowledge_session(generation: u64) {
+        if let Some(h) = Self::handle() {
+            h.acknowledge_session(generation);
+        }
     }
 
     /// Stop the SDK and flush pending work (dropping the recorder joins the worker).

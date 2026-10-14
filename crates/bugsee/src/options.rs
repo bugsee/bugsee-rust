@@ -40,6 +40,7 @@ pub struct LaunchOptions {
     pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
     pub(crate) sample_rate: f64,
     pub(crate) launch_recovery_budget: Duration,
+    pub(crate) release_health: bool,
 }
 
 impl LaunchOptions {
@@ -65,6 +66,7 @@ impl LaunchOptions {
             before_breadcrumb: None,
             sample_rate: 1.0,
             launch_recovery_budget: bugsee_core::runtime::DEFAULT_LAUNCH_RECOVERY_BUDGET,
+            release_health: false,
         }
     }
 
@@ -250,6 +252,22 @@ impl LaunchOptions {
     /// in that order; the server deduplicates by signature whatever the order.
     pub fn launch_recovery_budget(mut self, budget: Duration) -> Self {
         self.launch_recovery_budget = budget;
+        self
+    }
+
+    /// **Experimental.** Release health: register this launch with the backend
+    /// as a session immediately (rather than with the first report), so it
+    /// counts toward crash-free sessions even if the run never uploads
+    /// anything, and keep a local record of how the session ended (clean,
+    /// errored, crashed, abnormal exit) in the data directory. Off by default.
+    ///
+    /// The backend has no endpoint for session end/status yet, so the record is
+    /// local only and not exposed as stable API; the registration is best
+    /// effort and never delays or fails launch. In memory mode no record is
+    /// kept (a crash there could never be seen). The behaviour may change when
+    /// a backend contract exists. See DESIGN.md, release health.
+    pub fn release_health(mut self, enabled: bool) -> Self {
+        self.release_health = enabled;
         self
     }
 

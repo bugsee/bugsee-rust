@@ -240,6 +240,11 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
                         handled: is_worker,
                         thread: worker_thread,
                     });
+                    // The snapshot stays even for a worker-thread panic: under
+                    // `panic = "abort"` the process dies after this hook chain
+                    // and the snapshot is what correlates the SIGABRT with the
+                    // panic. One a surviving process leaves behind is ruled out
+                    // at recovery (`panic_is_recent`), not here.
                 }
             }
 

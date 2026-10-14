@@ -17,6 +17,10 @@ use crate::model::crash::Frame;
 
 /// File name of the persisted panic snapshot under a session's part dir.
 pub const PANIC_INFO_NAME: &str = "panic.info";
+/// Written beside the capture parts when the recorder is dropped while its
+/// thread is unwinding from a panic: the process is dying of that panic, which
+/// settles a panic snapshot's staleness without any clock.
+pub const PANIC_UNWINDING_NAME: &str = "panic.unwinding";
 
 /// A captured panic, persisted for next-launch correlation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

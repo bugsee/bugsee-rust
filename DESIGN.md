@@ -95,6 +95,7 @@ let _guard = Bugsee::launch_with(LaunchOptions::new("APP_TOKEN")
     .sample_rate(1.0).native_crash_capture(true).system_telemetry(true)
     .before_send(|r: &mut ReportMeta| { r.severity = Severity::High; true })
     .before_breadcrumb(|c| Some(c)))?;
+// Experimental, off by default: `release_health(bool)` (see §10, Release health).
 // Real builder set (see `crates/bugsee/src/options.rs`): data_dir, max_window,
 // max_bytes, max_events, endpoint, with_transport, before_send,
 // before_breadcrumb, sample_rate, native_crash_capture, system_telemetry,
@@ -289,6 +290,27 @@ That last case previously produced **no report whatsoever** — the SDK shut dow
 
 **TLS:** optional cert-pinning to `*.bugsee.com` for API calls (not presigned PUT).
 
+### Release health: sessions and crash-free rates (#12) — experimental
+
+**What the backend does today.** It counts a session once, when the session is registered, and a crash when a crash **report** is received. The crash-free session rate is derived from those two counts (sessions minus crashes, over sessions), per day and per release (app version and build). It has **no way for an SDK to report** a session's end, status, duration or error count, and no `ok/errored/crashed/abnormal` model; no document of the wire contract mentions one.
+
+**The design gap that matters most.** The Rust transport registers its session lazily, inside `deliver`, so only a process that uploads something ever creates a backend session. A healthy run that reports nothing is never counted while its crash report is, and the rate collapses toward 0%. With `LaunchOptions::release_health(true)` (experimental, **off by default**) the uploader thread therefore registers the session **eagerly, once per launch**, right after launch (only when the launch has a disk session: a memory-mode run could never contribute its crash, so counting it would read healthy): best effort, never on the caller's thread, never an error for launch, and offline-tolerant (a failure is dropped, retried at most every 30 s, and the first delivery registers lazily if it is still unregistered). The token is the one `deliver` uses, so there is exactly one session registration per online launch. The session of a run that died is registered by that run itself; its crash report arrives with the next process, which counts it as a crash on its own day and release (the backend has no link between the two), as for any recovered crash. A fork child inherits the parent's token and registers nothing of its own.
+
+**Local record (no backend half).** The same option keeps a durable record per session in `health/`: `<gen>.live` while running and `<gen>.json` when finished (`ok`, `errored`, `crashed`, `abnormal`; duration, error count, release). Nothing is sent. It is unstable by design: the types live in a `doc(hidden)` module, are `#[non_exhaustive]`, and the facade offers only `doc(hidden)` accessors (`Bugsee::__finished_sessions` and friends); there is no stable API for a contract that does not exist.
+
+Rules.
+- A session is one SDK launch (desktop app, server and CLI alike; no idle timeout).
+- A handled error, including a panic on a non-main thread, makes it `errored`, never `crashed`. Counting happens with an atomic on the reporting path (no file I/O under the facade's lock); the worker's rotation tick persists it.
+- A stop that is not a death by panic finishes the record (`ok`/`errored`) whatever the worker and uploader acked. A detached thread leaves the liveness marker, so the next launch recovers the session too and finds the finished record (idempotent).
+- A session that died is finished by the next launch's recovery as `crashed` (native crash info, a minidump, or a panic snapshot that is **fresh**: the session did not keep capturing more than 5 s after it, unless the recorder was dropped while unwinding from a panic, which leaves a `panic.unwinding` mark beside the parts and settles it regardless of how slow the unwind was) or `abnormal` (none). This happens in `recovery::discard`, under the recover claim and whatever became of the report (delivered, deduplicated, dropped by `before_send`). A worker-thread panic's snapshot is **kept** (under `panic = "abort"` it is what correlates the SIGABRT with the panic, and a chained hook can delay the abort arbitrarily); a leftover one is ruled out at recovery instead, and `build_report` applies the same freshness rule, so a later SIGKILL is not misread as that panic's crash.
+- Exactly once: the finished record is written by rename before the marker goes and rewritten if unreadable; `acknowledge` leaves a `<gen>.acked` tombstone that a late finalizer honours; gc removes tombstones and orphan `.live` files once their marker is gone. Records raise the generation floor, so a number is not reused.
+- Memory mode (#9) tracks nothing and lists nothing (a crash there is invisible, so every session would read healthy); an empty data directory is refused. A fork child is a session of its own and never finishes the parent's.
+- Durations of clean sessions come from a monotonic clock; a dead session's end is the later of its newest capture-part mtime and its live record's last write.
+
+Documented limits. Records of legacy and extra recovery directories are not surfaced; the newest 256 finished records are kept and older ones are dropped even if unacknowledged; right after launch a recovered earlier-run crash may not be listed yet (recovery past the launch-path budget is asynchronous); a server that is ended by SIGTERM, `exec` or `_exit` without dropping its guard is `abnormal`, which inflates the crashed rate, so end the run with a clean stop: call `Bugsee::stop` (or drop the guard) from the termination handler; once the shutdown contract of #8 (PR #31) lands, `Bugsee::shutdown` and the opt-in `Bugsee::install_termination_flush(timeout)` do this on SIGTERM/SIGINT (neither exists on this branch yet); error counts of a session that died are approximate (up to one tick behind). The crash handler and panic hook add no work of their own for this; the hook gains no new action, and the inline worker-thread report (already there) now also bumps the error counter.
+
+**Blocked on the backend.** (1) An ingest endpoint, or fields on session-create/close, for `{session_id, started_at, ended_at, duration, status, errors, release, environment}`, authenticated like the other calls and idempotent on `session_id`; until then crashed and abnormal sessions can only be counted through crash reports. (2) How `crashed`/`abnormal` should feed the crash-free rate: today a session whose crash report the server dropped as a duplicate or refused as too similar counts as crash-free server-side while the SDK records it `crashed`. (3) Crash-free **users**: the backend counts users by a stable per-device identifier in the environment, which the Rust environment does not send; a stable anonymous id is needed first. (4) Sampling for servers with many short sessions (each launch is one session registration), to be decided with the endpoint. (5) A `Transport::report_session` method and offline queueing of finished records, which the durable queue and recover-lock claims can carry once the shape exists.
+
 ## 11. Concurrency & threading
 
 | Role | Count | Owns | Does |
@@ -423,6 +445,8 @@ worker's Apple/Mach-O branch and a handled Rust error into the managed generic p
 worker jobs (alongside `ios`/`javascript`), not Android's `mappings/` + ProGuard
 `mapping.*` path — the worker resolves a Rust minidump against that unified
 store, so the two halves must agree or every Rust minidump stays unsymbolicated.
+
+**Still open, release health (#12):** the backend has no session end/status/duration ingest and counts a session only at session-create; see §10, *Release health*, for the contract the Rust SDK would need and why crash-free users also needs a stable anonymous device identifier.
 
 **Still open (not required for ingestion):** the `viewer` dashboard has no
 Rust-specific rendering yet (reports display through the generic managed path),
