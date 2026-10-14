@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
+use crate::crash_flush::CrashFlush;
 use crate::fork::{ForkLock, ForkLockable};
 use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
@@ -293,6 +294,9 @@ struct Shared {
     /// over (it is armed and the pass has not finished).
     launch_armed: AtomicBool,
     launch_done: AtomicBool,
+    /// Set when the launch pass left a session for the worker (queue cap), so a
+    /// worker that already did its one pass runs another.
+    launch_deferred: AtomicBool,
     launch_wait_ms: AtomicU64,
     /// This session's health record (issue #12); `None` unless release health is
     /// on and the session is on disk (memory mode has no recovery, so a crash
@@ -389,6 +393,9 @@ pub struct Recorder {
     backoff_base: Duration,
     worker: Option<JoinHandle<()>>,
     uploader: Option<JoinHandle<()>>,
+    /// Lets a crash handler ask the worker to drain in-flight entries
+    /// ([`crate::crash_flush`]). `None` in memory mode (nothing to flush to).
+    crash_flush: Option<CrashFlush>,
 }
 
 /// The two pipeline threads and the channels that feed them.
@@ -397,6 +404,7 @@ struct Pipeline {
     upload_tx: Sender<UploadMsg>,
     worker: JoinHandle<()>,
     uploader: JoinHandle<()>,
+    crash_flush: Option<CrashFlush>,
 }
 
 impl Recorder {
@@ -439,6 +447,7 @@ impl Recorder {
             launch_attempted: ForkLock::new(BTreeSet::new()),
             launch_armed: AtomicBool::new(false),
             launch_done: AtomicBool::new(false),
+            launch_deferred: AtomicBool::new(false),
             launch_wait_ms: AtomicU64::new(0),
             health: ForkLock::new(None),
             health_errors: AtomicU64::new(0),
@@ -523,11 +532,14 @@ impl Recorder {
             config.upload_backoff_base,
             config.sampler,
             true,
-            config
-                .legacy_data_dir
-                .into_iter()
-                .chain(config.extra_data_dirs)
-                .collect(),
+            distinct_extra_dirs(
+                &data_dir,
+                config
+                    .legacy_data_dir
+                    .into_iter()
+                    .chain(config.extra_data_dirs)
+                    .collect(),
+            ),
         )?;
 
         Ok(Recorder {
@@ -547,6 +559,7 @@ impl Recorder {
             backoff_base: config.upload_backoff_base,
             worker: Some(pipeline.worker),
             uploader: Some(pipeline.uploader),
+            crash_flush: pipeline.crash_flush,
         })
     }
 
@@ -579,6 +592,9 @@ impl Recorder {
         // running anything.
         std::mem::forget(self.worker.take());
         std::mem::forget(self.uploader.take());
+        // Likewise the parent's crash-flush helper thread (and its wake handle,
+        // which the parent still uses).
+        std::mem::forget(self.crash_flush.take());
 
         // Entries queued to the dead worker will never be processed, so the
         // back-pressure counters they incremented would stay high forever and
@@ -650,6 +666,7 @@ impl Recorder {
         std::mem::forget(std::mem::replace(&mut self.upload_tx, pipeline.upload_tx));
         self.worker = Some(pipeline.worker);
         self.uploader = Some(pipeline.uploader);
+        self.crash_flush = pipeline.crash_flush;
         Ok(())
     }
 
@@ -821,6 +838,9 @@ impl Drop for Recorder {
                 let _ = handle.join();
             }
         }
+        // Only now stop answering crash handlers: until the worker has acked
+        // `Stop` it can still hold queued entries a crash flush must wait for.
+        drop(self.crash_flush.take());
         let (utx, urx) = channel();
         let uploader_acked = self.upload_tx.send(UploadMsg::Stop(utx)).is_ok()
             && urx.recv_timeout(Duration::from_secs(2)).is_ok();
@@ -1083,6 +1103,23 @@ fn report_into(
     }
 }
 
+/// `extra` without duplicates and without `data_dir` itself, compared by
+/// canonical path. Recovering one directory twice in a launch would deliver its
+/// sessions twice and burn their attempt cap.
+fn distinct_extra_dirs(data_dir: &Path, extra: Vec<PathBuf>) -> Vec<PathBuf> {
+    let key = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut seen = vec![key(data_dir)];
+    let mut out = Vec::new();
+    for dir in extra {
+        let k = key(&dir);
+        if !seen.contains(&k) {
+            seen.push(k);
+            out.push(dir);
+        }
+    }
+    out
+}
+
 /// Claim a session and open its part store, or fail without leaving a liveness
 /// marker behind (a marker with no store would be recovered as a phantom crash).
 fn open_disk(data_dir: &Path, caps: WindowCaps) -> std::io::Result<(Session, PartStore)> {
@@ -1143,15 +1180,19 @@ fn spawn_pipeline(
     let worker_shared = Arc::clone(shared);
     let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_drain_dir = drain_dir.map(Path::to_path_buf);
+    let worker_recover_dir = worker_drain_dir.clone();
     let marker = data_dir.map(|d| Session::marker_path(d, generation));
     // Recovery can run long (a host `before_send`, many sessions); it keeps this
     // session's heartbeat going meanwhile, as the worker loop is not yet running.
     let beat_marker = marker.clone();
     let worker_upload_tx = upload_tx.clone();
+    let crash_flush = store.is_some().then(|| install_crash_flush(&tx)).flatten();
 
     let worker = std::thread::Builder::new()
         .name("bugsee-capture".into())
         .spawn(move || {
+            // A crash on this thread cannot wait for itself to flush.
+            let _pipeline = crate::crash_flush::register_pipeline_thread();
             // Queue any crashed prior session before capturing this one.
             // Contained: a panic here (e.g. a host before_send on a recovered
             // crash) must not abort the thread before worker_loop starts.
@@ -1191,6 +1232,13 @@ fn spawn_pipeline(
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 for dir in &legacy_data_dirs {
+                    if crate::crash_flush::is_dying() {
+                        break;
+                    }
+                    let known = queue::blacklisted_signatures(dir);
+                    if !known.is_empty() {
+                        worker_shared.mem_blacklist.lock().extend(known);
+                    }
                     queue::gc_orphans(dir);
                     run_recovery(&worker_shared, dir, u64::MAX, beat_marker.as_deref(), false);
                 }
@@ -1207,6 +1255,8 @@ fn spawn_pipeline(
                 caps,
                 sampler,
                 worker_upload_tx,
+                generation,
+                worker_recover_dir,
             );
         })?;
 
@@ -1215,7 +1265,23 @@ fn spawn_pipeline(
         upload_tx,
         worker,
         uploader,
+        crash_flush,
     })
+}
+
+/// How long the helper waits for the worker to acknowledge a crash-time flush.
+/// The crash handler gives up on its own, sooner; this only bounds the helper.
+const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Register this pipeline as the process's crash-time flush target. A failure
+/// (no pipe/event available) just forgoes the best-effort flush.
+fn install_crash_flush(tx: &Sender<Msg>) -> Option<CrashFlush> {
+    let tx = tx.clone();
+    CrashFlush::install(move || {
+        let (ack, done) = channel();
+        tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(CRASH_FLUSH_ACK_TIMEOUT).is_ok()
+    })
+    .ok()
 }
 
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
@@ -1232,6 +1298,11 @@ fn run_recovery(
     heartbeat_of: Option<&Path>,
     skip_launch_pass: bool,
 ) {
+    // A dying process starts no scan or GC a kill cannot finish: the worker must
+    // reach its loop to answer the crash handler's in-flight flush (crash_flush).
+    if crate::crash_flush::is_dying() {
+        return;
+    }
     let beat = || {
         if let Some(marker) = heartbeat_of {
             touch_heartbeat(marker);
@@ -1239,6 +1310,9 @@ fn run_recovery(
     };
     beat();
     for pending in recovery::find_pending(data_dir, current_generation) {
+        if crate::crash_flush::is_dying() {
+            return;
+        }
         beat();
         if skip_launch_pass && shared.launch_attempted.lock().contains(&pending.generation) {
             continue;
@@ -1246,7 +1320,9 @@ fn run_recovery(
         recover_claimed(shared, data_dir, &pending, false);
     }
     // Reap parts/attempts left by cleanly-exited or already-recovered generations.
-    recovery::gc_orphans(data_dir, current_generation);
+    if !crate::crash_flush::is_dying() {
+        recovery::gc_orphans(data_dir, current_generation);
+    }
 }
 
 /// Claim one pending session and recover it. Returns whether this process won the
@@ -1298,7 +1374,13 @@ fn wait_for_launch_pass(shared: &Shared) {
     }
     let wait = Duration::from_millis(shared.launch_wait_ms.load(Ordering::SeqCst));
     let deadline = Instant::now() + wait + LAUNCH_PASS_GRACE;
-    while !shared.launch_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+    // A dying process stops waiting at once: the worker must be free to answer the
+    // crash handler's in-flight flush (crash_flush), which a crash INSIDE the
+    // launch pass would otherwise leave queued behind this wait.
+    while !shared.launch_done.load(Ordering::SeqCst)
+        && !crate::crash_flush::is_dying()
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -1323,6 +1405,10 @@ fn run_launch_recovery(shared: &Shared, plan: &LaunchPlan) {
     let started = Instant::now();
     let mut claimed = 0;
     for pending in recovery::find_pending_bounded(&plan.dir, plan.generation, plan.max_sessions) {
+        // A crash is in progress: start no more sessions (claims are refused too).
+        if crate::crash_flush::is_dying() {
+            break;
+        }
         if let Some(marker) = &plan.heartbeat_of {
             touch_heartbeat(marker);
         }
@@ -1353,7 +1439,10 @@ fn recover_one(
         Some(hook) => hook(&mut built.meta),
         None => true,
     };
-    if !keep || queue::any_blacklisted(data_dir, &built.meta.signatures) {
+    if !keep
+        || mem_blacklisted(shared, &built.meta.signatures)
+        || queue::any_blacklisted(data_dir, &built.meta.signatures)
+    {
         recovery::discard(data_dir, pending);
         return;
     }
@@ -1374,6 +1463,10 @@ fn recover_one(
             // cap, rather than destroy it.
             queue::Admission::Full => {
                 shared.launch_attempted.lock().remove(&pending.generation);
+                // Not a failed attempt: a supervisor crash loop would otherwise
+                // burn the session's attempts on queue refusals and abandon it.
+                recovery::undo_attempt(data_dir, pending);
+                shared.launch_deferred.store(true, Ordering::SeqCst);
                 return;
             }
         }
@@ -1400,6 +1493,13 @@ fn recover_one(
                 true
             } else {
                 hold_in_memory(shared, assembled);
+                // A failed WRITE says nothing about the evidence (the volume is
+                // full or read-only), unlike an assemble failure, so it must not
+                // use up the session's attempts: a supervisor crash loop would
+                // kill the process before the memory copy is sent, and three such
+                // launches would discard a crash that was never delivered. The
+                // launch pass keeps its claim so the worker does not hold it twice.
+                recovery::undo_attempt(data_dir, pending);
                 false
             }
         }
@@ -1439,6 +1539,8 @@ fn worker_loop(
     caps: WindowCaps,
     mut sampler: Option<Box<dyn TelemetrySampler>>,
     upload_tx: Sender<UploadMsg>,
+    generation: u64,
+    recover_dir: Option<PathBuf>,
 ) {
     // Rotation/eviction/telemetry must run on a wall-clock cadence, NOT only when
     // `recv_timeout` times out. Under sustained capture traffic every `recv`
@@ -1536,6 +1638,20 @@ fn worker_loop(
                 health.sync_errors(shared.health_errors.load(Ordering::SeqCst));
             }
             next_rotate = Instant::now() + rotate_interval;
+        }
+        // The launch-path pass left a session for us (queue cap) after our one
+        // pass had already run, because it outlived the wait: take it now.
+        // `recover_dir` is the tree startup recovery used: it exists in memory
+        // mode too, where `data_dir` (the capture tree) does not.
+        if let Some(dir) = &recover_dir {
+            if shared.launch_done.load(Ordering::SeqCst)
+                && shared.launch_deferred.swap(false, Ordering::SeqCst)
+            {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_recovery(&shared, dir, generation, marker.as_deref(), true);
+                }));
+                let _ = upload_tx.send(UploadMsg::Wake);
+            }
         }
         // Independent of the rotation interval (which a host may set large).
         if Instant::now() >= next_heartbeat {
@@ -1942,6 +2058,17 @@ fn uploader_loop(
     }
 }
 
+/// Retire a queued report whose work is over (delivered, or abandoned for any
+/// reason). If the directory will not let us delete it (read-only or full), it is
+/// remembered so no later drain selects it again: otherwise a terminal verdict on
+/// such a directory would be re-sent every 20 ms of a flush and every poll.
+fn retire_queued(shared: &Shared, report: &queue::QueuedReport) {
+    queue::remove(report);
+    if report.bundle.exists() {
+        shared.delivered_stuck.lock().insert(report.bundle.clone());
+    }
+}
+
 /// Queued reports in `dir` still awaiting delivery: everything on disk except
 /// bundles already delivered whose deletion failed.
 fn pending_reports(shared: &Shared, dir: &Path) -> Vec<queue::QueuedReport> {
@@ -2063,13 +2190,7 @@ fn deliver_queued(
         cached_endpoint.as_deref(),
         &mut endpoint_out,
     ) {
-        Ok(()) => {
-            queue::remove(report);
-            if report.bundle.exists() {
-                // Delivered, but the directory will not let us delete it.
-                shared.delivered_stuck.lock().insert(report.bundle.clone());
-            }
-        }
+        Ok(()) => retire_queued(shared, report),
         // A transient failure OR a still-expired session are both retryable.
         Err(TransportError::Transient(_)) | Err(TransportError::SessionExpired) => {
             // Persist the presigned endpoint if the failure left one to resume
@@ -2081,7 +2202,7 @@ fn deliver_queued(
             if count_failure {
                 let n = retry + 1;
                 if n >= UPLOAD_RETRY_CAP {
-                    queue::remove(report);
+                    retire_queued(shared, report);
                     notify_dropped(shared, DropReason::RetriesExhausted);
                 } else {
                     queue::set_meta(report, n, now + backoff_delay(n, backoff_base));
@@ -2100,12 +2221,12 @@ fn deliver_queued(
             };
             queue::blacklist_add(data_dir, &sigs);
             shared.mem_blacklist.lock().extend(sigs);
-            queue::remove(report);
+            retire_queued(shared, report);
             notify_dropped(shared, DropReason::TooManySimilar);
         }
         // Duplicate / permanent — abandon the report.
         Err(e) => {
-            queue::remove(report);
+            retire_queued(shared, report);
             notify_dropped(shared, drop_reason_for(e));
         }
     }
@@ -2149,6 +2270,10 @@ fn drain_memory(
     let mut tried: Vec<u64> = Vec::new();
     loop {
         if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        // A dying process starts no delivery it cannot finish (crash_flush).
+        if crate::crash_flush::is_dying() {
             break;
         }
         let now = epoch_ms();

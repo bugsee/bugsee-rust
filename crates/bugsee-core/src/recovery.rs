@@ -99,6 +99,7 @@ pub fn find_pending_bounded(
         }
     }
     candidates.sort_unstable_by(|a, b| b.cmp(a));
+    let mut retried = Vec::new();
     let (mut fresh, mut retries) = (0usize, 0usize);
     for generation in candidates.into_iter().take(limit.saturating_mul(16)) {
         if fresh >= limit && retries >= limit {
@@ -116,20 +117,43 @@ pub fn find_pending_bounded(
         let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
         let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
         let panic_info = exists_opt(parts_dir.join(PANIC_INFO_NAME));
-        if retrying {
-            retries += 1;
-        } else {
-            fresh += 1;
-        }
-        pending.push(PendingSession {
+        let session = PendingSession {
             generation,
             parts_dir,
             minidump,
             crash_info,
             panic_info,
-        });
+        };
+        if retrying {
+            retries += 1;
+            retried.push(session);
+        } else {
+            fresh += 1;
+            pending.push(session);
+        }
     }
-    pending
+    // Sessions already tried come FIRST. If recovering the newest keeps killing
+    // the process, each death leaves another newer session behind and the older
+    // one would never get its next attempt counted (and never be queued, or
+    // abandoned at the cap).
+    retried.extend(pending);
+    retried
+}
+
+/// Give back the attempt [`bump_attempts`] just counted, for a session that was
+/// refused for a reason that says nothing about its evidence (the launch path had
+/// no queue room), so such refusals cannot use up `MAX_RECOVERY_ATTEMPTS`.
+pub fn undo_attempt(data_dir: &Path, pending: &PendingSession) {
+    let path = attempts_path(data_dir, pending.generation);
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if current <= 1 {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let _ = std::fs::write(&path, (current - 1).to_string());
+    }
 }
 
 fn exists_opt(p: PathBuf) -> Option<PathBuf> {
@@ -154,7 +178,10 @@ fn session_is_crashed(data_dir: &Path, generation: u64, marker: &Path, self_pid:
             crate::claim::Probe::Free => {
                 return !(marker_is_empty(marker) && marker_is_fresh(marker));
             }
-            crate::claim::Probe::Unknown => {}
+            // No lock file after all (it vanished since `exists`, e.g. a session
+            // without kernel locks removing it), or the filesystem cannot say:
+            // that is not evidence of death. Use the heartbeat / pid.
+            crate::claim::Probe::Vanished | crate::claim::Probe::Unknown => {}
         }
     }
     legacy_marker_is_dead(marker, self_pid)
@@ -1032,6 +1059,20 @@ mod tests {
     }
 
     #[test]
+    fn an_undone_attempt_is_not_counted() {
+        let dir = tmp();
+        marker(&dir, 1, "0");
+        let pending = find_pending(&dir, u64::MAX).pop().unwrap();
+        assert_eq!(bump_attempts(&dir, &pending), 1);
+        assert_eq!(bump_attempts(&dir, &pending), 2);
+        undo_attempt(&dir, &pending);
+        assert_eq!(bump_attempts(&dir, &pending), 2);
+        undo_attempt(&dir, &pending);
+        undo_attempt(&dir, &pending);
+        assert_eq!(bump_attempts(&dir, &pending), 1);
+    }
+
+    #[test]
     fn a_session_with_failed_attempts_is_not_starved_by_newer_ones() {
         let dir = tmp();
         for g in 1..=6u64 {
@@ -1043,7 +1084,9 @@ mod tests {
             .iter()
             .map(|p| p.generation)
             .collect();
-        assert_eq!(got, vec![6, 5, 2]);
+        // The one already tried comes first, so it advances even if the newest
+        // keeps killing the process.
+        assert_eq!(got, vec![2, 6, 5]);
     }
 
     #[test]
@@ -1119,6 +1162,26 @@ mod tests {
             .unwrap();
         drop(f);
         assert_eq!(gens(&dir), vec![1], "quiet heartbeat: crashed");
+    }
+
+    #[test]
+    fn a_lock_file_that_vanishes_under_the_scan_is_not_evidence_of_a_crash() {
+        // A lock-less session unlinks its `<gen>.lock` before it writes its
+        // heartbeat; a peer that saw the file must fall back to the beat.
+        let dir = tmp();
+        let m = marker(&dir, 1, "4294967290");
+        let lock = Session::lock_path(&dir, 1);
+        std::fs::write(&lock, "").unwrap();
+        std::fs::write(heartbeat_path(&m), "").unwrap();
+        let lock2 = lock.clone();
+        crate::claim::BEFORE_PROBE_OPEN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = std::fs::remove_file(&lock2);
+            }));
+        });
+        let found = gens(&dir);
+        crate::claim::BEFORE_PROBE_OPEN.with(|h| *h.borrow_mut() = None);
+        assert!(found.is_empty(), "fresh heartbeat: the session is alive");
     }
 
     #[test]

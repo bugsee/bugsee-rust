@@ -32,7 +32,7 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 0 — Harness | ✅ | Workspace, mock 3-step API server, bundle validator, subprocess crash runner, CI **matrix across ubuntu/macOS/windows** (build/test/clippy per platform, fmt once) + pinned-MSRV job. |
 | 1 — Ingestible bundle (core) | ✅ | Sliding-window capture (time/byte/event caps), length-prefixed part streams, envelope/manifest, Zstd method-93 ZIP, signatures. |
 | 2 — Handled errors + caught panics | ✅ | `catch_unwind` guards, panic snapshot, error/cause chains. Follow-ups: `tracing` Layer + `log` adapter done. Subsystem quarantine still open. |
-| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** Windows native capture — SEH/VEH handler, PE CodeView module map, marker + frame capture — so all three desktop platforms report fatal crashes. Open: best-effort in-flight flush, full out-of-process minidump. |
+| 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** Windows native capture — SEH/VEH handler, PE CodeView module map, marker + frame capture — so all three desktop platforms report fatal crashes. In-flight events are now flushed at crash (bounded 50 ms, signal-safe wake of the capture worker; #13). Open: full out-of-process minidump. |
 | 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. **New:** the environment is actually populated — OS version, kernel, memory, disk, locale, and app identity (`package_id`/`version`/`build`) via `LaunchOptions::app_version`. Open: sessions / release-health. |
 | 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. **New:** `on_report_dropped` — delivery failure is observable at last; `flush()` alone never could distinguish delivered from discarded. Open: general PII scrubber, rate limits. |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
@@ -426,14 +426,19 @@ can fix.
    browser SDK is also the remaining producer exposed to the
    `platform.jailbreak` class of bug — the appserver fix protects it now, but its
    `EnvironmentPlatform` is still `{type, os, locale}`.
-3. **Two environment fields remain unpopulated**, both needing a decision rather
-   than effort. `utc_offset`: the `time` crate refuses a local offset in a
-   multithreaded process (an SDK always is one), so it needs `localtime_r`/Win32
-   and a small `unsafe` — which belongs in the host crate, not core.
-   `hardware.model`: no `sysinfo` API, per-platform work, and on desktop it
-   yields a mainboard string worth little until Phase 6 puts this SDK on mobile.
-   Windows `locale` is likewise unset — `GetUserDefaultLocaleName` needs a
-   binding or a crate, and this SDK still takes no new dependencies.
+3. **Environment fields `utc_offset`, `hardware.model` and Windows `locale` are
+   now populated** (#16), in `crates/bugsee/src/hostinfo.rs` — the one place in
+   the host crate that calls the OS, so the `unsafe` stays out of core. No new
+   dependencies: `libc` (already in the tree) on unix, hand-declared
+   `kernel32`/`advapi32` calls on Windows. `utc_offset` is `localtime_r`
+   `tm_gmtoff` / `GetTimeZoneInformation` (the `time` crate refuses a local
+   offset in a multithreaded process). `hardware.model` is `sysctl hw.model` on
+   macOS/iOS, DMI `product_name` then the device-tree `model` on Linux, and the
+   SMBIOS `SystemProductName` registry value on Windows; firmware placeholders
+   ("To Be Filled By O.E.M.") are reported as absent, and Android reports none.
+   Windows `locale` falls back to the first preferred UI language (`GetUserPreferredUILanguages`, then `GetUserDefaultLocaleName`) when the POSIX
+   variables are unset. Windows code is type-checked and clippy-clean but its
+   tests have not been run on real hardware.
 
 ### Decided against
 
@@ -514,7 +519,7 @@ Rust and are worth evaluating before building one.
 ### Remaining phase work
 
 - Phase 2: subsystem quarantine (auto-disable a repeatedly-faulting integration).
-- Phase 3: best-effort in-flight flush at crash; full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
+- Phase 3: full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
 - Phase 4: sessions / release-health: SDK half done, experimental and off by default (#12: eager session registration plus local session records; the backend has no session-health ingest, see DESIGN.md §10).
 - Phase 5: general PII scrubber, rate limits.
 - Phase 6: iOS/Android target builds; Swift/Kotlin language wrappers.

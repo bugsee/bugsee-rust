@@ -87,6 +87,10 @@ impl Drop for Claim {
 /// Try to claim `path` (created if absent). `None` if another process, or another
 /// thread of this one, holds it, or if it cannot be claimed.
 pub fn try_claim(path: &Path) -> Option<Claim> {
+    // A dying process must not start work a kill would leave half-claimed.
+    if crate::crash_flush::is_dying() {
+        return None;
+    }
     match acquire(path) {
         Acquire::Got(claim) => Some(claim),
         Acquire::Held | Acquire::Unavailable => None,
@@ -100,6 +104,9 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
 /// may both do the work, and the backend deduplicates. `None` means another
 /// process (or thread) holds the claim.
 pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
+    if crate::crash_flush::is_dying() {
+        return None;
+    }
     match acquire(path) {
         Acquire::Got(claim) => Some(Some(claim)),
         Acquire::Unavailable => Some(None),
@@ -111,11 +118,15 @@ pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
 pub(crate) enum Probe {
     Held,
     Free,
+    /// There is no lock file (any longer). Not the same as [`Probe::Free`]: a
+    /// caller that saw the file exist and finds it gone must not conclude that its
+    /// holder died, since a session without kernel locks unlinks its lock file.
+    Vanished,
     /// The filesystem cannot say (it rejects locks): use another liveness signal.
     Unknown,
 }
 
-/// Is `path` currently claimed? A missing file is free. A file that cannot be
+/// Is `path` currently claimed? A missing file is [`Probe::Vanished`]. A file that cannot be
 /// inspected is [`Probe::Unknown`], never assumed held: a crashed session's
 /// leftover lock file must not hide the crash on a volume that has become
 /// read-only.
@@ -123,15 +134,18 @@ pub(crate) enum Probe {
 /// On unix this asks (`F_GETLK`) without taking the lock, so a probe can never
 /// steal the lock from a creator that has made the file but not yet locked it.
 pub(crate) fn probe(path: &Path) -> Probe {
-    if !path.exists() {
-        return Probe::Free;
-    }
     let key = key_of(path);
     if !registry().insert(&key) {
         return Probe::Held; // held by a thread of this process, or being probed
     }
     // Read-only: a querying lock call needs no write access, and a leftover lock
     // file on a read-only volume (or with 0444 mode) must still be probeable.
+    #[cfg(test)]
+    BEFORE_PROBE_OPEN.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook();
+        }
+    });
     let result = match OpenOptions::new().read(true).open(path) {
         Ok(file) => {
             let r = match test_is_locked(&file) {
@@ -145,8 +159,7 @@ pub(crate) fn probe(path: &Path) -> Probe {
             drop(file); // close before leaving the registry
             r
         }
-        // Vanished since the existence check: nothing holds it.
-        Err(_) if !path.exists() => Probe::Free,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::Vanished,
         Err(_) => Probe::Unknown,
     };
     registry().remove(&key);
@@ -261,6 +274,17 @@ thread_local! {
     /// Test hook: make this thread's lock calls behave as on a filesystem that
     /// rejects locks.
     pub(crate) static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+type Hook = Box<dyn Fn()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs inside `probe` just before it opens the file, to simulate
+    /// the lock file vanishing between a caller's existence check and the probe.
+    pub(crate) static BEFORE_PROBE_OPEN: std::cell::RefCell<Option<Hook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn test_try_lock(file: &File) -> std::io::Result<Lock> {
@@ -569,7 +593,7 @@ mod tests {
     fn a_missing_lock_file_probes_free_and_is_not_created() {
         let dir = tmp();
         let path = dir.join("nope.lock");
-        assert!(matches!(probe(&path), Probe::Free));
+        assert!(matches!(probe(&path), Probe::Vanished));
         assert!(!path.exists());
     }
 

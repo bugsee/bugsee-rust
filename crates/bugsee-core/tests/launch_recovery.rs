@@ -207,13 +207,19 @@ fn a_full_queue_defers_a_unique_crash_to_the_worker_instead_of_discarding_it() {
     let rec =
         Recorder::launch(config(&dir, Duration::from_millis(500)), Arc::new(Offline)).unwrap();
     rec.recover_on_launch_path();
-    // Not queued by the launch pass, and its evidence is still on disk.
-    assert_eq!(queue::list_pending(&dir).len(), queue::MAX_QUEUED_REPORTS);
-    assert!(dir.join("sessions").join("1.alive").exists());
-
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The launch pass refused it (the worker may already be queueing it, so
+    // only the outcome is asserted): it ends up queued, not discarded, and
+    // without having used up its recovery attempts.
+    // Observable condition, generous timeout: a loaded CI machine can delay the
+    // helper thread, the worker's wait (budget plus a 5 s grace) and its pass.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while queue::list_pending(&dir).len() <= queue::MAX_QUEUED_REPORTS {
-        assert!(Instant::now() < deadline, "the worker never recovered it");
+        assert!(
+            Instant::now() < deadline,
+            "the worker never recovered it: {} queued, session marker present: {}",
+            queue::list_pending(&dir).len(),
+            dir.join("sessions").join("1.alive").exists()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(rec);

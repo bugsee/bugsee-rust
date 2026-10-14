@@ -383,7 +383,13 @@ fn run_case(case: &Case) -> Result<(), String> {
         let left_behind = crash_info_files(&dir);
 
         // --- relaunch: exactly one usable report ---------------------------
-        let bundles = relaunch_and_collect(&dir);
+        let mut bundles = relaunch_and_collect(&dir);
+        // A worker-thread panic is also reported inline as a handled error, and
+        // the crash-time flush (#13) now lets that report survive the abort. It
+        // is a separate, non-fatal issue; the crash is the unhandled one.
+        if case.kind == "aborting_panic_thread" {
+            bundles.retain(|b| crash_json_from(b)["handled"] != true);
+        }
         if bundles.len() != 1 {
             return Err(format!(
                 "expected exactly one report, got {} (child stderr: {})",
