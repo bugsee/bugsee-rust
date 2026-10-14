@@ -61,7 +61,9 @@ fn launch_degrades_through_the_resolution_order() {
     assert!(!status.may_be_ephemeral());
     drop(guard);
 
-    // 2. An unusable explicit directory falls through to the environment variable.
+    // 2. A directory the host asked for is FINAL: unusable means memory mode, not
+    //    some other location on disk (here the environment variable is writable
+    //    and must stay untouched).
     let from_env = s.join("from-env");
     std::env::set_var(DATA_DIR_ENV, &from_env);
     let guard = Bugsee::launch_with(
@@ -71,20 +73,27 @@ fn launch_degrades_through_the_resolution_order() {
     )
     .expect("launch");
     let status = Bugsee::storage_status().expect("status");
+    assert_eq!(status.mode, StorageMode::Memory);
+    assert!(status.explicit_rejected.is_some());
+    assert!(!from_env.exists(), "must not fall back to another location");
+    drop(guard);
+
+    // 3. Without an explicit directory the environment variable is used.
+    let guard =
+        Bugsee::launch_with(LaunchOptions::new("TOKEN_A").with_transport(transport.clone()))
+            .expect("launch");
+    let status = Bugsee::storage_status().expect("status");
     assert_eq!(status.source, DataDirSource::Environment);
     assert_eq!(status.data_dir.as_deref(), Some(from_env.as_path()));
-    assert_eq!(status.skipped.len(), 1);
     drop(guard);
     std::env::remove_var(DATA_DIR_ENV);
 
-    // 3. Nothing usable anywhere: memory mode, and reports still go out.
+    // 4. Nothing usable anywhere (no home, temp dir unusable): memory mode, and
+    //    reports still go out.
     let transport = Arc::new(MockTransport::default());
-    let guard = Bugsee::launch_with(
-        LaunchOptions::new("TOKEN_A")
-            .data_dir(&blocked)
-            .with_transport(transport.clone()),
-    )
-    .expect("an unwritable environment must not fail launch");
+    let guard =
+        Bugsee::launch_with(LaunchOptions::new("TOKEN_A").with_transport(transport.clone()))
+            .expect("an unwritable environment must not fail launch");
     let status = Bugsee::storage_status().expect("status");
     assert_eq!(status.mode, StorageMode::Memory);
     assert_eq!(status.source, DataDirSource::None);

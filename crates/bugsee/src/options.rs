@@ -231,8 +231,8 @@ impl LaunchOptions {
         }
     }
 
-    /// Pick the data directory: the first candidate in [`DataDirSource`] order
-    /// that can actually be created and written to.
+    /// Pick the data directory; see [`DataDirSource`] for the order and what an
+    /// unusable choice means.
     pub(crate) fn resolve_data_dir(&self) -> DataDirResolution {
         resolve_data_dir(
             self.data_dir.as_deref(),
@@ -249,25 +249,30 @@ pub const DATA_DIR_ENV: &str = "BUGSEE_DATA_DIR";
 
 /// Which step of the resolution order produced the data directory.
 ///
-/// Candidates are tried in this order and the first one that is writable wins;
-/// an unusable one is skipped (and recorded in
-/// [`StorageStatus::skipped`](crate::StorageStatus::skipped)), never fatal:
-///
 /// 1. [`Explicit`](DataDirSource::Explicit): [`LaunchOptions::data_dir`].
 /// 2. [`Environment`](DataDirSource::Environment): `BUGSEE_DATA_DIR`.
 /// 3. [`PlatformDefault`](DataDirSource::PlatformDefault): `bugsee/<token>` under
 ///    `$XDG_DATA_HOME` (else `~/.local/share`) on Linux, `~/Library/Application
 ///    Support` on macOS, `%LOCALAPPDATA%` on Windows. Skipped when the base is
 ///    unset, as in a container with no home directory.
-/// 4. [`TempFallback`](DataDirSource::TempFallback): `bugsee/<token>` under the
-///    system temp directory. Often wiped on restart, so crash recovery may not
-///    survive it; [`StorageStatus::may_be_ephemeral`](crate::StorageStatus::may_be_ephemeral)
+/// 4. [`TempFallback`](DataDirSource::TempFallback): `bugsee-<uid>/<token>` under
+///    the system temp directory (`bugsee/<token>` on Windows), created private
+///    (`0700`) and refused if it is a symlink or owned by another user. Often
+///    wiped on restart, so crash recovery may not survive it;
+///    [`StorageStatus::may_be_ephemeral`](crate::StorageStatus::may_be_ephemeral)
 ///    reports it.
 ///
-/// If none is writable the SDK runs
+/// **A directory you asked for is final.** If 1 or 2 is set and not writable the
+/// SDK does NOT quietly use another location on disk (that would scatter
+/// reports somewhere the operator never chose); it runs in memory and reports
+/// why in [`StorageStatus::explicit_rejected`](crate::StorageStatus::explicit_rejected).
+/// Only the defaults (3, then 4) fall through to each other.
+///
+/// With no usable directory the SDK runs
 /// [in memory](bugsee_core::runtime::StorageMode::Memory): handled errors and
 /// manual reports are still sent, but there is no capture window and no crash
 /// recovery. It logs one line to stderr when it degrades.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataDirSource {
     Explicit,
@@ -283,8 +288,14 @@ pub(crate) struct DataDirResolution {
     /// The chosen directory, or `None` if no candidate was writable.
     pub dir: Option<PathBuf>,
     pub source: DataDirSource,
-    /// Candidates tried and rejected before the winner, with the reason.
+    /// Default candidates tried and rejected before the winner, with the reason.
     pub skipped: Vec<String>,
+    /// Why an explicit / environment directory was rejected (it is final).
+    pub explicit_rejected: Option<String>,
+    /// The location earlier SDK versions used by default
+    /// (`<temp>/bugsee/<token>`), if it exists, is trustworthy and is not `dir`.
+    /// Its leftovers are recovered once at launch.
+    pub legacy_dir: Option<PathBuf>,
 }
 
 /// Pure resolution core: `env` and `temp` are injected so tests need not touch
@@ -295,37 +306,80 @@ pub(crate) fn resolve_data_dir(
     env: &dyn Fn(&str) -> Option<OsString>,
     temp: &Path,
 ) -> DataDirResolution {
-    let mut candidates: Vec<(DataDirSource, PathBuf)> = Vec::new();
-    if let Some(dir) = explicit {
-        candidates.push((DataDirSource::Explicit, dir.to_path_buf()));
+    let token = short_token(app_token);
+
+    let chosen = explicit
+        .map(|d| (DataDirSource::Explicit, d.to_path_buf()))
+        .or_else(|| {
+            env(DATA_DIR_ENV)
+                .filter(|v| !v.is_empty())
+                .map(|v| (DataDirSource::Environment, PathBuf::from(v)))
+        });
+    if let Some((source, dir)) = chosen {
+        return match prepare_dir(&dir, false) {
+            Ok(()) => DataDirResolution {
+                dir: Some(dir),
+                source,
+                skipped: Vec::new(),
+                explicit_rejected: None,
+                legacy_dir: None,
+            },
+            Err(e) => DataDirResolution {
+                dir: None,
+                source: DataDirSource::None,
+                skipped: Vec::new(),
+                explicit_rejected: Some(format!("{}: {e}", dir.display())),
+                legacy_dir: None,
+            },
+        };
     }
-    if let Some(dir) = env(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
-        candidates.push((DataDirSource::Environment, PathBuf::from(dir)));
-    }
-    // Isolate by app token so multiple apps don't collide.
-    let app = |base: PathBuf| base.join("bugsee").join(short_token(app_token));
+
+    let mut candidates: Vec<(DataDirSource, PathBuf, bool)> = Vec::new();
     if let Some(base) = platform_data_base(env) {
-        candidates.push((DataDirSource::PlatformDefault, app(base)));
+        candidates.push((
+            DataDirSource::PlatformDefault,
+            base.join("bugsee").join(&token),
+            false,
+        ));
     }
-    candidates.push((DataDirSource::TempFallback, app(temp.to_path_buf())));
+    candidates.push((
+        DataDirSource::TempFallback,
+        temp.join(private_temp_name()).join(&token),
+        true,
+    ));
 
     let mut skipped = Vec::new();
-    for (source, dir) in candidates {
-        match probe_writable(&dir) {
+    let mut found = None;
+    for (source, dir, private) in candidates {
+        match prepare_dir(&dir, private) {
             Ok(()) => {
-                return DataDirResolution {
-                    dir: Some(dir),
-                    source,
-                    skipped,
-                }
+                found = Some((source, dir));
+                break;
             }
             Err(e) => skipped.push(format!("{}: {e}", dir.display())),
         }
     }
-    DataDirResolution {
-        dir: None,
-        source: DataDirSource::None,
-        skipped,
+
+    let legacy = temp.join("bugsee").join(&token);
+    let legacy_dir = found
+        .as_ref()
+        .filter(|(_, dir)| *dir != legacy)
+        .and_then(|_| trusted_existing_dir(&legacy).then_some(legacy));
+    match found {
+        Some((source, dir)) => DataDirResolution {
+            dir: Some(dir),
+            source,
+            skipped,
+            explicit_rejected: None,
+            legacy_dir,
+        },
+        None => DataDirResolution {
+            dir: None,
+            source: DataDirSource::None,
+            skipped,
+            explicit_rejected: None,
+            legacy_dir: None,
+        },
     }
 }
 
@@ -341,14 +395,113 @@ fn platform_data_base(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf>
     }
 }
 
+/// The per-user directory name under the shared temp dir. The system temp
+/// directory is world-writable on unix, so a fixed name would let another user
+/// pre-create (or symlink) it and read or plant our reports.
+#[cfg(unix)]
+fn private_temp_name() -> String {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    format!("bugsee-{}", unsafe { libc::geteuid() })
+}
+#[cfg(not(unix))]
+fn private_temp_name() -> String {
+    "bugsee".to_string()
+}
+
 /// Create `dir` and prove a file can be written in it. Checking writability (not
 /// just existence) is what catches a read-only root file system or a volume
-/// mounted read-only.
+/// mounted read-only. With `private` (the shared temp area) each created
+/// component is `0700` and an existing one is refused unless it is a real
+/// directory owned by us.
+fn prepare_dir(dir: &Path, private: bool) -> std::io::Result<()> {
+    if private {
+        make_private(dir)?;
+    } else {
+        std::fs::create_dir_all(dir)?;
+    }
+    probe_writable(dir)
+}
+
+#[cfg(unix)]
+fn make_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // The shared temp dir itself is the system's; only the two components below
+    // it are ours to vet.
+    let leaf = dir;
+    let top = leaf.parent().unwrap_or(leaf);
+    if let Some(shared) = top.parent() {
+        std::fs::create_dir_all(shared)?;
+    }
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    for component in [top, leaf] {
+        match std::fs::DirBuilder::new().mode(0o700).create(component) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        // `symlink_metadata`: a symlink planted at our name must not be followed.
+        let meta = std::fs::symlink_metadata(component)?;
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::other(
+                "not a real directory (symlink or file at our private name)",
+            ));
+        }
+        if meta.uid() != uid {
+            return Err(std::io::Error::other("owned by another user"));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(component, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn make_private(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Whether `dir` exists and may be trusted to hold OUR leftovers: a real
+/// directory (not a symlink) owned by the current user. The legacy location is
+/// in the shared temp area, where anyone could have planted files.
+fn trusted_existing_dir(dir: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() {
+        return false;
+    }
+    owned_by_us(&meta)
+}
+
+#[cfg(unix)]
+fn owned_by_us(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    meta.uid() == unsafe { libc::geteuid() }
+}
+#[cfg(not(unix))]
+fn owned_by_us(_meta: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Prove a file can be created in `dir`. `create_new` with an unpredictable name
+/// refuses to follow or reuse anything pre-planted at that path.
 fn probe_writable(dir: &Path) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::create_dir_all(dir)?;
-    let probe = dir.join(format!(".bugsee-probe-{}", std::process::id()));
-    let result = std::fs::File::create(&probe).and_then(|mut f| f.write_all(b"1"));
+    let probe = dir.join(format!(
+        ".bugsee-probe-{}-{}",
+        std::process::id(),
+        bugsee_core::util::random_hex(8)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = options.open(&probe).and_then(|mut f| f.write_all(b"1"));
     let _ = std::fs::remove_file(&probe);
     result
 }
@@ -360,6 +513,7 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
 /// the process (a volume mount). The SDK cannot tell a volume from a scratch
 /// disk, so check [`may_be_ephemeral`](StorageStatus::may_be_ephemeral) and
 /// your own deployment.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct StorageStatus {
     /// `Disk` when the data directory is usable; `Memory` when it is not.
@@ -368,18 +522,26 @@ pub struct StorageStatus {
     pub data_dir: Option<PathBuf>,
     /// Which resolution step produced `data_dir`.
     pub source: DataDirSource,
-    /// Candidates rejected before the one in use, with the error for each.
+    /// Default candidates rejected before the one in use, with the error for each.
     pub skipped: Vec<String>,
+    /// Set when the directory the host asked for (`data_dir` or
+    /// `BUGSEE_DATA_DIR`) was unusable. It is final: the SDK is in memory mode,
+    /// not on some other disk location.
+    pub explicit_rejected: Option<String>,
     /// Why the SDK is in memory mode, if it is.
     pub reason: Option<String>,
+    /// A disk write has failed since launch (full, read-only, removed). Reports
+    /// still go out, but crash recovery can no longer be relied on.
+    pub degraded: bool,
 }
 
 impl StorageStatus {
     /// Whether a fatal crash can be recovered on the next launch: true only with
-    /// a usable data directory. (It also needs that directory to survive the
-    /// process; see [`may_be_ephemeral`](Self::may_be_ephemeral).)
+    /// a usable data directory that has not failed since launch. (It also needs
+    /// that directory to survive the process; see
+    /// [`may_be_ephemeral`](Self::may_be_ephemeral).)
     pub fn crash_recovery_available(&self) -> bool {
-        self.mode == bugsee_core::runtime::StorageMode::Disk
+        self.mode == bugsee_core::runtime::StorageMode::Disk && !self.degraded
     }
 
     /// Whether the directory is the temp-dir fallback, which is commonly wiped
@@ -426,6 +588,14 @@ mod tests {
         }
     }
 
+    fn home_env(home: &Path) -> Vec<(&'static str, OsString)> {
+        vec![
+            ("HOME", home.as_os_str().to_owned()),
+            ("XDG_DATA_HOME", home.as_os_str().to_owned()),
+            ("LOCALAPPDATA", home.as_os_str().to_owned()),
+        ]
+    }
+
     #[test]
     fn explicit_directory_wins_when_writable() {
         let s = scratch();
@@ -434,20 +604,53 @@ mod tests {
         let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&env), &s.join("tmp"));
         assert_eq!(r.source, DataDirSource::Explicit);
         assert_eq!(r.dir.as_deref(), Some(explicit.as_path()));
-        assert!(r.skipped.is_empty());
+        assert!(r.skipped.is_empty() && r.explicit_rejected.is_none());
         let _ = std::fs::remove_dir_all(&s);
     }
 
     #[test]
-    fn unwritable_explicit_falls_through_to_the_environment_variable() {
+    fn unwritable_explicit_is_final_and_never_falls_to_another_location() {
         let s = scratch();
-        let bad = blocked(&s, "f1");
+        let good_env = s.join("from-env");
+        let env = [(DATA_DIR_ENV, good_env.clone().into_os_string())];
+        let mut full_env = env.to_vec();
+        full_env.extend(home_env(&s.join("home")));
+        let r = resolve_data_dir(
+            Some(&blocked(&s, "f1")),
+            "tok",
+            &env_of(&full_env),
+            &s.join("tmp"),
+        );
+        assert!(r.dir.is_none());
+        assert_eq!(r.source, DataDirSource::None);
+        assert!(r.explicit_rejected.is_some());
+        assert!(
+            !good_env.exists(),
+            "the environment variable must not be tried"
+        );
+        assert!(!s.join("home").exists() && !s.join("tmp").exists());
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn unwritable_environment_directory_is_final_too() {
+        let s = scratch();
+        let mut env = vec![(DATA_DIR_ENV, blocked(&s, "f2").into_os_string())];
+        env.extend(home_env(&s.join("home")));
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
+        assert!(r.dir.is_none() && r.explicit_rejected.is_some());
+        assert!(!s.join("home").exists() && !s.join("tmp").exists());
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn environment_variable_is_used_without_an_explicit_directory() {
+        let s = scratch();
         let good = s.join("from-env");
         let env = [(DATA_DIR_ENV, good.clone().into_os_string())];
-        let r = resolve_data_dir(Some(&bad), "tok", &env_of(&env), &s.join("tmp"));
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
         assert_eq!(r.source, DataDirSource::Environment);
         assert_eq!(r.dir, Some(good));
-        assert_eq!(r.skipped.len(), 1, "the rejected candidate is recorded");
         let _ = std::fs::remove_dir_all(&s);
     }
 
@@ -455,40 +658,63 @@ mod tests {
     fn platform_default_is_used_when_home_is_set() {
         let s = scratch();
         let home = s.join("home");
-        let env = [
-            ("HOME", home.clone().into_os_string()),
-            ("XDG_DATA_HOME", home.clone().into_os_string()),
-            ("LOCALAPPDATA", home.clone().into_os_string()),
-        ];
-        let r = resolve_data_dir(None, "tok-1", &env_of(&env), &s.join("tmp"));
+        let r = resolve_data_dir(None, "tok-1", &env_of(&home_env(&home)), &s.join("tmp"));
         assert_eq!(r.source, DataDirSource::PlatformDefault);
         assert!(r.dir.unwrap().starts_with(&home));
         let _ = std::fs::remove_dir_all(&s);
     }
 
     #[test]
-    fn no_home_falls_back_to_the_temp_directory() {
+    fn no_home_falls_back_to_a_private_temp_directory() {
         let s = scratch();
         let tmp = s.join("tmp");
         let r = resolve_data_dir(None, "tok-1", &env_of(&[]), &tmp);
         assert_eq!(r.source, DataDirSource::TempFallback);
-        assert_eq!(r.dir, Some(tmp.join("bugsee").join("tok1")));
+        let dir = r.dir.unwrap();
+        assert_eq!(dir, tmp.join(private_temp_name()).join("tok1"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [dir.as_path(), dir.parent().unwrap()] {
+                let mode = std::fs::metadata(d).unwrap().permissions().mode();
+                assert_eq!(mode & 0o077, 0, "{} must be private", d.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_fallback_refuses_a_symlink_planted_at_the_private_name() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let elsewhere = s.join("elsewhere");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmp.join(private_temp_name())).unwrap();
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &tmp);
+        assert!(r.dir.is_none(), "must not follow the symlink");
+        assert_eq!(r.skipped.len(), 1);
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing may be created through the symlink"
+        );
         let _ = std::fs::remove_dir_all(&s);
     }
 
     #[test]
-    fn nothing_writable_resolves_to_none_and_lists_every_attempt() {
+    fn nothing_writable_resolves_to_none_and_lists_every_default_attempt() {
         let s = scratch();
-        let env = [(DATA_DIR_ENV, blocked(&s, "f2").into_os_string())];
+        let blocked_home = blocked(&s, "f3");
         let r = resolve_data_dir(
-            Some(&blocked(&s, "f3")),
+            None,
             "tok",
-            &env_of(&env),
+            &env_of(&home_env(&blocked_home)),
             &blocked(&s, "f4"),
         );
         assert_eq!(r.source, DataDirSource::None);
         assert!(r.dir.is_none());
-        assert_eq!(r.skipped.len(), 3);
+        assert_eq!(r.skipped.len(), 2);
         let _ = std::fs::remove_dir_all(&s);
     }
 
@@ -498,6 +724,27 @@ mod tests {
         let env = [(DATA_DIR_ENV, OsString::new())];
         let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
         assert_eq!(r.source, DataDirSource::TempFallback);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    // Unix only: elsewhere the temp fallback IS the old location.
+    #[cfg(unix)]
+    #[test]
+    fn the_previous_default_location_is_offered_for_recovery_only_if_it_exists() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &tmp);
+        assert!(r.legacy_dir.is_none(), "nothing to adopt yet");
+
+        let legacy = tmp.join("bugsee").join("tok");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &tmp);
+        assert_eq!(r.legacy_dir, Some(legacy.clone()));
+
+        // A host that chose its directory never used the legacy one.
+        let explicit = s.join("explicit");
+        let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&[]), &tmp);
+        assert!(r.legacy_dir.is_none());
         let _ = std::fs::remove_dir_all(&s);
     }
 }

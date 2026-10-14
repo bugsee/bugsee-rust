@@ -21,6 +21,10 @@ fn full_c_abi_lifecycle() {
     let token = c(&format!("ffiLifecycle{}", std::process::id()));
     let endpoint = c("http://127.0.0.1:1"); // connection refused; offline-safe
 
+    // Keep the SDK's state out of the developer's real data directory.
+    let data = std::env::temp_dir().join(format!("bugsee-ffi-{}", std::process::id()));
+    std::env::set_var(bugsee::DATA_DIR_ENV, &data);
+
     assert_eq!(
         unsafe { bugsee_launch_with_endpoint(token.as_ptr(), endpoint.as_ptr()) },
         BugseeStatus::Ok
@@ -85,8 +89,5 @@ fn full_c_abi_lifecycle() {
     assert_eq!(bugsee_stop(), BugseeStatus::Ok);
     assert_eq!(bugsee_is_active(), 0, "stopped is not active");
 
-    // Cleanup the default per-token data dir.
-    let mut data = std::env::temp_dir();
-    data.push("bugsee");
     let _ = std::fs::remove_dir_all(data);
 }

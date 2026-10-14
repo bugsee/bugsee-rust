@@ -106,7 +106,7 @@ fn memory_only_config_skips_the_disk_entirely() {
     let transport = Arc::new(MockTransport::default());
     let data_dir = dir.path.join("must-stay-absent");
     let mut config = RecorderConfig::new(&data_dir, "T");
-    config.memory_only = true;
+    config.memory_only = Some("test".to_string());
 
     let recorder = Recorder::launch(config, transport.clone()).expect("launch");
 
@@ -140,6 +140,9 @@ fn read_only_directory_runs_in_memory_and_still_reports() {
 
 #[test]
 fn directory_removed_mid_run_still_reports() {
+    // The SDK recreates a vanished directory (`create_dir_all`) and open part
+    // files keep accepting writes to their unlinked inodes, so this report takes
+    // the disk queue again (the earlier capture window is gone with the files).
     let dir = TempDir::new();
     let data_dir = dir.path.join("data");
     let transport = Arc::new(MockTransport::default());
@@ -171,7 +174,12 @@ fn directory_replaced_by_a_file_mid_run_falls_back_to_memory_delivery() {
     std::fs::remove_dir_all(&data_dir).unwrap();
     std::fs::write(&data_dir, b"a file now").unwrap();
 
+    assert!(!recorder.is_degraded());
     assert_eq!(report_and_flush(&recorder, &transport), 1);
+    assert!(
+        recorder.is_degraded(),
+        "mid-run degradation must be visible"
+    );
     drop(recorder);
 }
 
@@ -191,49 +199,215 @@ fn queue_write_failure_holds_the_report_in_memory() {
     assert_eq!(recorder.storage_mode(), StorageMode::Disk);
 
     assert_eq!(report_and_flush(&recorder, &transport), 1);
+    assert!(recorder.is_degraded());
+    drop(recorder);
+    // The failed enqueue must not leak its hard-linked snapshot.
+    let leftovers = std::fs::read_dir(data_dir.join("reports"))
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0, "reports/<id> snapshot dirs must be reclaimed");
 }
 
 #[test]
-fn memory_backlog_is_bounded_and_overflow_is_reported() {
+fn legacy_directory_leftovers_are_delivered_once() {
+    use bugsee_core::model::report::TimeWindow;
+    use bugsee_core::reporting::assemble_docs;
+
+    let dir = TempDir::new();
+    let legacy = dir.path.join("legacy");
+    let data_dir = dir.path.join("data");
+    let meta = manual_upload_meta();
+    let env = bugsee_core::model::environment::Environment::detect_with(
+        "t",
+        &Default::default(),
+        &Default::default(),
+    );
+    let window = TimeWindow { start: 0, end: 1 };
+    let stranded = assemble_docs(Vec::new(), window, &meta, &env, None, &[], "T", 1).unwrap();
+    bugsee_core::queue::enqueue(&legacy, &stranded).unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    let mut config = RecorderConfig::new(&data_dir, "T");
+    config.legacy_data_dir = Some(legacy.clone());
+    let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+    assert!(recorder.flush(Duration::from_secs(10)));
+    // The startup drain is asynchronous; flush covers only the data dir queue.
+    let start = std::time::Instant::now();
+    while transport.uploaded_bundles.lock().unwrap().is_empty()
+        && start.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 1);
+    assert!(
+        bugsee_core::queue::list_pending(&legacy).is_empty(),
+        "a delivered legacy report must be removed"
+    );
+}
+
+/// Blocks every delivery until released, so the backlog cannot drain.
+struct Gate {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+impl Gate {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+struct Gated(Arc<Gate>);
+impl bugsee_core::Transport for Gated {
+    fn register_session(&self, _: &str, _: &[u8]) -> Result<String, bugsee_core::TransportError> {
+        let mut open = self.0.open.lock().unwrap();
+        while !*open {
+            open = self.0.cv.wait(open).unwrap();
+        }
+        Err(bugsee_core::TransportError::Transient("offline".into()))
+    }
+    fn create_issue(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: &[u8],
+    ) -> Result<String, bugsee_core::TransportError> {
+        Err(bugsee_core::TransportError::Transient("offline".into()))
+    }
+    fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), bugsee_core::TransportError> {
+        Err(bugsee_core::TransportError::Transient("offline".into()))
+    }
+}
+
+#[test]
+fn memory_backlog_is_bounded_even_while_a_delivery_is_in_flight() {
     use bugsee_core::runtime::DropReason;
-    use bugsee_core::transport::{Transport, TransportError};
     use std::sync::Mutex;
 
-    // Never delivers, so everything stays in the memory backlog.
-    struct Offline;
-    impl Transport for Offline {
-        fn register_session(&self, _: &str, _: &[u8]) -> Result<String, TransportError> {
-            Err(TransportError::Transient("offline".into()))
+    let dir = TempDir::new();
+    let gate = Arc::new(Gate {
+        open: Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let sink = dropped.clone();
+    let mut config = RecorderConfig::new(blocked_path(&dir.path), "T");
+    config.on_report_dropped = Some(Box::new(move |r| sink.lock().unwrap().push(r)));
+    let recorder = Recorder::launch(config, Arc::new(Gated(gate.clone()))).expect("launch");
+
+    for _ in 0..40 {
+        recorder.report(manual_upload_meta(), None);
+    }
+    // The worker has handled every report once a Flush message round-trips
+    // (the flush itself cannot finish: the uploader is held in the gate).
+    assert!(!recorder.flush(Duration::from_millis(500)));
+
+    let seen = dropped.lock().unwrap().clone();
+    gate.release();
+    assert_eq!(
+        seen.len(),
+        40 - 16,
+        "exactly the reports over the cap are dropped, got {seen:?}"
+    );
+    assert!(seen.iter().all(|r| *r == DropReason::StorageUnavailable));
+}
+
+#[test]
+fn memory_flush_respects_its_deadline_with_a_full_backlog() {
+    use std::time::Instant;
+
+    // Every attempt costs 100 ms and fails transiently.
+    struct Slow;
+    impl bugsee_core::Transport for Slow {
+        fn register_session(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Err(bugsee_core::TransportError::Transient("slow".into()))
         }
         fn create_issue(
             &self,
             _: &str,
             _: Option<&str>,
             _: &[u8],
-        ) -> Result<String, TransportError> {
-            Err(TransportError::Transient("offline".into()))
+        ) -> Result<String, bugsee_core::TransportError> {
+            Err(bugsee_core::TransportError::Transient("slow".into()))
         }
-        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), TransportError> {
-            Err(TransportError::Transient("offline".into()))
+        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), bugsee_core::TransportError> {
+            Err(bugsee_core::TransportError::Transient("slow".into()))
         }
     }
 
     let dir = TempDir::new();
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let sink = dropped.clone();
-    let mut config = RecorderConfig::new(blocked_path(&dir.path), "T");
-    config.on_report_dropped = Some(Box::new(move |r| sink.lock().unwrap().push(r)));
-    let recorder = Recorder::launch(config, Arc::new(Offline)).expect("launch");
-
-    for _ in 0..40 {
+    let recorder = Recorder::launch(
+        RecorderConfig::new(blocked_path(&dir.path), "T"),
+        Arc::new(Slow),
+    )
+    .expect("launch");
+    for _ in 0..16 {
         recorder.report(manual_upload_meta(), None);
     }
-    // Flush cannot succeed (offline) but must return promptly, not hang.
-    assert!(!recorder.flush(Duration::from_millis(500)));
-
-    let seen = dropped.lock().unwrap().clone();
+    let start = Instant::now();
+    assert!(!recorder.flush(Duration::from_millis(400)));
+    // 16 attempts at 100 ms would be 1.6 s per pass if the deadline were ignored.
     assert!(
-        !seen.is_empty() && seen.iter().all(|r| *r == DropReason::StorageUnavailable),
-        "overflow must be surfaced, got {seen:?}"
+        start.elapsed() < Duration::from_millis(1200),
+        "flush overran its deadline: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_failed_put_retries_at_the_put_and_does_not_mint_a_duplicate_issue() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The issue is created, then the first PUT fails transiently.
+    #[derive(Default)]
+    struct FlakyPut {
+        issues: AtomicUsize,
+        puts: AtomicUsize,
+    }
+    struct Handle(Arc<FlakyPut>);
+    impl bugsee_core::Transport for Handle {
+        fn register_session(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            Ok("token".into())
+        }
+        fn create_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            self.0.issues.fetch_add(1, Ordering::SeqCst);
+            Ok("https://uploads.example/x".into())
+        }
+        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), bugsee_core::TransportError> {
+            if self.0.puts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(bugsee_core::TransportError::Transient("reset".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let dir = TempDir::new();
+    let flaky = Arc::new(FlakyPut::default());
+    let recorder = Recorder::launch(
+        RecorderConfig::new(blocked_path(&dir.path), "T"),
+        Arc::new(Handle(flaky.clone())),
+    )
+    .expect("launch");
+    recorder.report(manual_upload_meta(), None);
+    assert!(recorder.flush(Duration::from_secs(10)));
+    assert_eq!(flaky.puts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        flaky.issues.load(Ordering::SeqCst),
+        1,
+        "the retry must resume at the PUT, not create the issue again"
     );
 }

@@ -54,6 +54,7 @@ pub struct ExtraFile {
 }
 
 /// A finished, ready-to-deliver report.
+#[derive(Clone)]
 pub struct AssembledReport {
     /// `<random20>.bundle.zip` file name.
     pub bundle_name: String,

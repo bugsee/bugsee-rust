@@ -50,6 +50,7 @@ struct Resolved {
     dir: Option<std::path::PathBuf>,
     source: DataDirSource,
     skipped: Vec<String>,
+    explicit_rejected: Option<String>,
 }
 static RESOLUTION: ForkMutex<Option<Resolved>> = ForkMutex::new(|| None);
 
@@ -86,15 +87,26 @@ impl Bugsee {
             dir,
             source,
             skipped,
+            explicit_rejected,
+            legacy_dir,
         } = options.resolve_data_dir();
-        let memory_only = dir.is_none();
+        let memory_only = dir.is_none().then(|| {
+            explicit_rejected
+                .clone()
+                .or_else(|| (!skipped.is_empty()).then(|| skipped.join("; ")))
+                .unwrap_or_else(|| "no usable data directory".to_string())
+        });
         let data_dir = dir.unwrap_or_else(|| std::env::temp_dir().join("bugsee"));
-        if !memory_only && !skipped.is_empty() {
-            bugsee_core::util::warn_once(&format!(
-                "data directory unusable ({}); using {}",
-                skipped.join("; "),
-                data_dir.display()
-            ));
+        if memory_only.is_none() && !skipped.is_empty() {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            bugsee_core::util::warn_once(
+                &WARNED,
+                &format!(
+                    "default data directory unusable ({}); using {}",
+                    skipped.join("; "),
+                    data_dir.display()
+                ),
+            );
         }
 
         let transport = match options.transport.clone() {
@@ -118,6 +130,7 @@ impl Bugsee {
 
         let mut config = RecorderConfig::new(data_dir, options.app_token.clone());
         config.memory_only = memory_only;
+        config.legacy_data_dir = legacy_dir;
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
         config.before_send = options.before_send;
@@ -148,7 +161,7 @@ impl Bugsee {
         // Nothing can be recovered without a disk, so crash markers and panic
         // snapshots have nowhere to go.
         let persistent = recorder.storage_mode() == StorageMode::Disk;
-        *RESOLUTION.lock() = Some(Resolved {
+        let resolved = Resolved {
             dir: persistent.then(|| recorder.data_dir().to_path_buf()),
             source: if persistent {
                 source
@@ -156,7 +169,8 @@ impl Bugsee {
                 DataDirSource::None
             },
             skipped,
-        });
+            explicit_rejected,
+        };
 
         #[cfg(feature = "panic")]
         let panic_info_path = recorder.panic_info_path();
@@ -183,7 +197,13 @@ impl Bugsee {
         // `Recorder::drop` joins the worker/uploader threads (blocking up to a few
         // seconds), and doing that under the global lock would stall every
         // concurrent capture call — the same hazard `stop()` guards against.
-        let old = RECORDER.lock().replace(recorder);
+        // The resolution is published under the same lock as the recorder, so
+        // `storage_status` never pairs one launch's recorder with another's.
+        let old = {
+            let mut slot = RECORDER.lock();
+            *RESOLUTION.lock() = Some(resolved);
+            slot.replace(recorder)
+        };
         drop(old);
         PAUSED.store(false, Ordering::SeqCst);
         *REVIVE_INFO.lock() = Some(ReviveInfo {
@@ -217,22 +237,20 @@ impl Bugsee {
     /// ([`StorageStatus::may_be_ephemeral`]).
     pub fn storage_status() -> Option<StorageStatus> {
         check_fork();
-        let (mode, reason) = {
-            let guard = RECORDER.lock();
-            let recorder = guard.as_ref()?;
-            (
-                recorder.storage_mode(),
-                recorder.storage_reason().map(String::from),
-            )
-        };
+        // Both locks, always in this order (as in `launch_with`), so the pair is
+        // one launch's.
+        let recorder = RECORDER.lock();
+        let recorder = recorder.as_ref()?;
         let resolved = RESOLUTION.lock();
         let resolved = resolved.as_ref()?;
         Some(StorageStatus {
-            mode,
+            mode: recorder.storage_mode(),
             data_dir: resolved.dir.clone(),
             source: resolved.source,
             skipped: resolved.skipped.clone(),
-            reason,
+            explicit_rejected: resolved.explicit_rejected.clone(),
+            reason: recorder.storage_reason().map(String::from),
+            degraded: recorder.is_degraded(),
         })
     }
 
@@ -558,8 +576,11 @@ fn revive_after_fork(epoch: u64) {
     #[cfg(feature = "native")]
     if old_native.is_some() {
         drop(old_native);
-        if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
-            *NATIVE.lock() = Some(handler);
+        // A child that fell back to memory has nowhere to keep a crash marker.
+        if recorder.storage_mode() == StorageMode::Disk {
+            if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
+                *NATIVE.lock() = Some(handler);
+            }
         }
     }
     #[cfg(feature = "panic")]

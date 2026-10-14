@@ -10,14 +10,17 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Print `message` to stderr the first time it is called in this process and do
+/// Print `message` to stderr the first time it is called with `flag` and do
 /// nothing after. For conditions the SDK must announce (it otherwise does no
-/// logging) but that would be noise if repeated, such as a degraded data dir.
-pub fn warn_once(message: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("bugsee: {message}");
+/// logging) but that would be noise if repeated, such as a degraded data dir;
+/// each kind of message owns a `static` flag so one does not mute another.
+///
+/// Never panics: a closed or broken stderr is ignored (`eprintln!` would panic).
+pub fn warn_once(flag: &std::sync::atomic::AtomicBool, message: &str) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    if !flag.swap(true, Ordering::Relaxed) {
+        let _ = writeln!(std::io::stderr(), "bugsee: {message}");
     }
 }
 
