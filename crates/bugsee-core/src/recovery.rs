@@ -61,20 +61,21 @@ pub struct RecoveredReport {
 /// because it launched earlier) has a live marker that is *not* a crash. Its
 /// marker is left in place for a future launch to recover once the peer is gone.
 pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSession> {
-    find_pending_bounded(data_dir, current_generation, usize::MAX, usize::MAX)
+    find_pending_bounded(data_dir, current_generation, usize::MAX)
 }
 
 /// Like [`find_pending`], for the launch path: newest generation first, and
-/// bounded. At most `scan_cap` directory entries are read and at most `limit`
-/// sessions returned, so a directory a crash loop has filled does not make launch
-/// scan, probe and stat without end. Names are sorted before any file is touched,
-/// so only the newest candidates cost a probe. A scan cut off by `scan_cap` may
-/// miss the newest session; the worker's unbounded pass picks up whatever the
-/// bounded one left.
+/// bounded in what it probes. Every session marker NAME is read (cheap, and the
+/// newest cannot be known without reading them all: `readdir` order is not
+/// generation order), sorted, and only then are files touched: the newest `limit`
+/// pending sessions, plus up to `limit` older ones that already have an
+/// `.attempts` sidecar. The latter keep a session that faults during recovery
+/// itself moving toward `MAX_RECOVERY_ATTEMPTS`, instead of being starved by the
+/// newer sessions each failed recovery leaves behind. At most `limit * 16`
+/// candidates are probed.
 pub fn find_pending_bounded(
     data_dir: &Path,
     current_generation: u64,
-    scan_cap: usize,
     limit: usize,
 ) -> Vec<PendingSession> {
     let mut pending = Vec::new();
@@ -85,12 +86,7 @@ pub fn find_pending_bounded(
     };
     let self_pid = std::process::id();
     let mut candidates: Vec<u64> = Vec::new();
-    // The cap counts session markers only: a session also leaves `.lock` and
-    // `.attempts` files that must not use it up.
-    // Entries read are bounded too (a session leaves about three files), so a
-    // directory full of unrelated files cannot make the scan long either.
-    let mut seen = 0usize;
-    for entry in read.flatten().take(scan_cap.saturating_mul(4)) {
+    for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(gen_str) = name.strip_suffix(".alive") else {
             continue;
@@ -98,50 +94,33 @@ pub fn find_pending_bounded(
         let Ok(generation) = gen_str.parse::<u64>() else {
             continue;
         };
-        if seen >= scan_cap {
-            break;
-        }
-        seen += 1;
         if generation < current_generation {
             candidates.push(generation);
         }
     }
     candidates.sort_unstable_by(|a, b| b.cmp(a));
-    for generation in candidates {
-        if pending.len() >= limit {
+    let (mut fresh, mut retries) = (0usize, 0usize);
+    for generation in candidates.into_iter().take(limit.saturating_mul(16)) {
+        if fresh >= limit && retries >= limit {
             break;
         }
+        let retrying = attempts_path(data_dir, generation).exists();
+        if (retrying && retries >= limit) || (!retrying && fresh >= limit) {
+            continue;
+        }
         let marker = sessions.join(format!("{generation}.alive"));
-        // A session whose `<gen>.lock` exists is arbitrated by that OS lock: held
-        // means a live process (in any pid namespace), free means it died. The
-        // marker's pid is not consulted, since it is only meaningful inside the
-        // writer's own pid namespace and can be reused.
-        let lock = crate::session::Session::lock_path(data_dir, generation);
-        if lock.exists() {
-            match crate::claim::probe(&lock) {
-                crate::claim::Probe::Held => continue,
-                crate::claim::Probe::Free => {
-                    // A launching session locks BEFORE it writes its pid, and a
-                    // marker still empty and fresh may be one that is between
-                    // creating the lock file and locking it.
-                    if marker_is_empty(&marker) && marker_is_fresh(&marker) {
-                        continue;
-                    }
-                }
-                // The filesystem rejects locks: fall back to the pid.
-                crate::claim::Probe::Unknown => {
-                    if !legacy_marker_is_dead(&marker, self_pid) {
-                        continue;
-                    }
-                }
-            }
-        } else if !legacy_marker_is_dead(&marker, self_pid) {
+        if !session_is_crashed(data_dir, generation, &marker, self_pid) {
             continue;
         }
         let parts_dir = data_dir.join("parts").join(generation.to_string());
         let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
         let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
         let panic_info = exists_opt(parts_dir.join(PANIC_INFO_NAME));
+        if retrying {
+            retries += 1;
+        } else {
+            fresh += 1;
+        }
         pending.push(PendingSession {
             generation,
             parts_dir,
@@ -157,10 +136,62 @@ fn exists_opt(p: PathBuf) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Whether a marker with no lock file beside it (written by an older SDK build,
-/// or by a session that could not lock) is a crashed session rather than a live
-/// peer, judged from its recorded pid. Only meaningful within one pid namespace.
+/// Whether the session `generation`, whose marker survives, has ended abnormally.
+///
+/// A session whose `<gen>.lock` exists is arbitrated by that OS lock: held means a
+/// live process (in any pid namespace), free means it died. The marker's pid is
+/// not consulted, since it is only meaningful inside the writer's own pid
+/// namespace and can be reused. Otherwise (no lock file, or the filesystem cannot
+/// say) the marker is judged by [`legacy_marker_is_dead`].
+fn session_is_crashed(data_dir: &Path, generation: u64, marker: &Path, self_pid: u32) -> bool {
+    let lock = crate::session::Session::lock_path(data_dir, generation);
+    if lock.exists() {
+        match crate::claim::probe(&lock) {
+            crate::claim::Probe::Held => return false,
+            // A launching session locks BEFORE it writes its pid, and a marker
+            // still empty and fresh may be one that is between creating the lock
+            // file and locking it.
+            crate::claim::Probe::Free => {
+                return !(marker_is_empty(marker) && marker_is_fresh(marker));
+            }
+            crate::claim::Probe::Unknown => {}
+        }
+    }
+    legacy_marker_is_dead(marker, self_pid)
+}
+
+/// How recently a lock-less session's heartbeat file must have been touched for
+/// the session to count as alive. Generous because network filesystems cache file
+/// attributes (Linux NFS `acregmax` defaults to 60 s), so a live beat can look much
+/// older than it is.
+const HEARTBEAT_STALE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The heartbeat file beside a marker. Only a session that could not take a lock
+/// (the filesystem rejects them) keeps one: it is touched every couple of seconds.
+pub(crate) fn heartbeat_path(marker: &Path) -> PathBuf {
+    marker.with_extension("beat")
+}
+
+/// Whether a marker with no usable lock beside it (written by an older SDK build,
+/// or by a session on a filesystem without locks) is a crashed session rather
+/// than a live peer.
+///
+/// A fresh heartbeat file means alive, whatever pid the marker names: that is the
+/// only signal that works across pid namespaces when there are no locks. Without
+/// one, the recorded pid is probed, which is only meaningful within one pid
+/// namespace. A crash is therefore recovered only once the heartbeat has gone
+/// quiet for [`HEARTBEAT_STALE`] (three minutes; a restart faster than that defers recovery to a
+/// later launch).
 fn legacy_marker_is_dead(marker: &Path, self_pid: u32) -> bool {
+    // A beat whose age cannot be established (a modification time in the future:
+    // the file server's clock runs ahead of ours) counts as fresh, like
+    // `marker_is_fresh`: only a beat demonstrably quiet condemns a session.
+    if std::fs::metadata(heartbeat_path(marker))
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().map(|age| age < HEARTBEAT_STALE).unwrap_or(true))
+    {
+        return false;
+    }
     let owner = std::fs::read_to_string(marker).unwrap_or_default();
     let owner = owner.trim();
     if owner.is_empty() {
@@ -374,6 +405,7 @@ pub fn discard(data_dir: &Path, pending: &PendingSession) {
     );
     let sessions = data_dir.join("sessions");
     let _ = std::fs::remove_file(sessions.join(format!("{}.alive", pending.generation)));
+    let _ = std::fs::remove_file(sessions.join(format!("{}.beat", pending.generation)));
     let _ = std::fs::remove_file(sessions.join(format!("{}.attempts", pending.generation)));
     let _ = std::fs::remove_dir_all(&pending.parts_dir);
 }
@@ -457,11 +489,14 @@ pub fn claim_pending(
     // (its claim released, the marker gone). Recovering it now would deliver a
     // phantom second report for it. The marker is removed first by `discard`, so
     // its absence, re-checked while holding the claim, is conclusive.
-    data_dir
-        .join("sessions")
-        .join(format!("{}.alive", pending.generation))
-        .exists()
-        .then_some(claim)
+    //
+    // It also re-evaluates liveness under the claim: between the scan and now a
+    // launching session may have finished taking its lock (the scan saw it free,
+    // then the pid appeared), and a live session must not be torn down.
+    let marker = crate::session::Session::marker_path(data_dir, pending.generation);
+    (marker.exists()
+        && session_is_crashed(data_dir, pending.generation, &marker, std::process::id()))
+    .then_some(claim)
 }
 
 /// Reap leftover on-disk state from generations that no longer have a liveness
@@ -489,7 +524,10 @@ pub fn gc_orphans(data_dir: &Path, current_generation: u64) {
     if let Ok(read) = std::fs::read_dir(&sessions) {
         for entry in read.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(gen_str) = name.strip_suffix(".attempts") {
+            if let Some(gen_str) = name
+                .strip_suffix(".attempts")
+                .or_else(|| name.strip_suffix(".beat"))
+            {
                 if let Ok(generation) = gen_str.parse::<u64>() {
                     if generation < current_generation && !alive(generation) {
                         let _ = std::fs::remove_file(entry.path());
@@ -962,19 +1000,32 @@ mod tests {
         for g in [3u64, 9, 1, 7, 5] {
             marker(&dir, g, "0");
         }
-        let got = |current, scan, limit| -> Vec<u64> {
-            find_pending_bounded(&dir, current, scan, limit)
+        let got = |current, limit| -> Vec<u64> {
+            find_pending_bounded(&dir, current, limit)
                 .iter()
                 .map(|p| p.generation)
                 .collect()
         };
-        assert_eq!(got(u64::MAX, 100, 100), vec![9, 7, 5, 3, 1]);
-        assert_eq!(got(u64::MAX, 100, 2), vec![9, 7]);
+        assert_eq!(got(u64::MAX, 100), vec![9, 7, 5, 3, 1]);
+        assert_eq!(got(u64::MAX, 2), vec![9, 7]);
         // Only older generations than the caller's own are candidates.
-        assert_eq!(got(7, 100, 100), vec![5, 3, 1]);
-        // A scan cut short reads fewer entries (which ones is directory order).
-        assert!(got(u64::MAX, 2, 100).len() <= 2);
-        assert!(got(u64::MAX, 0, 100).is_empty());
+        assert_eq!(got(7, 100), vec![5, 3, 1]);
+        assert!(got(u64::MAX, 0).is_empty());
+    }
+
+    #[test]
+    fn a_session_with_failed_attempts_is_not_starved_by_newer_ones() {
+        let dir = tmp();
+        for g in 1..=6u64 {
+            marker(&dir, g, "0");
+        }
+        // Session 2 was tried before (and the process died doing it).
+        std::fs::write(attempts_path(&dir, 2), "1").unwrap();
+        let got: Vec<u64> = find_pending_bounded(&dir, u64::MAX, 2)
+            .iter()
+            .map(|p| p.generation)
+            .collect();
+        assert_eq!(got, vec![6, 5, 2]);
     }
 
     #[test]
@@ -1022,6 +1073,59 @@ mod tests {
         FORCE_UNSUPPORTED.with(|f| f.set(false));
         // Dead pid: recovered. Live pid (unix): left alone.
         assert_eq!(found, vec![1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_leftover_lock_file_does_not_hide_a_crash() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        marker(&dir, 1, "4294967290");
+        let lock = Session::lock_path(&dir, 1);
+        std::fs::write(&lock, "").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(gens(&dir), vec![1]);
+    }
+
+    #[test]
+    fn a_fresh_heartbeat_keeps_a_lockless_session_alive_whatever_its_pid() {
+        // No lock file (the filesystem has none): the marker's pid, even our own
+        // (a peer in another pid namespace), must not condemn a beating session.
+        let dir = tmp();
+        let m = marker(&dir, 1, &std::process::id().to_string());
+        let beat = heartbeat_path(&m);
+        std::fs::write(&beat, "").unwrap();
+        assert!(gens(&dir).is_empty(), "heartbeat is fresh: alive");
+        let f = std::fs::OpenOptions::new().write(true).open(&beat).unwrap();
+        f.set_modified(std::time::SystemTime::now() - HEARTBEAT_STALE * 2)
+            .unwrap();
+        drop(f);
+        assert_eq!(gens(&dir), vec![1], "quiet heartbeat: crashed");
+    }
+
+    #[test]
+    fn a_future_dated_heartbeat_counts_as_alive() {
+        let dir = tmp();
+        let m = marker(&dir, 1, "4294967290");
+        let beat = heartbeat_path(&m);
+        std::fs::write(&beat, "").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&beat).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+        assert!(gens(&dir).is_empty());
+    }
+
+    #[test]
+    fn claim_pending_gives_up_if_the_session_took_its_lock_since_the_scan() {
+        let dir = tmp();
+        marker(&dir, 1, "4294967290");
+        std::fs::write(Session::lock_path(&dir, 1), "").unwrap();
+        let pending = find_pending(&dir, u64::MAX);
+        assert_eq!(pending.len(), 1);
+        // The launching session finishes locking after the scan.
+        let _live = try_claim(&Session::lock_path(&dir, 1)).unwrap();
+        assert!(claim_pending(&dir, &pending[0]).is_none());
     }
 
     #[test]

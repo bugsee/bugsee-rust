@@ -242,9 +242,11 @@ impl LaunchOptions {
     /// elapsed (the background worker recovers the rest, so nothing is lost). A
     /// session's cost grows with its capture window (`max_window`/`max_bytes`).
     /// Repeated identical crashes are queued once while the first is undelivered,
-    /// and recovered crashes stop being queued at
+    /// and at
     /// [`MAX_QUEUED_REPORTS`](bugsee_core::queue::MAX_QUEUED_REPORTS) reports or
-    /// [`MAX_QUEUED_BYTES`](bugsee_core::queue::MAX_QUEUED_BYTES) bytes.
+    /// [`MAX_QUEUED_BYTES`](bugsee_core::queue::MAX_QUEUED_BYTES) bytes queued
+    /// the launch pass stops adding more (a crash it leaves is kept on disk and
+    /// recovered in the background).
     /// `Duration::ZERO` disables the pass: everything is recovered in the
     /// background. Recovered crashes are queued newest first, so they may upload
     /// in that order; the server deduplicates by signature whatever the order.

@@ -313,6 +313,8 @@ struct LaunchPlan {
     generation: u64,
     budget: Duration,
     max_sessions: usize,
+    /// This session's marker, whose heartbeat the pass keeps fresh.
+    heartbeat_of: Option<PathBuf>,
 }
 
 /// The recorder's own locks join the `fork()` lock protocol, so a forked child
@@ -497,6 +499,9 @@ impl Recorder {
                 generation: session.as_ref().map_or(u64::MAX, Session::generation),
                 budget: config.launch_recovery_budget,
                 max_sessions: config.launch_recovery_max_sessions,
+                heartbeat_of: session
+                    .as_ref()
+                    .map(|s| Session::marker_path(dir, s.generation())),
             });
             let wait_ms = config.launch_recovery_budget.as_millis() as u64;
             shared.launch_wait_ms.store(wait_ms, Ordering::SeqCst);
@@ -1125,6 +1130,9 @@ fn spawn_pipeline(
     let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_drain_dir = drain_dir.map(Path::to_path_buf);
     let marker = data_dir.map(|d| Session::marker_path(d, generation));
+    // Recovery can run long (a host `before_send`, many sessions); it keeps this
+    // session's heartbeat going meanwhile, as the worker loop is not yet running.
+    let beat_marker = marker.clone();
     let worker_upload_tx = upload_tx.clone();
 
     let worker = std::thread::Builder::new()
@@ -1158,13 +1166,19 @@ fn spawn_pipeline(
                     if fresh_launch {
                         wait_for_launch_pass(&worker_shared);
                     }
-                    run_recovery(&worker_shared, dir, generation, fresh_launch);
+                    run_recovery(
+                        &worker_shared,
+                        dir,
+                        generation,
+                        beat_marker.as_deref(),
+                        fresh_launch,
+                    );
                 }
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 for dir in &legacy_data_dirs {
                     queue::gc_orphans(dir);
-                    run_recovery(&worker_shared, dir, u64::MAX, false);
+                    run_recovery(&worker_shared, dir, u64::MAX, beat_marker.as_deref(), false);
                 }
             }));
             legacy_ready.store(true, Ordering::SeqCst);
@@ -1194,10 +1208,24 @@ fn spawn_pipeline(
 /// The crashed session's state is discarded ONLY after the report is durably
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
 ///
-/// With `skip_launch_pass`, generations the launch-path pass already claimed are
-/// left alone.
-fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64, skip_launch_pass: bool) {
+/// `heartbeat_of` is this session's marker, touched as the pass makes progress so a
+/// peer does not take a long recovery for a dead session. With `skip_launch_pass`,
+/// generations the launch-path pass already claimed are left alone.
+fn run_recovery(
+    shared: &Shared,
+    data_dir: &Path,
+    current_generation: u64,
+    heartbeat_of: Option<&Path>,
+    skip_launch_pass: bool,
+) {
+    let beat = || {
+        if let Some(marker) = heartbeat_of {
+            touch_heartbeat(marker);
+        }
+    };
+    beat();
     for pending in recovery::find_pending(data_dir, current_generation) {
+        beat();
         if skip_launch_pass && shared.launch_attempted.lock().contains(&pending.generation) {
             continue;
         }
@@ -1261,18 +1289,15 @@ fn wait_for_launch_pass(shared: &Shared) {
     }
 }
 
-/// Directory entries the launch-path pass reads before giving up on finding more.
-const LAUNCH_SCAN_CAP: usize = 4096;
-
 /// The launch-path recovery pass (issue #10): turn the newest crashed sessions
 /// into durable queue entries BEFORE `launch` returns, so a host that dies again
 /// within milliseconds (a crash loop under a supervisor) cannot outrun the report
 /// of the crash before it. Only the queueing is synchronous; upload stays on the
 /// uploader thread.
 ///
-/// Bounded three ways: at most `max_sessions` are recovered, the scan reads at
-/// most [`LAUNCH_SCAN_CAP`] directory entries, and no new session is started once
-/// `budget` has elapsed. The budget is checked between sessions, so one session
+/// Bounded: at most `max_sessions` (plus as many already-attempted ones, so a
+/// session that faults in recovery still reaches `MAX_RECOVERY_ATTEMPTS`) are
+/// recovered, and no new session is started once `budget` has elapsed. The budget is checked between sessions, so one session
 /// can overrun it; the newest session is always attempted whatever the budget,
 /// since it is the one a crash loop is about to make unreachable. Newest first:
 /// the latest crash is the one most likely to be on the build now running, and
@@ -1283,12 +1308,10 @@ const LAUNCH_SCAN_CAP: usize = 4096;
 fn run_launch_recovery(shared: &Shared, plan: &LaunchPlan) {
     let started = Instant::now();
     let mut claimed = 0;
-    for pending in recovery::find_pending_bounded(
-        &plan.dir,
-        plan.generation,
-        LAUNCH_SCAN_CAP,
-        plan.max_sessions,
-    ) {
+    for pending in recovery::find_pending_bounded(&plan.dir, plan.generation, plan.max_sessions) {
+        if let Some(marker) = &plan.heartbeat_of {
+            touch_heartbeat(marker);
+        }
         if claimed > 0 && started.elapsed() >= plan.budget {
             break;
         }
@@ -1328,8 +1351,15 @@ fn recover_one(
             queue::Admission::Admit => {}
             // A crash loop reports the same crash on every start: the first one
             // is already queued, and another copy adds nothing the server keeps.
-            queue::Admission::Duplicate | queue::Admission::Full => {
+            queue::Admission::Duplicate => {
                 recovery::discard(data_dir, pending);
+                return;
+            }
+            // A unique crash the queue has no room for on the launch path:
+            // keep its evidence and leave it to the worker's pass, which does not
+            // cap, rather than destroy it.
+            queue::Admission::Full => {
+                shared.launch_attempted.lock().remove(&pending.generation);
                 return;
             }
         }
@@ -1404,8 +1434,11 @@ fn worker_loop(
     // sampled (F17). Instead we recv with a timeout bounded by the next rotation
     // deadline and run the tick whenever that deadline passes, message or not.
     let mut next_rotate = Instant::now() + rotate_interval;
+    let mut next_heartbeat = Instant::now() + HEARTBEAT_EVERY;
     loop {
-        let timeout = next_rotate.saturating_duration_since(Instant::now());
+        let timeout = next_rotate
+            .saturating_duration_since(Instant::now())
+            .min(HEARTBEAT_EVERY);
         match rx.recv_timeout(timeout) {
             Ok(Msg::Capture(entry)) => {
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
@@ -1488,11 +1521,30 @@ fn worker_loop(
             if let Some(health) = shared.health.lock().as_mut() {
                 health.sync_errors(shared.health_errors.load(Ordering::SeqCst));
             }
-            if let Some(marker) = &marker {
-                ensure_marker(&shared, marker);
-            }
             next_rotate = Instant::now() + rotate_interval;
         }
+        // Independent of the rotation interval (which a host may set large).
+        if Instant::now() >= next_heartbeat {
+            if let Some(marker) = &marker {
+                ensure_marker(&shared, marker);
+                touch_heartbeat(marker);
+            }
+            next_heartbeat = Instant::now() + HEARTBEAT_EVERY;
+        }
+    }
+}
+
+/// How often the worker checks the liveness marker and, for a session that could
+/// not take a file lock, touches its heartbeat file.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
+
+/// Touch this session's heartbeat file, if it keeps one (see
+/// `recovery::heartbeat_path`). Never creates it: a session with a kernel lock has
+/// none, and one that has ended must not leave one behind.
+fn touch_heartbeat(marker: &Path) {
+    let beat = recovery::heartbeat_path(marker);
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&beat) {
+        let _ = file.set_modified(std::time::SystemTime::now());
     }
 }
 
