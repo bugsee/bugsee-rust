@@ -43,5 +43,11 @@ name = "crash_e2e_matrix"
 harness = false
 required-features = ["native"]
 
+# Same reason: the session-health matrix kills real child processes.
+[[test]]
+name = "release_health"
+harness = false
+required-features = ["native"]
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

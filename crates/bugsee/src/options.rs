@@ -40,6 +40,7 @@ pub struct LaunchOptions {
     pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
     pub(crate) sample_rate: f64,
     pub(crate) launch_recovery_budget: Duration,
+    pub(crate) release_health: bool,
 }
 
 impl LaunchOptions {
@@ -65,6 +66,7 @@ impl LaunchOptions {
             before_breadcrumb: None,
             sample_rate: 1.0,
             launch_recovery_budget: bugsee_core::runtime::DEFAULT_LAUNCH_RECOVERY_BUDGET,
+            release_health: false,
         }
     }
 
@@ -248,6 +250,20 @@ impl LaunchOptions {
     /// in that order; the server deduplicates by signature whatever the order.
     pub fn launch_recovery_budget(mut self, budget: Duration) -> Self {
         self.launch_recovery_budget = budget;
+        self
+    }
+
+    /// Record how each session ends (clean, errored, crashed, abnormal exit) in
+    /// the data directory, for [`Bugsee::finished_sessions`](crate::Bugsee::finished_sessions).
+    /// Off by default.
+    ///
+    /// **Local only.** The backend has no endpoint for session health yet (it
+    /// derives crash-free rates from session creation and crash issues), so
+    /// nothing is sent. Requires a usable data directory: in memory mode a crash
+    /// could never be seen, so no session is tracked. See DESIGN.md, release
+    /// health.
+    pub fn release_health(mut self, enabled: bool) -> Self {
+        self.release_health = enabled;
         self
     }
 

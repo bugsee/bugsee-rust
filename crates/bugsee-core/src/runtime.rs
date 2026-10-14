@@ -197,6 +197,9 @@ pub struct RecorderConfig {
     /// `legacy_data_dir`: trusted trees that could not take new files (a full or
     /// read-only default) even though a later default was writable.
     pub extra_data_dirs: Vec<PathBuf>,
+    /// Record how this session ends (issue #12, see [`crate::health`]). Off by
+    /// default: nothing consumes it server-side yet.
+    pub release_health: bool,
 }
 
 impl RecorderConfig {
@@ -222,6 +225,7 @@ impl RecorderConfig {
             launch_recovery_budget: Duration::ZERO,
             launch_recovery_max_sessions: DEFAULT_LAUNCH_RECOVERY_SESSIONS,
             extra_data_dirs: Vec::new(),
+            release_health: false,
         }
     }
 }
@@ -290,6 +294,10 @@ struct Shared {
     launch_armed: AtomicBool,
     launch_done: AtomicBool,
     launch_wait_ms: AtomicU64,
+    /// This session's health record (issue #12); `None` unless release health is
+    /// on and the session is on disk (memory mode has no recovery, so a crash
+    /// would never be seen and every session would read as healthy).
+    health: ForkLock<Option<crate::health::HealthTracker>>,
 }
 
 /// What the launch-path recovery pass needs, fixed at launch.
@@ -312,8 +320,10 @@ impl ForkLockable for Shared {
         self.delivered_stuck.fork_lock();
         self.launch_plan.fork_lock();
         self.launch_attempted.fork_lock();
+        self.health.fork_lock();
     }
     fn fork_unlock(&self) {
+        self.health.fork_unlock();
         self.launch_attempted.fork_unlock();
         self.launch_plan.fork_unlock();
         self.delivered_stuck.fork_unlock();
@@ -421,6 +431,7 @@ impl Recorder {
             launch_armed: AtomicBool::new(false),
             launch_done: AtomicBool::new(false),
             launch_wait_ms: AtomicU64::new(0),
+            health: ForkLock::new(None),
         });
 
         crate::fork::install_fork_hook();
@@ -453,6 +464,15 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        if config.release_health {
+            if let Some(session) = &session {
+                *shared.health.lock() = crate::health::HealthTracker::start(
+                    &data_dir,
+                    session.generation(),
+                    &shared.env,
+                );
+            }
+        }
         // A directory that cannot take NEW files may still hold reports and crashes
         // a previous run persisted (that is what a full disk looks like), and
         // recovering them only reads and deletes. So an existing directory is
@@ -570,6 +590,21 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        // The child is a session of its own: the parent's record stays the
+        // parent's (never finished or counted from here), and a child that fell
+        // back to memory tracks nothing.
+        {
+            let mut health = self.shared.health.lock();
+            let enabled = health.is_some();
+            *health = match (&session, enabled) {
+                (Some(s), true) => crate::health::HealthTracker::start(
+                    &self.data_dir,
+                    s.generation(),
+                    &self.shared.env,
+                ),
+                _ => None,
+            };
+        }
         let pipeline = spawn_pipeline(
             &self.shared,
             store.is_some().then_some(self.data_dir.as_path()),
@@ -688,6 +723,21 @@ impl Recorder {
         self.handle().flush(timeout)
     }
 
+    /// The running session's health record, when release health is on.
+    pub fn session_health(&self) -> Option<crate::health::SessionRecord> {
+        self.shared
+            .health
+            .lock()
+            .as_ref()
+            .map(|h| h.record().clone())
+    }
+
+    /// Finished sessions recorded in this data directory (clean ends and
+    /// recovered crashes), oldest first, until [`crate::health::acknowledge`]d.
+    pub fn finished_sessions(&self) -> Vec<crate::health::SessionRecord> {
+        crate::health::finished(&self.data_dir)
+    }
+
     /// Data directory root for this recorder.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -782,6 +832,11 @@ impl Drop for Recorder {
         // cannot turn a handled panic into a phantom crash.
         if worker_acked && uploader_acked && !std::thread::panicking() {
             if let Some(session) = &self.session {
+                // The finished health record first, then the marker: a death in
+                // between leaves a marker that recovery settles idempotently.
+                if let Some(health) = self.shared.health.lock().take() {
+                    health.finish_clean();
+                }
                 session.end();
             }
         } else if !(worker_acked && uploader_acked) {
@@ -936,6 +991,15 @@ fn report_into(
     window_end: i64,
     crash_json: Option<Vec<u8>>,
 ) {
+    // A handled error counts against the session's health whatever becomes of
+    // the report (sampled out, dropped, rate limited): the session had an error.
+    // A panic on a non-main thread arrives here as an `Error` too, never as a
+    // crash: the process survives it.
+    if meta.issue_type == IssueType::Error {
+        if let Some(health) = shared.health.lock().as_mut() {
+            health.note_error();
+        }
+    }
     // Every enqueued report increments the counter (the worker decrements on
     // drain), but only NON-crash reports are subject to the drop-newest cap.
     let prev = shared.report_queued.fetch_add(1, Ordering::Relaxed);

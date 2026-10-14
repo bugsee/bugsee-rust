@@ -142,6 +142,7 @@ impl Bugsee {
         config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
         config.launch_recovery_budget = options.launch_recovery_budget;
+        config.release_health = options.release_health;
         config.app_identity = bugsee_core::model::environment::AppIdentity {
             package_id: options.app_package_id.clone(),
             version: options.app_version.clone(),
@@ -265,6 +266,26 @@ impl Bugsee {
             reason: recorder.storage_reason().map(String::from),
             degraded: recorder.is_degraded(),
         })
+    }
+
+    /// The running session's health record, or `None` when the SDK is not
+    /// launched, release health is off ([`LaunchOptions::release_health`]) or
+    /// the SDK is in memory mode.
+    pub fn session_health() -> Option<bugsee_core::health::SessionRecord> {
+        Self::with_recorder(|r| r.session_health()).flatten()
+    }
+
+    /// Sessions of this data directory that have ended, oldest first: clean ends
+    /// (`ok` / `errored`) and earlier runs this launch recovered (`crashed` /
+    /// `abnormal`), each exactly once. Take one with
+    /// [`Bugsee::acknowledge_session`]; the newest 256 are kept.
+    pub fn finished_sessions() -> Vec<bugsee_core::health::SessionRecord> {
+        Self::with_recorder(|r| r.finished_sessions()).unwrap_or_default()
+    }
+
+    /// Forget a finished session (by its `generation`) once it has been used.
+    pub fn acknowledge_session(generation: u64) {
+        Self::with_recorder(|r| bugsee_core::health::acknowledge(r.data_dir(), generation));
     }
 
     /// Stop the SDK and flush pending work (dropping the recorder joins the worker).

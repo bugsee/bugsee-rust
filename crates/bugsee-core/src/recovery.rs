@@ -355,10 +355,33 @@ fn read_minidump(pending: &PendingSession) -> Vec<ExtraFile> {
 /// GC'able via [`gc_orphans`]) rather than leaving a marker that would re-recover
 /// a phantom empty report or duplicate the already-delivered one.
 pub fn discard(data_dir: &Path, pending: &PendingSession) {
+    // The session's health record is settled here, whatever became of its report
+    // (delivered, deduplicated, dropped by `before_send`): the session crashed
+    // either way. Callers hold the recovery claim, and `discard` runs only once
+    // the evidence is spent, so this is the one place a dead session is counted;
+    // the finished record is written before the marker goes (see `health`).
+    crate::health::finalize_dead(
+        data_dir,
+        pending.generation,
+        dead_status(pending),
+        crate::health::newest_mtime(&pending.parts_dir, 3),
+    );
     let sessions = data_dir.join("sessions");
     let _ = std::fs::remove_file(sessions.join(format!("{}.alive", pending.generation)));
     let _ = std::fs::remove_file(sessions.join(format!("{}.attempts", pending.generation)));
     let _ = std::fs::remove_dir_all(&pending.parts_dir);
+}
+
+/// How a dead session ended: `Crashed` when the crash handlers left evidence (a
+/// native signal, a minidump or an uncaught panic's snapshot, the same evidence
+/// [`build_report`] reports as a crash), `Abnormal` when the process just
+/// vanished (SIGKILL, OOM kill, power loss).
+fn dead_status(pending: &PendingSession) -> crate::health::SessionStatus {
+    if pending.minidump.is_some() || pending.crash_info.is_some() || pending.panic_info.is_some() {
+        crate::health::SessionStatus::Crashed
+    } else {
+        crate::health::SessionStatus::Abnormal
+    }
 }
 
 /// The recovery-attempt-counter sidecar path for a generation.
@@ -809,6 +832,41 @@ mod tests {
             .iter()
             .map(|p| p.generation)
             .collect()
+    }
+
+    #[test]
+    fn discarding_a_dead_session_settles_its_health_by_the_evidence_exactly_once() {
+        use crate::health::{finished, HealthTracker, SessionStatus};
+        let dir = tmp();
+        let env = crate::model::environment::Environment::detect_with(
+            "0",
+            &Default::default(),
+            &Default::default(),
+        );
+        for (generation, panic_info) in [(1u64, true), (2, false)] {
+            marker(&dir, generation, "0");
+            HealthTracker::start(&dir, generation, &env).unwrap();
+            let parts = dir.join("parts").join(generation.to_string());
+            std::fs::create_dir_all(&parts).unwrap();
+            let pending = PendingSession {
+                generation,
+                parts_dir: parts,
+                minidump: None,
+                crash_info: None,
+                panic_info: panic_info.then(|| dir.join("panic.info")),
+            };
+            discard(&dir, &pending);
+            // A repeat (the same session recovered again) changes nothing.
+            discard(&dir, &pending);
+        }
+        let got: Vec<_> = finished(&dir)
+            .iter()
+            .map(|r| (r.generation, r.status))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, SessionStatus::Crashed), (2, SessionStatus::Abnormal)]
+        );
     }
 
     #[test]

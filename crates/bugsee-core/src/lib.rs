@@ -21,6 +21,7 @@ pub mod capture;
 pub mod claim;
 pub mod errors;
 pub mod fork;
+pub mod health;
 pub mod model;
 pub mod panic_info;
 pub(crate) mod process;
