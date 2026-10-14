@@ -78,6 +78,15 @@ impl LaunchOptions {
     /// Register a callback run on every report before delivery. Mutate the
     /// metadata (summary/severity/labels/attributes/…) in place; return `false`
     /// to drop the report.
+    ///
+    /// Threading: the callback runs on an SDK thread (the capture worker, or the
+    /// launch-recovery helper thread for a crash recovered during `launch`), and
+    /// that can be before `launch` has returned. Do not assume it runs on the
+    /// thread that launched, and do not make `launch` wait on a lock the callback
+    /// needs: `launch` itself never waits for the callback longer than
+    /// [`launch_recovery_budget`](Self::launch_recovery_budget), but a callback
+    /// that blocks forever stalls report processing. A recovered crash carries no
+    /// scope (email, labels, attributes) from the new process.
     pub fn before_send(
         mut self,
         f: impl Fn(&mut ReportMeta) -> bool + Send + Sync + 'static,
@@ -214,18 +223,29 @@ impl LaunchOptions {
         self
     }
 
-    /// Time `launch` may spend queueing the previous run's crash reports before
-    /// it returns. Default 500 ms.
+    /// How long `launch` waits for the previous run's crash reports to be
+    /// queued. Default 500 ms
+    /// ([`DEFAULT_LAUNCH_RECOVERY_BUDGET`](bugsee_core::runtime::DEFAULT_LAUNCH_RECOVERY_BUDGET)).
     ///
     /// A host that crashes again right after launch (a crash loop under a
-    /// supervisor) still gets the previous crash reported, because it is made
-    /// durable on this path; only the upload is asynchronous. The newest crashed
-    /// session is always queued, and at most 8 are queued here, newest first;
-    /// the budget stops further ones from starting once it has elapsed, and
-    /// whatever is left is recovered on the background worker. It is checked
-    /// between sessions, so one very large session can exceed it (the cost of a
-    /// session grows with its capture window, `max_window`/`max_bytes`). `Duration::ZERO` skips the launch-path
-    /// pass and recovers everything in the background.
+    /// supervisor) still gets the previous crash reported, because it is put in
+    /// the on-disk queue on this path (it survives process death, not power
+    /// loss); only the upload is asynchronous. The work runs on a helper thread
+    /// and `launch` waits at most this long, so this is a hard upper bound on
+    /// what recovery adds to `launch`, whatever a `before_send` callback does; if
+    /// it runs out the pass finishes in the background. The newest crashed
+    /// session is attempted first, at most
+    /// [`DEFAULT_LAUNCH_RECOVERY_SESSIONS`](bugsee_core::runtime::DEFAULT_LAUNCH_RECOVERY_SESSIONS)
+    /// are taken, newest first, and no further session starts once the budget has
+    /// elapsed (the background worker recovers the rest, so nothing is lost). A
+    /// session's cost grows with its capture window (`max_window`/`max_bytes`).
+    /// Repeated identical crashes are queued once while the first is undelivered,
+    /// and recovered crashes stop being queued at
+    /// [`MAX_QUEUED_REPORTS`](bugsee_core::queue::MAX_QUEUED_REPORTS) reports or
+    /// [`MAX_QUEUED_BYTES`](bugsee_core::queue::MAX_QUEUED_BYTES) bytes.
+    /// `Duration::ZERO` disables the pass: everything is recovered in the
+    /// background. Recovered crashes are queued newest first, so they may upload
+    /// in that order; the server deduplicates by signature whatever the order.
     pub fn launch_recovery_budget(mut self, budget: Duration) -> Self {
         self.launch_recovery_budget = budget;
         self

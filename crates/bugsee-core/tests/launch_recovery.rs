@@ -5,23 +5,27 @@
 //  Copyright © 2026 Bugsee. All rights reserved.
 //
 //! Early-crash recovery finishes on the launch path (issue #10): by the time
-//! `launch` returns, the previous run's crash is a durable queue entry, so a host
-//! that crashes again right away (a crash loop) cannot outrun its report.
+//! `recover_on_launch_path` returns, the previous run's crash is a queue entry on
+//! disk, so a host that crashes again right away (a crash loop) cannot outrun its
+//! report.
 //!
 //! The crash loop is real: this test binary re-executes itself as children that
 //! launch the SDK and `abort()` immediately.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bugsee_core::capture::record;
 use bugsee_core::transport::{Transport, TransportError};
 use bugsee_core::{queue, MockTransport, Recorder, RecorderConfig};
 
 const ROLE: &str = "BUGSEE_LR_ROLE";
 const DIR: &str = "BUGSEE_LR_DIR";
 const OUT: &str = "BUGSEE_LR_OUT";
+const LAUNCH_THREAD: &str = "bugsee-launch-recovery";
 
 /// A transport that never delivers anything, so the queue keeps its entries.
 struct Offline;
@@ -37,6 +41,12 @@ impl Transport for Offline {
     }
 }
 
+fn config(dir: &Path, budget: Duration) -> RecorderConfig {
+    let mut config = RecorderConfig::new(dir, "tok");
+    config.launch_recovery_budget = budget;
+    config
+}
+
 /// Child entry point. A no-op in a normal test run.
 #[test]
 fn child_entry() {
@@ -45,8 +55,10 @@ fn child_entry() {
     }
     let dir = PathBuf::from(std::env::var(DIR).unwrap());
     let out = PathBuf::from(std::env::var(OUT).unwrap());
-    let _rec = Recorder::launch(RecorderConfig::new(&dir, "tok"), Arc::new(Offline)).unwrap();
-    // The instant `launch` returns: record what is durably queued, then die the
+    let rec =
+        Recorder::launch(config(&dir, Duration::from_millis(500)), Arc::new(Offline)).unwrap();
+    rec.recover_on_launch_path();
+    // The instant the launch path is done: record what is queued, then die the
     // way a crash does, with no destructor and no flush.
     std::fs::write(out, queue::list_pending(&dir).len().to_string()).unwrap();
     std::process::abort();
@@ -78,64 +90,134 @@ fn seed_crashed(dir: &Path, generations: std::ops::RangeInclusive<u64>) {
     std::fs::write(dir.join("gen"), generations.end().to_string()).unwrap();
 }
 
+/// A `before_send` that records the name of the thread it runs on and sleeps.
+fn recording_hook(
+    threads: &Arc<Mutex<Vec<String>>>,
+    sleep: Duration,
+) -> bugsee_core::runtime::BeforeSend {
+    let seen = Arc::clone(threads);
+    Box::new(move |_meta| {
+        let t = std::thread::current();
+        seen.lock()
+            .unwrap()
+            .push(t.name().unwrap_or("launch").to_string());
+        std::thread::sleep(sleep);
+        true
+    })
+}
+
+fn on_launch_thread(threads: &Arc<Mutex<Vec<String>>>) -> usize {
+    threads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| *n == LAUNCH_THREAD)
+        .count()
+}
+
 #[test]
-fn the_previous_crash_is_queued_before_launch_returns() {
+fn the_previous_crash_is_queued_before_the_launch_path_returns() {
     let tmp = TempDir::new();
     let dir = tmp.0.join("data");
     seed_crashed(&dir, 1..=1);
 
-    let rec = Recorder::launch(RecorderConfig::new(&dir, "tok"), Arc::new(Offline)).unwrap();
-    // No flush, no waiting: it is on disk the moment launch returns.
+    let rec =
+        Recorder::launch(config(&dir, Duration::from_millis(500)), Arc::new(Offline)).unwrap();
+    rec.recover_on_launch_path();
+    // No flush, no waiting: it is on disk the moment the launch path returns.
     assert_eq!(queue::list_pending(&dir).len(), 1);
     drop(rec);
 }
 
-/// Several pending crashes, a time cap, and newest-first: the hook observes which
-/// thread recovers each. With a budget shorter than one session only the newest
-/// is recovered on the launch path; the rest follow on the worker.
+/// Time cap: a budget shorter than one session lets exactly the newest session
+/// through on the launch path (it is always attempted); the rest follow on the
+/// worker. And the launch path returns at the budget, not when the hook does.
 #[test]
-fn the_launch_path_is_capped_by_time_and_the_rest_follows_in_the_background() {
+fn a_short_budget_recovers_one_session_on_the_launch_path() {
     let tmp = TempDir::new();
     let dir = tmp.0.join("data");
     seed_crashed(&dir, 1..=5);
 
     let threads: Arc<Mutex<Vec<String>>> = Arc::default();
-    let seen = Arc::clone(&threads);
-    let mut config = RecorderConfig::new(&dir, "tok");
-    config.launch_recovery_budget = Duration::from_millis(150);
+    let mut config = config(&dir, Duration::from_millis(50));
+    config.before_send = Some(recording_hook(&threads, Duration::from_millis(400)));
+    let transport = Arc::new(MockTransport::default());
+    let started = Instant::now();
+    let rec = Recorder::launch(config, transport.clone()).unwrap();
+    rec.recover_on_launch_path();
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "the launch path waited for the hook: {:?}",
+        started.elapsed()
+    );
+
+    assert!(rec.flush(Duration::from_secs(20)));
+    assert_eq!(
+        on_launch_thread(&threads),
+        1,
+        "{:?}",
+        threads.lock().unwrap()
+    );
+    assert_eq!(threads.lock().unwrap().len(), 5, "each session once");
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 5);
+}
+
+/// Count cap: with time to spare, `launch_recovery_max_sessions` limits the pass.
+#[test]
+fn the_session_cap_limits_the_launch_path() {
+    let tmp = TempDir::new();
+    let dir = tmp.0.join("data");
+    seed_crashed(&dir, 1..=5);
+
+    let threads: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut config = config(&dir, Duration::from_secs(10));
+    config.launch_recovery_max_sessions = 2;
+    config.before_send = Some(recording_hook(&threads, Duration::ZERO));
+    let transport = Arc::new(MockTransport::default());
+    let rec = Recorder::launch(config, transport.clone()).unwrap();
+    rec.recover_on_launch_path();
+    // The pass was quick, so it is over: exactly the cap ran on it.
+    assert_eq!(on_launch_thread(&threads), 2);
+
+    assert!(rec.flush(Duration::from_secs(20)));
+    assert_eq!(threads.lock().unwrap().len(), 5, "each session once");
+    // The pass's second session repeats the first one's crash and is dropped.
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 4);
+}
+
+/// A hook that never returns must not hold `launch` past the budget.
+#[test]
+fn a_blocked_before_send_cannot_stall_the_launch_path() {
+    let tmp = TempDir::new();
+    let dir = tmp.0.join("data");
+    seed_crashed(&dir, 1..=1);
+
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = Arc::clone(&release);
+    let mut config = config(&dir, Duration::from_millis(100));
     config.before_send = Some(Box::new(move |_meta| {
-        let t = std::thread::current();
-        seen.lock()
-            .unwrap()
-            .push(t.name().unwrap_or("launch").to_string());
-        std::thread::sleep(Duration::from_millis(100));
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         true
     }));
     let transport = Arc::new(MockTransport::default());
-    let me = std::thread::current().name().map(String::from);
+    let started = Instant::now();
     let rec = Recorder::launch(config, transport.clone()).unwrap();
-
-    let after_launch = threads.lock().unwrap().clone();
-    // 100 ms per session against a 150 ms budget: two start, a third does not.
-    let on_launch_path = after_launch
-        .iter()
-        .filter(|n| Some(n.as_str()) != Some("bugsee-capture"))
-        .count();
-    assert_eq!(
-        on_launch_path, 2,
-        "hook threads: {after_launch:?}, test thread {me:?}"
+    rec.recover_on_launch_path();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "launch waited on a blocked hook: {:?}",
+        started.elapsed()
     );
 
-    assert!(rec.flush(Duration::from_secs(10)));
-    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 5);
-    let all = threads.lock().unwrap().clone();
-    assert_eq!(
-        all.len(),
-        5,
-        "each crash was processed exactly once: {all:?}"
-    );
+    // Unblocked, the pass finishes in the background and the report goes out.
+    release.store(true, Ordering::SeqCst);
+    assert!(rec.flush(Duration::from_secs(20)));
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 1);
 }
 
+/// Without a launch-path pass (the core default), the worker does it all.
 #[test]
 fn a_zero_budget_leaves_recovery_to_the_worker() {
     let tmp = TempDir::new();
@@ -143,18 +225,11 @@ fn a_zero_budget_leaves_recovery_to_the_worker() {
     seed_crashed(&dir, 1..=2);
 
     let threads: Arc<Mutex<Vec<String>>> = Arc::default();
-    let seen = Arc::clone(&threads);
-    let mut config = RecorderConfig::new(&dir, "tok");
-    config.launch_recovery_budget = Duration::ZERO;
-    config.before_send = Some(Box::new(move |_meta| {
-        let t = std::thread::current();
-        seen.lock()
-            .unwrap()
-            .push(t.name().unwrap_or("launch").to_string());
-        true
-    }));
+    let mut config = config(&dir, Duration::ZERO);
+    config.before_send = Some(recording_hook(&threads, Duration::ZERO));
     let transport = Arc::new(MockTransport::default());
     let rec = Recorder::launch(config, transport.clone()).unwrap();
+    rec.recover_on_launch_path();
     assert!(rec.flush(Duration::from_secs(10)));
     assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 2);
     assert!(threads
@@ -164,11 +239,12 @@ fn a_zero_budget_leaves_recovery_to_the_worker() {
         .all(|n| n == "bugsee-capture"));
 }
 
-/// The product scenario: the host crashes right after every launch. Each launch
-/// must already hold the previous crash in the queue, and a later healthy run
-/// delivers every one of them exactly once.
+/// The product scenario: the host crashes right after every launch. A crash loop
+/// reports the same crash each time, so the first copy is queued and later copies
+/// are not stacked behind it; and each launch already holds the previous crash in
+/// the queue on return, with no async worker involved.
 #[test]
-fn a_crash_loop_loses_no_crash_and_reports_each_exactly_once() {
+fn a_crash_loop_queues_the_first_crash_before_each_relaunch_and_collapses_repeats() {
     const CRASHES: usize = 5;
     let tmp = TempDir::new();
     let dir = tmp.0.join("data");
@@ -190,22 +266,86 @@ fn a_crash_loop_loses_no_crash_and_reports_each_exactly_once() {
             .unwrap_or_else(|_| panic!("child {i} never got past launch"))
             .parse()
             .unwrap();
-        // Child i found the crashes of children 0..i already queued, with
-        // the previous child's among them: none waited for an async worker.
-        assert_eq!(queued, i, "child {i} saw {queued} queued crashes");
+        // Child 0 has nothing to recover. Every later child found the crash
+        // before it already queued, and identical repeats are not queued again.
+        assert_eq!(queued, usize::from(i > 0), "child {i} saw {queued} queued");
     }
 
-    // A healthy run: everything is delivered, once.
+    // Another launch, offline so nothing is delivered behind the test's back,
+    // recovers the last child's crash: a repeat of the queued one, so dropped.
+    let rec =
+        Recorder::launch(config(&dir, Duration::from_millis(500)), Arc::new(Offline)).unwrap();
+    rec.recover_on_launch_path();
+    assert_eq!(queue::list_pending(&dir).len(), 1);
+    drop(rec);
+
+    // A healthy run delivers the queued crash, once.
     let transport = Arc::new(MockTransport::default());
-    let rec = Recorder::launch(RecorderConfig::new(&dir, "tok"), transport.clone()).unwrap();
+    let rec =
+        Recorder::launch(config(&dir, Duration::from_millis(500)), transport.clone()).unwrap();
+    rec.recover_on_launch_path();
     assert!(rec.flush(Duration::from_secs(20)));
-    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), CRASHES);
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 1);
     assert!(queue::list_pending(&dir).is_empty());
     drop(rec);
 
     // And not again.
     let again = Arc::new(MockTransport::default());
-    let rec = Recorder::launch(RecorderConfig::new(&dir, "tok"), again.clone()).unwrap();
+    let rec = Recorder::launch(config(&dir, Duration::from_millis(500)), again.clone()).unwrap();
+    rec.recover_on_launch_path();
     assert!(rec.flush(Duration::from_secs(5)));
     assert!(again.uploaded_bundles.lock().unwrap().is_empty());
+}
+
+/// Launch latency of the pass, for DESIGN.md: run with
+/// `cargo test -p bugsee-core --release --test launch_recovery -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_launch_latency() {
+    fn seed_with_window(dir: &Path, generations: std::ops::RangeInclusive<u64>, bytes: usize) {
+        seed_crashed(dir, generations.clone());
+        for g in generations {
+            let part = dir.join("parts").join(g.to_string()).join("0");
+            std::fs::create_dir_all(&part).unwrap();
+            let mut buf = Vec::new();
+            let mut ts = 1_000i64;
+            while buf.len() < bytes {
+                let payload = format!(
+                    r#"{{"timestamp":{ts},"level":1,"source":2,"message":"{}"}}"#,
+                    "x".repeat(200)
+                );
+                record::frame(ts, payload.as_bytes(), &mut buf);
+                ts += 1;
+            }
+            std::fs::write(part.join("log.part"), &buf).unwrap();
+        }
+    }
+    for (label, sessions, bytes) in [
+        ("empty directory", 0u64, 0usize),
+        ("1 session, 8 MiB window", 1, 8 << 20),
+        ("8 sessions, 8 MiB windows", 8, 8 << 20),
+    ] {
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        if sessions > 0 {
+            seed_with_window(&dir, 1..=sessions, bytes);
+        }
+        let mut config = config(&dir, Duration::from_secs(30));
+        config.caps = bugsee_core::capture::WindowCaps {
+            max_window_ms: 60_000,
+            max_bytes: 8 << 20,
+            max_events: 100_000,
+        };
+        let t0 = Instant::now();
+        let rec = Recorder::launch(config, Arc::new(Offline)).unwrap();
+        let launched = t0.elapsed();
+        let t1 = Instant::now();
+        rec.recover_on_launch_path();
+        println!(
+            "{label}: Recorder::launch {launched:?}, recover_on_launch_path {:?}, queued {}",
+            t1.elapsed(),
+            queue::list_pending(&dir).len()
+        );
+    }
 }

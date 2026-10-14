@@ -85,7 +85,12 @@ pub fn find_pending_bounded(
     };
     let self_pid = std::process::id();
     let mut candidates: Vec<u64> = Vec::new();
-    for entry in read.flatten().take(scan_cap) {
+    // The cap counts session markers only: a session also leaves `.lock` and
+    // `.attempts` files that must not use it up.
+    // Entries read are bounded too (a session leaves about three files), so a
+    // directory full of unrelated files cannot make the scan long either.
+    let mut seen = 0usize;
+    for entry in read.flatten().take(scan_cap.saturating_mul(4)) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(gen_str) = name.strip_suffix(".alive") else {
             continue;
@@ -93,6 +98,10 @@ pub fn find_pending_bounded(
         let Ok(generation) = gen_str.parse::<u64>() else {
             continue;
         };
+        if seen >= scan_cap {
+            break;
+        }
+        seen += 1;
         if generation < current_generation {
             candidates.push(generation);
         }
