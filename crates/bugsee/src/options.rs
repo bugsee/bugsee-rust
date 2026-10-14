@@ -292,10 +292,11 @@ pub(crate) struct DataDirResolution {
     pub skipped: Vec<String>,
     /// Why an explicit / environment directory was rejected (it is final).
     pub explicit_rejected: Option<String>,
-    /// A rejected candidate that nevertheless EXISTS as a directory (full or
-    /// read-only). It may hold reports and crashes a previous run persisted, so
-    /// it is still drained and recovered from; no new files are written to it.
-    pub recovery_dir: Option<PathBuf>,
+    /// Rejected candidates that nevertheless EXIST as directories we may trust
+    /// (full or read-only). They may hold reports and crashes a previous run
+    /// persisted, so each is still drained and recovered from, whether or not a
+    /// later candidate won; no new files are written to them.
+    pub recovery_dirs: Vec<PathBuf>,
     /// The location earlier SDK versions used by default
     /// (`<temp>/bugsee/<token>`), if it exists, is trustworthy and is not `dir`.
     /// Its leftovers are recovered once at launch.
@@ -326,12 +327,12 @@ pub(crate) fn resolve_data_dir(
                 source,
                 skipped: Vec::new(),
                 explicit_rejected: None,
-                recovery_dir: None,
+                recovery_dirs: Vec::new(),
                 legacy_dir: None,
             },
             Err(e) => DataDirResolution {
                 explicit_rejected: Some(format!("{}: {e}", dir.display())),
-                recovery_dir: dir.is_dir().then_some(dir),
+                recovery_dirs: if dir.is_dir() { vec![dir] } else { Vec::new() },
                 dir: None,
                 source: DataDirSource::None,
                 skipped: Vec::new(),
@@ -358,7 +359,7 @@ pub(crate) fn resolve_data_dir(
 
     let mut skipped = Vec::new();
     let mut found = None;
-    let mut recovery_dir = None;
+    let mut recovery_dirs = Vec::new();
     for (source, dir, private) in candidates {
         match prepare_dir(&dir, private) {
             Ok(()) => {
@@ -367,10 +368,16 @@ pub(crate) fn resolve_data_dir(
             }
             Err(e) => {
                 skipped.push(format!("{}: {e}", dir.display()));
-                // Only the user's own default location: the shared temp area is
-                // exactly where a planted directory would be refused.
-                if !private && recovery_dir.is_none() && dir.is_dir() {
-                    recovery_dir = Some(dir);
+                // The shared temp area is where a planted directory would be
+                // refused, so there the tree must be a real directory of ours
+                // (and so must its parent) to be trusted for recovery.
+                let trusted = if private {
+                    trusted_existing_dir(&dir) && dir.parent().is_some_and(trusted_existing_dir)
+                } else {
+                    dir.is_dir()
+                };
+                if trusted {
+                    recovery_dirs.push(dir);
                 }
             }
         }
@@ -387,7 +394,7 @@ pub(crate) fn resolve_data_dir(
             source,
             skipped,
             explicit_rejected: None,
-            recovery_dir: None,
+            recovery_dirs,
             legacy_dir,
         },
         None => DataDirResolution {
@@ -395,7 +402,7 @@ pub(crate) fn resolve_data_dir(
             source: DataDirSource::None,
             skipped,
             explicit_rejected: None,
-            recovery_dir,
+            recovery_dirs,
             legacy_dir,
         },
     }
@@ -842,8 +849,8 @@ mod tests {
         let r = resolve_data_dir(Some(&ro), "tok", &env_of(&[]), &|| s.join("tmp"));
         assert!(r.dir.is_none() && r.explicit_rejected.is_some());
         assert_eq!(
-            r.recovery_dir.as_deref(),
-            Some(ro.as_path()),
+            r.recovery_dirs,
+            vec![ro.clone()],
             "its queue and crashed sessions must still be drained"
         );
 
@@ -851,7 +858,7 @@ mod tests {
         let r = resolve_data_dir(Some(&blocked(&s, "f5")), "tok", &env_of(&[]), &|| {
             s.join("tmp")
         });
-        assert!(r.recovery_dir.is_none());
+        assert!(r.recovery_dirs.is_empty());
         let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&s);
     }
@@ -868,6 +875,47 @@ mod tests {
         let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
         assert!(r.dir.is_none(), "no new directory is usable");
         assert_eq!(r.legacy_dir, Some(legacy));
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn a_full_default_that_loses_to_a_later_one_is_still_recovered_from() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch();
+        let home = s.join("home");
+        let default = home.join("bugsee").join("tok");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(default.join("p"), b"x").is_ok() {
+            let _ = std::fs::remove_dir_all(&s);
+            return; // permission bits not enforced (root)
+        }
+        // The platform default is full/read-only; the temp fallback is writable.
+        let r = resolve_data_dir(None, "tok", &env_of(&home_env(&home)), &|| s.join("tmp"));
+        assert_eq!(r.source, DataDirSource::TempFallback);
+        assert_eq!(r.recovery_dirs, vec![default.clone()]);
+        let _ = std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_full_private_temp_tree_is_recovered_from_when_nothing_is_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let tree = tmp.join(private_temp_name()).join("tok");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(tree.join("p"), b"x").is_ok() {
+            let _ = std::fs::remove_dir_all(&s);
+            return; // permission bits not enforced (root)
+        }
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
+        assert!(r.dir.is_none());
+        assert_eq!(r.recovery_dirs, vec![tree.clone()]);
+        let _ = std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&s);
     }
 

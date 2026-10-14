@@ -433,6 +433,7 @@ fn a_failed_put_retries_at_the_put_and_does_not_mint_a_duplicate_issue() {
     );
 }
 
+#[cfg(unix)]
 /// Lay down what a previous run left behind: a queued report nobody delivered and
 /// a session that died (marker left, owner gone).
 fn seed_leftovers(dir: &Path) {
@@ -470,6 +471,7 @@ fn seed_leftovers(dir: &Path) {
     std::fs::write(dir.join("gen"), "1").unwrap();
 }
 
+#[cfg(unix)]
 fn wait_for_bundles(transport: &MockTransport, n: usize) -> usize {
     let start = std::time::Instant::now();
     while transport.uploaded_bundles.lock().unwrap().len() < n
@@ -653,4 +655,47 @@ fn a_directory_wiped_and_recreated_mid_run_gets_its_liveness_marker_back() {
     }
     assert!(alive(), "a crash after the wipe must still be recoverable");
     assert!(recorder.is_degraded(), "the lost window is a degradation");
+}
+
+/// A later default can win while an earlier, full one still holds leftovers.
+#[cfg(unix)]
+#[test]
+fn extra_directories_are_recovered_alongside_a_working_data_dir() {
+    let dir = TempDir::new();
+    let data = dir.path.join("data");
+    let full = dir.path.join("full-default");
+    std::fs::create_dir_all(&full).unwrap();
+    seed_leftovers(&full);
+
+    let transport = Arc::new(MockTransport::default());
+    let mut config = RecorderConfig::new(&data, "T");
+    config.extra_data_dirs = vec![full.clone()];
+    let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+    assert_eq!(recorder.storage_mode(), StorageMode::Disk);
+    assert_eq!(wait_for_bundles(&transport, 2), 2);
+    assert!(bugsee_core::queue::list_pending(&full).is_empty());
+}
+
+#[test]
+fn signatures_blacklisted_on_disk_are_honoured_in_memory_mode() {
+    let dir = TempDir::new();
+    let data = dir.path.join("data");
+    std::fs::create_dir_all(data.join("queue")).unwrap();
+    std::fs::write(data.join("queue").join(".blacklist"), "sig-known\n").unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    let mut config = RecorderConfig::new(&data, "T");
+    config.memory_only = Some("write probe failed".into());
+    let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+
+    let mut known = manual_upload_meta();
+    known.signatures = vec!["sig-known".into()];
+    recorder.report(known, None);
+    recorder.report(manual_upload_meta(), None);
+    assert!(recorder.flush(Duration::from_secs(10)));
+    assert_eq!(
+        transport.created_requests.lock().unwrap().len(),
+        1,
+        "only the report without the blacklisted signature is sent"
+    );
 }
