@@ -80,34 +80,18 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         if generation >= current_generation {
             continue;
         }
-        // Decide from the marker's recorded owner pid whether this is a real
-        // crash or a still-running shared-dir peer.
-        let owner = std::fs::read_to_string(&marker).unwrap_or_default();
-        let owner = owner.trim();
-        if owner.is_empty() {
-            // Present but not yet populated: `Session::begin` creates the marker
-            // (O_EXCL) and writes the pid a moment later, so a peer launching
-            // concurrently can observe this empty window. Skip only while the
-            // marker is FRESH — a peer writes its pid within microseconds. An empty
-            // marker older than the grace window is a session that died in the
-            // create→write gap (or whose pid write silently failed on a full
-            // disk); recover it so its crash is surfaced and its generation
-            // reclaimed instead of being re-scanned and leaked on every future
-            // launch (F28). No pid ⇒ no liveness check; fall through to recover.
-            if marker_is_fresh(&marker) {
+        // A session whose `<gen>.lock` exists is arbitrated by that OS lock: held
+        // means a live process (in any pid namespace), free means it died. The
+        // marker's pid is not consulted, since it is only meaningful inside the
+        // writer's own pid namespace and can be reused.
+        let lock = crate::session::Session::lock_path(data_dir, generation);
+        if lock.exists() {
+            if matches!(crate::claim::probe(&lock), crate::claim::Probe::Held) {
                 continue;
             }
-        } else if let Some((pid, start)) = crate::process::parse_token(owner) {
-            // Skip a marker still owned by a live *other* process. Our own pid is
-            // never skipped (a live process cannot share our pid, so a marker
-            // bearing it is a dead prior incarnation — recover it). The marker
-            // may carry the owner's start time, which tells a recycled pid (a
-            // dead owner whose pid something else now uses) from the owner.
-            if pid != self_pid && crate::process::owner_is_alive(pid, start) {
-                continue;
-            }
+        } else if !legacy_marker_is_dead(&marker, self_pid) {
+            continue;
         }
-        // Non-empty but unparseable content ⇒ the owner is gone; recover.
         let parts_dir = data_dir.join("parts").join(generation.to_string());
         let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
         let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
@@ -125,6 +109,31 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
 
 fn exists_opt(p: PathBuf) -> Option<PathBuf> {
     p.exists().then_some(p)
+}
+
+/// Whether a marker with no lock file beside it (written by an older SDK build,
+/// or by a session that could not lock) is a crashed session rather than a live
+/// peer, judged from its recorded pid. Only meaningful within one pid namespace.
+fn legacy_marker_is_dead(marker: &Path, self_pid: u32) -> bool {
+    let owner = std::fs::read_to_string(marker).unwrap_or_default();
+    let owner = owner.trim();
+    if owner.is_empty() {
+        // Present but not yet populated: `Session::begin` creates the marker
+        // (O_EXCL) and writes the pid a moment later, so a peer launching
+        // concurrently can observe this empty window. Skip only while the
+        // marker is FRESH. An empty marker older than the grace window is a
+        // session that died in the create-to-write gap (or whose pid write failed
+        // on a full disk); recover it so its crash is surfaced and its
+        // generation reclaimed instead of being re-scanned on every launch.
+        return !marker_is_fresh(marker);
+    }
+    match owner.parse::<u32>() {
+        // Our own pid is never skipped (a live process cannot share our pid, so a
+        // marker bearing it is a dead prior incarnation).
+        Ok(pid) => pid == self_pid || !crate::process::is_alive(pid),
+        // Non-empty but unparseable content: the owner is gone.
+        Err(_) => true,
+    }
 }
 
 /// Grace window for an empty (pid-not-yet-written) liveness marker: a launching
@@ -332,7 +341,7 @@ pub fn claim_pending(data_dir: &Path, pending: &PendingSession) -> Option<crate:
     let claim = crate::claim::try_claim(
         &data_dir
             .join("sessions")
-            .join(format!("{}.claim", pending.generation)),
+            .join(format!("{}.recover.lock", pending.generation)),
     )?;
     // The listing that produced `pending` may be stale: a peer that held this
     // claim before us can have recovered and discarded the session in between
@@ -377,14 +386,16 @@ pub fn gc_orphans(data_dir: &Path, current_generation: u64) {
                     }
                 }
             }
-            // A claim left by a holder that died after the session was discarded.
-            // Taking it (which succeeds only if it is stale) and dropping it
-            // removes it; a live holder's claim is left alone.
-            if let Some(gen_str) = name.strip_suffix(".claim") {
-                if let Ok(generation) = gen_str.parse::<u64>() {
-                    if generation < current_generation && !alive(generation) {
-                        drop(crate::claim::try_claim(&entry.path()));
-                    }
+            // Lock files of a generation with no marker: the session lock of a
+            // crashed process (its marker already recovered) and the recovery
+            // claim. Removed only if free, so a live holder's is left alone.
+            let lock_gen = name
+                .strip_suffix(".recover.lock")
+                .or_else(|| name.strip_suffix(".lock"))
+                .and_then(|g| g.parse::<u64>().ok());
+            if let Some(generation) = lock_gen {
+                if generation < current_generation && !alive(generation) {
+                    crate::claim::remove_if_free(&entry.path());
                 }
             }
         }

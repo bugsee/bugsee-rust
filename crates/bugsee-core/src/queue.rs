@@ -35,15 +35,15 @@ impl QueuedReport {
     fn endpoint_path(&self) -> PathBuf {
         sibling(&self.bundle, "endpoint")
     }
-    fn claim_path(&self) -> PathBuf {
-        sibling(&self.bundle, "claim")
+    fn lock_path(&self) -> PathBuf {
+        sibling(&self.bundle, "lock")
     }
 }
 
 /// Claim a queued report for delivery, so that of several processes draining one
 /// shared queue exactly one uploads it. Released when the guard drops.
 pub fn try_claim(report: &QueuedReport) -> Option<crate::claim::Claim> {
-    crate::claim::try_claim(&report.claim_path())
+    crate::claim::try_claim(&report.lock_path())
 }
 
 fn sibling(bundle: &Path, ext: &str) -> PathBuf {
@@ -151,6 +151,9 @@ pub fn remove(report: &QueuedReport) {
     let _ = std::fs::remove_file(report.req_path());
     let _ = std::fs::remove_file(report.meta_path());
     let _ = std::fs::remove_file(report.endpoint_path());
+    // The delivering claimant's own lock file (removing a held lock file is fine:
+    // the item is gone, so no one will look for it).
+    let _ = std::fs::remove_file(report.lock_path());
 }
 
 /// The bundle file's base name (for reconstructing an [`AssembledReport`]).
@@ -249,6 +252,8 @@ pub fn gc_orphans(data_dir: &Path) {
             .strip_suffix(".req")
             .or_else(|| name.strip_suffix(".meta"))
             .or_else(|| name.strip_suffix(".endpoint"))
+            .or_else(|| name.strip_suffix(".lock"))
+            // Leftovers of an earlier claim scheme.
             .or_else(|| name.strip_suffix(".claim"))
             .or_else(|| name.strip_suffix(".claim.takeover"))
             .or_else(|| name.strip_suffix(".tmp"));

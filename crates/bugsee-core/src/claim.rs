@@ -4,184 +4,322 @@
 //
 //  Copyright © 2026 Bugsee. All rights reserved.
 //
-//! Cross-process exclusive claims on on-disk work items.
+//! Cross-process exclusive claims on on-disk work items, and session liveness.
 //!
 //! Several processes can share one data directory — a prefork server's master
-//! and its workers above all — and the work items in it (a crashed session to
-//! recover, a queued report to upload) must each be handled by exactly one of
-//! them, or the backend receives duplicates. A claim is a small file created
-//! with `O_EXCL` (`CREATE_NEW` on Windows) that records its owner as
-//! `"<pid> <start-time> <nonce>"`.
+//! and its workers, containers sharing a volume — and the work items in it (a
+//! crashed session to recover, a queued report to upload) must each be handled
+//! by exactly one of them, or the backend receives duplicates.
 //!
-//! A claim must never block the work forever if its owner dies, so a stale claim
-//! is taken over. It is stale when
+//! A claim is an **OS byte-range lock** on a small `*.lock` file:
 //!
-//! * its owner process is gone, or the pid now belongs to a *different* process
-//!   (the recorded start time no longer matches: pid reuse, or a container's
-//!   restarted app being pid 1 again),
-//! * it has no readable owner and is older than [`UNOWNED_GRACE`] (its creator
-//!   died between creating the file and writing it), or
-//! * it is older than [`MAX_LEASE`], a backstop for a holder that is alive but
-//!   wedged, or on a platform that cannot tell processes apart.
+//! * unix: `fcntl(F_SETLK)`, a *process-scoped* lock. The kernel releases it the
+//!   instant the process dies, however it dies, and a `fork` child does not
+//!   inherit it.
+//! * Windows: `LockFileEx` on the handle, released when the handle closes or the
+//!   process exits.
 //!
-//! Taking over is serialised by a short-lived guard file, so two processes that
-//! both find the same claim stale cannot each remove the other's fresh claim and
-//! both end up holding it. (An OS file lock would release on death automatically,
-//! but it is per-open-file-description, not per-process, which makes it unreliable
-//! across `fork`.)
+//! Because the kernel is the arbiter there is nothing to go stale: no owner pid
+//! to probe, no start time, no lease to expire, no takeover protocol. That is
+//! also why it is correct across **pid namespaces** (two containers sharing a
+//! volume, both with a pid 1) and across pid reuse, where recording a pid in a
+//! file is not. The lock file itself may be left behind by a dead holder; it is
+//! just an unlocked file, and anyone may lock it.
+//!
+//! Two costs of process-scoped locks, both handled here:
+//!
+//! * They do not exclude *threads* of one process, so an in-process registry of
+//!   held paths does that.
+//! * POSIX drops a process's locks on a file when it closes **any** descriptor
+//!   for that file. So a lock file is never opened twice by one process: the
+//!   registry is consulted before every open, and a claim closes its descriptor
+//!   *before* leaving the registry.
+//!
+//! Advisory locks on network filesystems are best effort (NFS needs lockd). The
+//! SDK relies on no file timestamps for claims; the only ones it reads are the
+//! grace windows for half-written files in `recovery` and `queue`, which assume
+//! clocks that agree to within seconds.
 //!
 //! None of this runs on the crash path; it allocates freely.
 
-use std::io::Write;
+use std::cell::UnsafeCell;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-
-use crate::process;
-
-/// A claim that has no readable owner is given this long before it is treated as
-/// stale: its creator writes the owner a moment after creating the file.
-const UNOWNED_GRACE: Duration = Duration::from_secs(5);
-
-/// No claim is honoured for longer than this, whatever its owner's state. Work
-/// items are short (one upload, one recovery), so a claim this old is wedged.
-const MAX_LEASE: Duration = Duration::from_secs(30 * 60);
-
-/// The takeover guard is held for a few syscalls; one older than this was left
-/// by a process that died inside the critical section.
-const GUARD_TTL: Duration = Duration::from_secs(10);
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Holds a claim; dropping it releases the claim.
 #[derive(Debug)]
 pub struct Claim {
     path: PathBuf,
-    /// Exactly what this claim wrote, so release never removes a successor's claim.
-    content: String,
+    file: Option<File>,
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        if std::fs::read_to_string(&self.path).is_ok_and(|c| c == self.content) {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        // Close (releasing the OS lock) strictly before leaving the registry, so
+        // a thread that acquires next never has its lock dropped by our close.
+        drop(self.file.take());
+        registry().remove(&self.path);
     }
 }
 
-/// Try to claim `path`. `None` if another live process (or another thread of this
-/// one) holds it, or if it cannot be claimed.
+/// Try to claim `path` (created if absent). `None` if another process, or another
+/// thread of this one, holds it, or if it cannot be claimed.
 pub fn try_claim(path: &Path) -> Option<Claim> {
-    let content = owner_record();
-    match create(path, &content) {
-        Create::Done => Some(Claim {
-            path: path.to_path_buf(),
-            content,
-        }),
-        Create::Exists => take_over(path, content),
-        // Directory missing / unwritable: nothing can be claimed, and the
-        // caller's own I/O will fail more usefully than we can here.
-        Create::Failed => None,
+    match acquire(path, true) {
+        Acquire::Got(claim) => Some(claim),
+        Acquire::Held | Acquire::Unavailable => None,
     }
 }
 
-enum Create {
-    Done,
-    Exists,
-    Failed,
+/// Whether the lock file at `path` is held by a live process.
+pub(crate) enum Probe {
+    Held,
+    Free,
 }
 
-/// Atomically create `path` holding `content` (one `write`, so the owner is
-/// visible as soon as the file is).
-fn create(path: &Path, content: &str) -> Create {
-    match std::fs::OpenOptions::new()
+/// Is `path` currently claimed? A missing file is free. A file that cannot be
+/// inspected is reported held: the conservative answer never disturbs a peer.
+pub(crate) fn probe(path: &Path) -> Probe {
+    if !path.exists() {
+        return Probe::Free;
+    }
+    match acquire(path, false) {
+        Acquire::Got(claim) => {
+            drop(claim);
+            Probe::Free
+        }
+        // Vanished since the existence check: nothing holds it.
+        Acquire::Unavailable if !path.exists() => Probe::Free,
+        Acquire::Held | Acquire::Unavailable => Probe::Held,
+    }
+}
+
+/// Remove the lock file at `path` if nobody holds it (a dead holder's leftover).
+pub(crate) fn remove_if_free(path: &Path) {
+    if let Some(claim) = try_claim(path) {
+        let _ = std::fs::remove_file(path);
+        drop(claim);
+    }
+}
+
+enum Acquire {
+    Got(Claim),
+    Held,
+    Unavailable,
+}
+
+fn acquire(path: &Path, create: bool) -> Acquire {
+    if !registry().insert(path) {
+        return Acquire::Held; // another thread of this process
+    }
+    let file = match OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(create)
+        .truncate(false)
         .open(path)
     {
-        Ok(mut file) => {
-            let _ = file.write_all(content.as_bytes());
-            Create::Done
+        Ok(f) => f,
+        Err(_) => {
+            registry().remove(path);
+            return Acquire::Unavailable;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Create::Exists,
-        Err(_) => Create::Failed,
-    }
-}
-
-/// Replace a stale claim with ours. Only one process at a time may do this: the
-/// guard file excludes a second taker between our staleness check and our create,
-/// which is exactly the window in which it could otherwise remove the claim we
-/// just made.
-fn take_over(path: &Path, content: String) -> Option<Claim> {
-    let observed = std::fs::read_to_string(path).ok()?;
-    if !is_stale(path, &observed) {
-        return None;
-    }
-    let guard_path = sibling(path, "takeover");
-    match create(&guard_path, "") {
-        Create::Done => {}
-        Create::Exists => {
-            // Held by a peer mid-takeover (it finishes in microseconds, and the
-            // work is retried on the next drain), or left by one that died.
-            if age(&guard_path).is_some_and(|a| a > GUARD_TTL) {
-                let _ = std::fs::remove_file(&guard_path);
-            }
-            return None;
-        }
-        Create::Failed => return None,
-    }
-    let _guard = Guard(guard_path);
-    // Re-check under the guard: a peer may have completed its own takeover since
-    // we looked, and what is there now is a live claim, not the stale one.
-    if std::fs::read_to_string(path).ok().as_deref() != Some(observed.as_str()) {
-        return None;
-    }
-    let _ = std::fs::remove_file(path);
-    match create(path, &content) {
-        Create::Done => Some(Claim {
+    };
+    match os::try_lock(&file) {
+        Ok(true) => Acquire::Got(Claim {
             path: path.to_path_buf(),
-            content,
+            file: Some(file),
         }),
-        // A fresh creator slipped in between our remove and create: it holds it.
-        Create::Exists | Create::Failed => None,
+        Ok(false) => {
+            drop(file);
+            registry().remove(path);
+            Acquire::Held
+        }
+        Err(_) => {
+            drop(file);
+            registry().remove(path);
+            Acquire::Unavailable
+        }
     }
 }
 
-struct Guard(PathBuf);
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+/// The paths this process currently holds, keyed by pid so that a `fork` child,
+/// which inherits a copy of this memory, ignores the parent's entries.
+///
+/// A hand-rolled spin lock rather than a `Mutex`: if another thread held a
+/// `Mutex` at the instant of `fork`, the child's copy would stay locked forever
+/// and its first claim would deadlock. Here the lock word records the holder's
+/// pid, so a child that finds it held by a different pid knows the holder does
+/// not exist in this process and breaks it.
+struct Registry {
+    owner: AtomicU32,
+    held: UnsafeCell<Vec<(u32, PathBuf)>>,
+}
+
+// SAFETY: `held` is only touched while `owner` is held (see `with`).
+unsafe impl Sync for Registry {}
+
+static REGISTRY: Registry = Registry {
+    owner: AtomicU32::new(0),
+    held: UnsafeCell::new(Vec::new()),
+};
+
+fn registry() -> &'static Registry {
+    &REGISTRY
+}
+
+impl Registry {
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<(u32, PathBuf)>) -> R) -> R {
+        let pid = std::process::id();
+        loop {
+            match self
+                .owner
+                .compare_exchange(0, pid, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(holder) if holder != pid => {
+                    // Held by a pid that is not us: a parent's thread at the time
+                    // of `fork`. It does not exist here. Take the lock, and
+                    // discard (leak, never drop) the vector it may have left
+                    // half-modified.
+                    if self
+                        .owner
+                        .compare_exchange(holder, pid, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        // SAFETY: we now hold the lock; the old value is leaked
+                        // because its allocator state may be mid-update.
+                        unsafe { std::ptr::write(self.held.get(), Vec::new()) };
+                        break;
+                    }
+                }
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+        // SAFETY: exclusive while `owner == pid` (held above).
+        let out = f(unsafe { &mut *self.held.get() });
+        self.owner.store(0, Ordering::Release);
+        out
+    }
+
+    /// Record `path` as held by this process; `false` if it already is.
+    fn insert(&self, path: &Path) -> bool {
+        let pid = std::process::id();
+        self.with(|held| {
+            if held.iter().any(|(p, q)| *p == pid && q == path) {
+                return false;
+            }
+            // Entries of a different pid are a forked-from parent's; drop them.
+            held.retain(|(p, _)| *p == pid);
+            held.push((pid, path.to_path_buf()));
+            true
+        })
+    }
+
+    fn remove(&self, path: &Path) {
+        let pid = std::process::id();
+        self.with(|held| held.retain(|(p, q)| !(*p == pid && q == path)));
     }
 }
 
-fn sibling(path: &Path, ext: &str) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
-}
+#[cfg(unix)]
+mod os {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::io::AsRawFd;
 
-/// `"<pid> <start|-> <nonce>"` for this process; the nonce makes every claim's
-/// content unique, so "is this still my claim" is a content comparison.
-fn owner_record() -> String {
-    let (pid, start) =
-        process::parse_token(&process::self_token()).unwrap_or((std::process::id(), None));
-    let start = start.map_or_else(|| "-".to_string(), |s| s.to_string());
-    format!("{pid} {start} {}", crate::util::random_hex(8))
-}
-
-fn age(path: &Path) -> Option<Duration> {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    SystemTime::now().duration_since(modified).ok()
-}
-
-fn is_stale(path: &Path, content: &str) -> bool {
-    let age = age(path);
-    if age.is_some_and(|a| a > MAX_LEASE) {
-        return true;
+    /// Take a non-blocking exclusive lock on byte 0. `Ok(false)` if a peer holds it.
+    pub fn try_lock(file: &File) -> io::Result<bool> {
+        // SAFETY: an all-zero `flock` is a valid plain-data value.
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = libc::F_WRLCK as _;
+        fl.l_whence = libc::SEEK_SET as _;
+        fl.l_start = 0;
+        fl.l_len = 1;
+        loop {
+            // SAFETY: `fd` is a valid open descriptor and `fl` a valid `flock`.
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &fl) };
+            if ret == 0 {
+                return Ok(true);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EACCES) => return Ok(false),
+                Some(libc::EINTR) => continue,
+                _ => return Err(err),
+            }
+        }
     }
-    match process::parse_token(content) {
-        // A live owner with the recorded identity (including another thread of
-        // this very process) holds it.
-        Some((pid, start)) => !process::owner_is_alive(pid, start),
-        None => age.is_some_and(|a| a > UNOWNED_GRACE),
+}
+
+#[cfg(windows)]
+mod os {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut c_void,
+    }
+
+    extern "system" {
+        fn LockFileEx(
+            file: *mut c_void,
+            flags: u32,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    /// Take a non-blocking exclusive lock on byte 0. `Ok(false)` if a peer holds it.
+    pub fn try_lock(file: &File) -> io::Result<bool> {
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        };
+        // SAFETY: the handle is valid for the call and `ov` outlives it.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut ov,
+            )
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(ERROR_LOCK_VIOLATION) => Ok(false),
+            _ => Err(err),
+        }
+    }
+}
+
+/// No file locks: claims exclude threads of this process only.
+#[cfg(not(any(unix, windows)))]
+mod os {
+    pub fn try_lock(_file: &std::fs::File) -> std::io::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -195,122 +333,58 @@ mod tests {
         p
     }
 
-    fn backdate(path: &Path, by: Duration) {
-        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        f.set_modified(SystemTime::now() - by).unwrap();
-    }
-
-    /// This process's own live owner record, as a peer would have written it.
-    fn live_owner() -> String {
-        format!("{} nonce", process::self_token())
-    }
-
     #[test]
     fn a_claim_is_exclusive_and_released_on_drop() {
         let dir = tmp();
-        let path = dir.join("x.claim");
+        let path = dir.join("x.lock");
         let first = try_claim(&path).expect("first claim");
         assert!(try_claim(&path).is_none(), "already held");
+        assert!(matches!(probe(&path), Probe::Held));
         drop(first);
+        assert!(matches!(probe(&path), Probe::Free));
         assert!(try_claim(&path).is_some(), "free again after release");
     }
 
     #[test]
-    fn a_claim_whose_owner_is_dead_is_taken_over() {
+    fn a_leftover_lock_file_from_a_dead_holder_is_just_free() {
         let dir = tmp();
-        let path = dir.join("x.claim");
-        // A pid that cannot be alive: far above any real pid range.
-        std::fs::write(&path, "4294967290").unwrap();
-        assert!(try_claim(&path).is_some(), "stale claim must be reclaimed");
-        assert!(!sibling(&path, "takeover").exists(), "guard released");
-    }
-
-    #[test]
-    fn a_claim_held_by_a_live_process_is_respected() {
-        let dir = tmp();
-        let path = dir.join("x.claim");
-        std::fs::write(&path, live_owner()).unwrap();
-        assert!(try_claim(&path).is_none());
-        // Old-format owner (pid only), pid 1: alive on unix.
-        #[cfg(unix)]
-        {
-            std::fs::write(&path, "1").unwrap();
-            assert!(try_claim(&path).is_none());
-        }
-    }
-
-    #[test]
-    fn a_recycled_pid_does_not_keep_a_dead_owners_claim_alive() {
-        let Some(start) = process::start_time(std::process::id()) else {
-            return; // platform cannot tell processes apart
-        };
-        let dir = tmp();
-        let path = dir.join("x.claim");
-        // Our own (live) pid, but with a start time that is not ours: the claim
-        // was written by an earlier process that had this pid.
-        std::fs::write(
-            &path,
-            format!("{} {} stale", std::process::id(), start.wrapping_add(1)),
-        )
-        .unwrap();
-        assert!(try_claim(&path).is_some(), "recycled pid must not block");
-    }
-
-    #[test]
-    fn a_freshly_created_unowned_claim_is_not_stolen_but_an_old_one_is() {
-        let dir = tmp();
-        let path = dir.join("x.claim");
-        std::fs::write(&path, "").unwrap(); // creator has not written its owner yet
-        assert!(try_claim(&path).is_none());
-        backdate(&path, UNOWNED_GRACE + Duration::from_secs(5));
-        assert!(try_claim(&path).is_some(), "creator died before writing");
-    }
-
-    #[test]
-    fn a_wedged_holder_cannot_hold_a_claim_past_the_lease() {
-        let dir = tmp();
-        let path = dir.join("x.claim");
-        std::fs::write(&path, live_owner()).unwrap();
-        assert!(try_claim(&path).is_none());
-        backdate(&path, MAX_LEASE + Duration::from_secs(60));
+        let path = dir.join("x.lock");
+        // Contents are irrelevant: a dead holder's pid, even one that collides
+        // with a live process (here, our own), must not block anything.
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        assert!(matches!(probe(&path), Probe::Free));
         assert!(try_claim(&path).is_some());
     }
 
     #[test]
-    fn releasing_a_claim_never_removes_its_successors() {
+    fn a_missing_lock_file_probes_free_and_is_not_created() {
         let dir = tmp();
-        let path = dir.join("x.claim");
-        let first = try_claim(&path).unwrap();
-        // First is judged wedged and replaced behind its back.
-        std::fs::write(&path, live_owner()).unwrap();
-        drop(first);
-        assert!(path.exists(), "the successor's claim must survive");
+        let path = dir.join("nope.lock");
+        assert!(matches!(probe(&path), Probe::Free));
+        assert!(!path.exists());
     }
 
     #[test]
-    fn an_abandoned_takeover_guard_does_not_block_forever() {
+    fn dropping_one_claim_never_releases_another() {
+        // POSIX drops a process's locks on a file when ANY descriptor for it
+        // closes; the registry must keep a second open from ever happening.
         let dir = tmp();
-        let path = dir.join("x.claim");
-        std::fs::write(&path, "4294967290").unwrap();
-        let guard = sibling(&path, "takeover");
-        std::fs::write(&guard, "").unwrap();
-        // A taker is (apparently) mid-takeover: back off.
+        let path = dir.join("x.lock");
+        let held = try_claim(&path).unwrap();
         assert!(try_claim(&path).is_none());
-        // It died there long ago: clear the guard, then succeed.
-        backdate(&guard, GUARD_TTL + Duration::from_secs(5));
+        assert!(matches!(probe(&path), Probe::Held));
         assert!(
             try_claim(&path).is_none(),
-            "clearing the guard is its own step"
+            "probing must not have closed our lock"
         );
-        assert!(try_claim(&path).is_some());
+        drop(held);
     }
 
     #[test]
-    fn racing_takers_of_one_stale_claim_yield_exactly_one_holder() {
-        for _ in 0..200 {
+    fn racing_claimers_of_one_path_yield_exactly_one_holder() {
+        for _ in 0..100 {
             let dir = tmp();
-            let path = dir.join("x.claim");
-            std::fs::write(&path, "4294967290").unwrap();
+            let path = dir.join("x.lock");
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
             let handles: Vec<_> = (0..8)
                 .map(|_| {
@@ -318,7 +392,7 @@ mod tests {
                     std::thread::spawn(move || {
                         barrier.wait();
                         let claim = try_claim(&path);
-                        // Keep the claim held until every thread has tried.
+                        // Hold until every thread has tried.
                         barrier.wait();
                         claim.is_some()
                     })
@@ -329,7 +403,7 @@ mod tests {
                 .map(|h| h.join().unwrap())
                 .filter(|held| *held)
                 .count();
-            assert_eq!(holders, 1, "exactly one taker may win");
+            assert_eq!(holders, 1, "exactly one claimer may win");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

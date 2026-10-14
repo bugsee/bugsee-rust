@@ -94,6 +94,13 @@ fn child_entry() {
             std::fs::rename(dir.join("READY.tmp"), dir.join("READY")).unwrap();
             std::thread::sleep(Duration::from_secs(120));
         }
+        "session" => {
+            // A live session of its own, as a peer's launch would create.
+            let session = bugsee_core::session::Session::begin(&dir).unwrap();
+            std::fs::write(dir.join("READY.tmp"), session.generation().to_string()).unwrap();
+            std::fs::rename(dir.join("READY.tmp"), dir.join("READY")).unwrap();
+            std::thread::sleep(Duration::from_secs(120));
+        }
         other => panic!("unknown role {other}"),
     }
 }
@@ -242,4 +249,43 @@ fn a_holder_killed_mid_work_does_not_block_the_others() {
         run_workers(&dir, &log, 1);
     }
     assert_eq!(delivered(&log).len(), 7, "log: {:?}", delivered(&log));
+}
+
+/// Containers with separate pid namespaces share a volume, and each app is pid 1,
+/// so a peer's recorded pid can name a live process HERE that is not the peer.
+/// The marker's pid must therefore play no part in deciding the peer is dead.
+#[test]
+fn a_live_peers_session_is_not_mistaken_for_a_crash_whatever_pid_its_marker_names() {
+    let tmp = TempDir::new();
+    let dir = tmp.0.join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = tmp.0.join("delivered.log");
+
+    let mut peer = spawn("session", &dir, &log);
+    let ready = dir.join("READY");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "peer never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let generation: u64 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+
+    // Make the marker name a pid that is alive in THIS namespace and is not the
+    // peer: the parent's own, then init's. Neither may make the peer look dead,
+    // nor make it look alive once it is gone.
+    let marker = dir.join("sessions").join(format!("{generation}.alive"));
+    for foreign in [std::process::id().to_string(), "1".to_string()] {
+        std::fs::write(&marker, &foreign).unwrap();
+        run_workers(&dir, &log, 3);
+        let _ = std::fs::remove_file(dir.join("GO"));
+        assert!(delivered(&log).is_empty(), "live peer reported as a crash");
+        assert!(marker.exists(), "live peer's marker was reclaimed");
+    }
+
+    // Once the peer really dies, its session is recovered exactly once, even
+    // though the marker still names a live pid.
+    peer.kill().unwrap();
+    let _ = peer.wait();
+    run_workers(&dir, &log, 3);
+    assert_eq!(delivered(&log), vec!["recovered-crash".to_string()]);
 }

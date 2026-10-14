@@ -27,6 +27,12 @@ const SESSIONS_DIR: &str = "sessions";
 pub struct Session {
     data_dir: PathBuf,
     generation: u64,
+    /// The OS lock on `<gen>.lock`, held for the session's life. Peers sharing the
+    /// data dir (including from another pid namespace) probe it to tell a live
+    /// session from a crashed one; the kernel drops it when this process dies.
+    /// `None` if the lock file could not be taken (the bare pid in the marker is
+    /// then all a peer has).
+    _lock: Option<crate::claim::Claim>,
 }
 
 impl Session {
@@ -38,7 +44,7 @@ impl Session {
         std::fs::create_dir_all(&markers)?;
 
         let mut candidate = floor_generation(data_dir) + 1;
-        let generation = loop {
+        let (generation, lock) = loop {
             let marker = markers.join(format!("{candidate}.alive"));
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -46,10 +52,13 @@ impl Session {
                 .open(&marker)
             {
                 Ok(mut f) => {
-                    // "<pid> <start-time>": the start time lets recovery tell this
-                    // process from a later one that reuses the pid.
-                    let _ = write!(f, "{}", crate::process::self_token());
-                    break candidate;
+                    // Lock BEFORE writing the pid: the marker is empty (and fresh,
+                    // so peers skip it) until then, which closes the window in
+                    // which it is neither locked nor attributed.
+                    let lock = crate::claim::try_claim(&Session::lock_path(data_dir, candidate));
+                    // The marker stays a bare pid, readable by older builds.
+                    let _ = write!(f, "{}", std::process::id());
+                    break (candidate, lock);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     candidate += 1;
@@ -64,6 +73,7 @@ impl Session {
         Ok(Session {
             data_dir: data_dir.to_path_buf(),
             generation,
+            _lock: lock,
         })
     }
 
@@ -79,9 +89,18 @@ impl Session {
             .join(format!("{generation}.alive"))
     }
 
+    /// The liveness lock-file path for `generation`. Its presence marks a session
+    /// whose liveness is arbitrated by the lock rather than the marker's pid.
+    pub(crate) fn lock_path(data_dir: &Path, generation: u64) -> PathBuf {
+        data_dir
+            .join(SESSIONS_DIR)
+            .join(format!("{generation}.lock"))
+    }
+
     /// Mark a clean shutdown: remove this session's liveness marker.
     pub fn end(&self) {
         let _ = std::fs::remove_file(Session::marker_path(&self.data_dir, self.generation));
+        let _ = std::fs::remove_file(Session::lock_path(&self.data_dir, self.generation));
     }
 }
 
