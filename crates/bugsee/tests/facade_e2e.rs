@@ -100,10 +100,9 @@ fn full_public_api_flow() {
     assert_eq!(req["email"], "user@example.com");
     assert_eq!(req["source"]["type"], "code_upload");
     // origin is the caller of create_report() (this test), never an SDK frame
-    // or a bare address; null only if the build carries no symbols.
-    if let Some(origin) = req["source"]["origin"].as_str() {
-        assert!(origin.contains("full_public_api_flow"), "origin: {origin}");
-    }
+    // or a bare address. Test builds carry debug info, so it must be present.
+    let origin = req["source"]["origin"].as_str().expect("origin populated");
+    assert!(origin.contains("full_public_api_flow"), "origin: {origin}");
     assert_eq!(
         req["environment"]["sdk"]["version"],
         env!("CARGO_PKG_VERSION")

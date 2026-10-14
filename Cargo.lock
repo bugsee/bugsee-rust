@@ -167,6 +167,7 @@ dependencies = [
 name = "bugsee-core"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "getrandom 0.2.17",
  "libc",
  "proptest",
