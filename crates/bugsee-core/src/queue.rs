@@ -271,7 +271,7 @@ const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether `path` was last modified at least `grace` ago. Unknown or future-dated
 /// times count as recent: the conservative answer never disturbs a live peer.
-fn untouched_for(path: &Path, grace: std::time::Duration) -> bool {
+pub(crate) fn untouched_for(path: &Path, grace: std::time::Duration) -> bool {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()

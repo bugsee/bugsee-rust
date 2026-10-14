@@ -440,6 +440,9 @@ impl Recorder {
         &mut self,
         sampler: Option<Box<dyn TelemetrySampler>>,
     ) -> std::io::Result<()> {
+        // The registry of held claims is the parent's, and may be mid-update.
+        crate::claim::reset_after_fork();
+
         // The parent's threads are not ours to join; drop their handles without
         // running anything.
         std::mem::forget(self.worker.take());
@@ -663,6 +666,13 @@ impl Drop for Recorder {
         if worker_acked && uploader_acked && !std::thread::panicking() {
             if let Some(session) = &self.session {
                 session.end();
+            }
+        } else if !(worker_acked && uploader_acked) {
+            // A detached thread may still be writing this session's data: keep
+            // the liveness lock until the process exits so no peer recovers (and
+            // deletes) the session underneath it.
+            if let Some(session) = &mut self.session {
+                session.keep_lock_until_exit();
             }
         }
     }

@@ -30,8 +30,9 @@ pub struct Session {
     /// The OS lock on `<gen>.lock`, held for the session's life. Peers sharing the
     /// data dir (including from another pid namespace) probe it to tell a live
     /// session from a crashed one; the kernel drops it when this process dies.
-    /// `None` if the lock file could not be taken (the bare pid in the marker is
-    /// then all a peer has).
+    /// `None` when the session has no lock file (the filesystem rejects locks, or
+    /// the file could not be locked), in which case the pid in the marker is all
+    /// a peer has and `<gen>.lock` is deliberately absent.
     _lock: Option<crate::claim::Claim>,
 }
 
@@ -53,9 +54,8 @@ impl Session {
             {
                 Ok(mut f) => {
                     // Lock BEFORE writing the pid: the marker is empty (and fresh,
-                    // so peers skip it) until then, which closes the window in
-                    // which it is neither locked nor attributed.
-                    let lock = crate::claim::try_claim(&Session::lock_path(data_dir, candidate));
+                    // so peers skip it) until then.
+                    let lock = Session::take_lock(data_dir, candidate);
                     // The marker stays a bare pid, readable by older builds.
                     let _ = write!(f, "{}", std::process::id());
                     break (candidate, lock);
@@ -75,6 +75,38 @@ impl Session {
             generation,
             _lock: lock,
         })
+    }
+
+    /// Take `<gen>.lock`, or leave no lock file at all.
+    ///
+    /// A peer's probe never takes the lock (unix), but on Windows it momentarily
+    /// does, so a contended claim is retried briefly. If it still cannot be held
+    /// with kernel enforcement the file is removed: a lock file that exists but
+    /// is not held reads as "that session died" to every peer, which would have
+    /// them recover (and delete) this live session. Without the file peers fall
+    /// back to the pid in the marker.
+    fn take_lock(data_dir: &Path, generation: u64) -> Option<crate::claim::Claim> {
+        let path = Session::lock_path(data_dir, generation);
+        for attempt in 0..20 {
+            match crate::claim::try_claim(&path) {
+                Some(claim) if claim.is_os_locked() => return Some(claim),
+                // Thread-only (the filesystem rejects locks): useless to peers.
+                Some(_) => break,
+                None if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(2)),
+                None => break,
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        None
+    }
+
+    /// Keep this session's lock until the process exits instead of releasing it
+    /// when the session is dropped. For an unclean shutdown, where a detached
+    /// worker or uploader may still be writing this session's data: releasing the
+    /// lock would let a peer recover the session as a crash and delete its parts
+    /// underneath them. The kernel drops the lock when the process ends.
+    pub(crate) fn keep_lock_until_exit(&mut self) {
+        std::mem::forget(self._lock.take());
     }
 
     /// This session's generation number.
@@ -141,4 +173,62 @@ fn max_numeric_entry(dir: &Path, strip_suffix: Option<&str>) -> u64 {
         }
     }
     max
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claim::{probe, Probe};
+
+    fn tmp() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("bugsee-sess-{}", crate::util::random_hex(8)));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_live_session_holds_its_lock_and_a_clean_end_removes_it() {
+        let dir = tmp();
+        let session = Session::begin(&dir).unwrap();
+        let lock = Session::lock_path(&dir, session.generation());
+        assert!(matches!(probe(&lock), Probe::Held));
+        session.end();
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_session_that_cannot_hold_its_lock_leaves_no_lock_file_behind() {
+        // A lock file that exists but is not held reads as "that session died".
+        let dir = tmp();
+        std::fs::create_dir_all(dir.join(SESSIONS_DIR)).unwrap();
+        let peer = crate::claim::try_claim(&Session::lock_path(&dir, 1)).unwrap();
+        let session = Session::begin(&dir).unwrap();
+        assert_eq!(session.generation(), 1);
+        assert!(session._lock.is_none());
+        drop(peer);
+        assert!(!Session::lock_path(&dir, 1).exists());
+    }
+
+    #[test]
+    fn a_session_on_a_filesystem_without_locks_leaves_no_lock_file() {
+        let dir = tmp();
+        crate::claim::FORCE_UNSUPPORTED.with(|f| f.set(true));
+        let session = Session::begin(&dir).unwrap();
+        crate::claim::FORCE_UNSUPPORTED.with(|f| f.set(false));
+        assert!(session._lock.is_none());
+        assert!(!Session::lock_path(&dir, session.generation()).exists());
+    }
+
+    #[test]
+    fn keeping_the_lock_until_exit_survives_dropping_the_session() {
+        let dir = tmp();
+        let mut session = Session::begin(&dir).unwrap();
+        let lock = Session::lock_path(&dir, session.generation());
+        session.keep_lock_until_exit();
+        drop(session);
+        assert!(
+            matches!(probe(&lock), Probe::Held),
+            "a detached thread may still be writing: peers must not recover it"
+        );
+    }
 }

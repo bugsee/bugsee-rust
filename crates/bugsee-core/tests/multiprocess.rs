@@ -101,6 +101,13 @@ fn child_entry() {
             std::fs::rename(dir.join("READY.tmp"), dir.join("READY")).unwrap();
             std::thread::sleep(Duration::from_secs(120));
         }
+        "lockholder" => {
+            // Hold `sessions/1.lock`, as a peer's probe or launch would for a moment.
+            let claim = bugsee_core::claim::try_claim(&dir.join("sessions").join("1.lock"));
+            std::fs::write(dir.join("READY.tmp"), claim.is_some().to_string()).unwrap();
+            std::fs::rename(dir.join("READY.tmp"), dir.join("READY")).unwrap();
+            std::thread::sleep(Duration::from_secs(120));
+        }
         other => panic!("unknown role {other}"),
     }
 }
@@ -150,6 +157,8 @@ fn seed(dir: &Path, queued: usize, crashed: u64) {
     for g in 1..=crashed {
         // "0" is the portable "owner gone" sentinel.
         std::fs::write(sessions.join(format!("{g}.alive")), "0").unwrap();
+        // The lock file a crashed session leaves behind: present, held by no one.
+        std::fs::write(sessions.join(format!("{g}.lock")), "").unwrap();
         std::fs::create_dir_all(dir.join("parts").join(g.to_string())).unwrap();
     }
     std::fs::write(dir.join("gen"), crashed.to_string()).unwrap();
@@ -274,7 +283,20 @@ fn a_live_peers_session_is_not_mistaken_for_a_crash_whatever_pid_its_marker_name
     // peer: the parent's own, then init's. Neither may make the peer look dead,
     // nor make it look alive once it is gone.
     let marker = dir.join("sessions").join(format!("{generation}.alive"));
-    for foreign in [std::process::id().to_string(), "1".to_string()] {
+    // A reaped child's pid: gone from this namespace, as a peer's own pid is.
+    let mut reaped = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "no_such_test"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = reaped.wait();
+    let foreign_pids = [
+        std::process::id().to_string(),
+        "1".to_string(),
+        "4294967290".to_string(),
+        reaped.id().to_string(),
+    ];
+    for foreign in foreign_pids {
         std::fs::write(&marker, &foreign).unwrap();
         run_workers(&dir, &log, 3);
         let _ = std::fs::remove_file(dir.join("GO"));
@@ -288,4 +310,40 @@ fn a_live_peers_session_is_not_mistaken_for_a_crash_whatever_pid_its_marker_name
     let _ = peer.wait();
     run_workers(&dir, &log, 3);
     assert_eq!(delivered(&log), vec!["recovered-crash".to_string()]);
+}
+
+/// A launch that finds `<gen>.lock` momentarily held by someone else must not leave
+/// an unheld lock file behind: every peer would read it as "that session died" and
+/// recover (and delete) the live session.
+#[test]
+fn a_launch_that_loses_the_lock_race_is_not_recovered_as_a_crash() {
+    let tmp = TempDir::new();
+    let dir = tmp.0.join("data");
+    std::fs::create_dir_all(dir.join("sessions")).unwrap();
+    let log = tmp.0.join("delivered.log");
+
+    let mut holder = spawn("lockholder", &dir, &log);
+    let ready = dir.join("READY");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "holder never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(&ready).unwrap(), "true");
+    std::fs::remove_file(&ready).unwrap();
+
+    // Generation 1 is ours, but its lock file is held by the other process.
+    let session = bugsee_core::session::Session::begin(&dir).unwrap();
+    assert_eq!(session.generation(), 1);
+    holder.kill().unwrap();
+    let _ = holder.wait();
+
+    // Peers now look at a live session (this process) with no usable lock file.
+    run_workers(&dir, &log, 3);
+    assert!(
+        delivered(&log).is_empty(),
+        "live session reported as a crash"
+    );
+    assert!(dir.join("sessions").join("1.alive").exists());
+    drop(session);
 }

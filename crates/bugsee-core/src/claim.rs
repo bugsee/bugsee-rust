@@ -31,27 +31,48 @@
 //! * They do not exclude *threads* of one process, so an in-process registry of
 //!   held paths does that.
 //! * POSIX drops a process's locks on a file when it closes **any** descriptor
-//!   for that file. So a lock file is never opened twice by one process: the
-//!   registry is consulted before every open, and a claim closes its descriptor
-//!   *before* leaving the registry.
+//!   for that file. So a lock file is never opened twice by one process: every
+//!   open (claim or probe) registers the path first, and a claim closes its
+//!   descriptor *before* leaving the registry. Registry keys are canonicalised
+//!   (`/tmp` and `/private/tmp`, relative and absolute, are one file).
 //!
-//! Advisory locks on network filesystems are best effort (NFS needs lockd). The
-//! SDK relies on no file timestamps for claims; the only ones it reads are the
-//! grace windows for half-written files in `recovery` and `queue`, which assume
-//! clocks that agree to within seconds.
+//! **Unsupported locks.** Some filesystems reject byte-range locks outright (NFS
+//! without lockd: `ENOLCK`; FUSE/9p: `EOPNOTSUPP`/`ENOSYS`/`EINVAL`). The base
+//! scheme (`O_EXCL` files) worked there, so refusing to claim would be a
+//! regression: a queue that never drains. Instead such a claim degrades to
+//! thread-only exclusion (announced once on stderr), and a probe reports
+//! [`Probe::Unknown`] so the caller falls back to its pid check.
+//!
+//! **Locks that succeed but do not exclude** (Docker Desktop bind mounts, WSL2
+//! drvfs/9p, NFS mounted `nolock`) cannot be detected. Processes sharing a
+//! directory over such a mount can deliver a report twice; run one SDK host per
+//! directory there.
+//!
+//! The SDK relies on no file timestamps for claims; the only ones it reads are
+//! the grace windows for half-written files in `recovery` and `queue`, which
+//! assume clocks that agree to within seconds.
 //!
 //! None of this runs on the crash path; it allocates freely.
 
 use std::cell::UnsafeCell;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Holds a claim; dropping it releases the claim.
 #[derive(Debug)]
 pub struct Claim {
-    path: PathBuf,
+    key: PathBuf,
     file: Option<File>,
+    os_locked: bool,
+}
+
+impl Claim {
+    /// Whether the kernel enforces this claim against other processes. `false`
+    /// means the filesystem rejected locks and only threads are excluded.
+    pub(crate) fn is_os_locked(&self) -> bool {
+        self.os_locked
+    }
 }
 
 impl Drop for Claim {
@@ -59,14 +80,14 @@ impl Drop for Claim {
         // Close (releasing the OS lock) strictly before leaving the registry, so
         // a thread that acquires next never has its lock dropped by our close.
         drop(self.file.take());
-        registry().remove(&self.path);
+        registry().remove(&self.key);
     }
 }
 
 /// Try to claim `path` (created if absent). `None` if another process, or another
 /// thread of this one, holds it, or if it cannot be claimed.
 pub fn try_claim(path: &Path) -> Option<Claim> {
-    match acquire(path, true) {
+    match acquire(path) {
         Acquire::Got(claim) => Some(claim),
         Acquire::Held | Acquire::Unavailable => None,
     }
@@ -76,23 +97,40 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
 pub(crate) enum Probe {
     Held,
     Free,
+    /// The filesystem cannot say (it rejects locks): use another liveness signal.
+    Unknown,
 }
 
 /// Is `path` currently claimed? A missing file is free. A file that cannot be
 /// inspected is reported held: the conservative answer never disturbs a peer.
+///
+/// On unix this asks (`F_GETLK`) without taking the lock, so a probe can never
+/// steal the lock from a creator that has made the file but not yet locked it.
 pub(crate) fn probe(path: &Path) -> Probe {
     if !path.exists() {
         return Probe::Free;
     }
-    match acquire(path, false) {
-        Acquire::Got(claim) => {
-            drop(claim);
-            Probe::Free
+    let key = key_of(path);
+    if !registry().insert(&key) {
+        return Probe::Held; // held by a thread of this process, or being probed
+    }
+    let result = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => {
+            let r = match test_is_locked(&file) {
+                Ok(Peek::Free) => Probe::Free,
+                Ok(Peek::Held) => Probe::Held,
+                Ok(Peek::Unsupported) => Probe::Unknown,
+                Err(_) => Probe::Held,
+            };
+            drop(file); // close before leaving the registry
+            r
         }
         // Vanished since the existence check: nothing holds it.
-        Acquire::Unavailable if !path.exists() => Probe::Free,
-        Acquire::Held | Acquire::Unavailable => Probe::Held,
-    }
+        Err(_) if !path.exists() => Probe::Free,
+        Err(_) => Probe::Held,
+    };
+    registry().remove(&key);
+    result
 }
 
 /// Remove the lock file at `path` if nobody holds it (a dead holder's leftover).
@@ -103,45 +141,122 @@ pub(crate) fn remove_if_free(path: &Path) {
     }
 }
 
+/// Forget every registry entry. Called in a `fork` child before it claims
+/// anything: the child inherits the parent's registry (entries it does not own,
+/// possibly mid-update under the parent's spin lock) and none of its locks.
+pub fn reset_after_fork() {
+    registry().reset();
+}
+
 enum Acquire {
     Got(Claim),
     Held,
     Unavailable,
 }
 
-fn acquire(path: &Path, create: bool) -> Acquire {
-    if !registry().insert(path) {
+fn acquire(path: &Path) -> Acquire {
+    let key = key_of(path);
+    if !registry().insert(&key) {
         return Acquire::Held; // another thread of this process
     }
     let file = match OpenOptions::new()
         .read(true)
         .write(true)
-        .create(create)
+        .create(true)
         .truncate(false)
         .open(path)
     {
         Ok(f) => f,
         Err(_) => {
-            registry().remove(path);
+            registry().remove(&key);
             return Acquire::Unavailable;
         }
     };
-    match os::try_lock(&file) {
-        Ok(true) => Acquire::Got(Claim {
-            path: path.to_path_buf(),
+    match test_try_lock(&file) {
+        Ok(Lock::Got) => Acquire::Got(Claim {
+            key,
             file: Some(file),
+            os_locked: true,
         }),
-        Ok(false) => {
+        Ok(Lock::Contended) => {
             drop(file);
-            registry().remove(path);
+            registry().remove(&key);
             Acquire::Held
+        }
+        Ok(Lock::Unsupported) => {
+            static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+            crate::util::warn_once(
+                &ANNOUNCED,
+                "this filesystem does not support file locks; processes sharing the data \
+                 directory cannot be kept from delivering the same report twice",
+            );
+            Acquire::Got(Claim {
+                key,
+                file: Some(file),
+                os_locked: false,
+            })
         }
         Err(_) => {
             drop(file);
-            registry().remove(path);
+            registry().remove(&key);
             Acquire::Unavailable
         }
     }
+}
+
+/// The registry key for `path`: its directory canonicalised, so every spelling of
+/// one file maps to one key. Falls back to the path as given.
+fn key_of(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::canonicalize(parent)
+                .map(|p| p.join(name))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Outcome of an attempt to take a lock.
+enum Lock {
+    Got,
+    Contended,
+    Unsupported,
+}
+
+/// Outcome of asking whether a lock is held.
+enum Peek {
+    Free,
+    Held,
+    Unsupported,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make this thread's lock calls behave as on a filesystem that
+    /// rejects locks.
+    pub(crate) static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn test_try_lock(file: &File) -> std::io::Result<Lock> {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED.with(|f| f.get()) {
+        return Ok(Lock::Unsupported);
+    }
+    os::try_lock(file)
+}
+
+fn test_is_locked(file: &File) -> std::io::Result<Peek> {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED.with(|f| f.get()) {
+        return Ok(Peek::Unsupported);
+    }
+    os::is_locked(file)
 }
 
 /// The paths this process currently holds, keyed by pid so that a `fork` child,
@@ -149,9 +264,9 @@ fn acquire(path: &Path, create: bool) -> Acquire {
 ///
 /// A hand-rolled spin lock rather than a `Mutex`: if another thread held a
 /// `Mutex` at the instant of `fork`, the child's copy would stay locked forever
-/// and its first claim would deadlock. Here the lock word records the holder's
-/// pid, so a child that finds it held by a different pid knows the holder does
-/// not exist in this process and breaks it.
+/// and its first claim would deadlock. The fork hook calls [`reset_after_fork`]
+/// to clear it; as a second line the lock word records the holder's pid, so a
+/// child that finds it held by a different pid breaks it.
 struct Registry {
     owner: AtomicU32,
     held: UnsafeCell<Vec<(u32, PathBuf)>>,
@@ -221,32 +336,80 @@ impl Registry {
         let pid = std::process::id();
         self.with(|held| held.retain(|(p, q)| !(*p == pid && q == path)));
     }
+
+    /// Discard everything, including a lock word left held by a thread that does
+    /// not exist in this process. Only for a freshly forked, single-threaded child.
+    fn reset(&self) {
+        // SAFETY: the caller is the only thread in the process, so nothing else
+        // can be using the registry; the old vector is leaked, not dropped, as its
+        // allocator state may be mid-update from the parent's other threads.
+        unsafe { std::ptr::write(self.held.get(), Vec::new()) };
+        self.owner.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(unix)]
 mod os {
+    use super::{Lock, Peek};
     use std::fs::File;
     use std::io;
     use std::os::unix::io::AsRawFd;
 
-    /// Take a non-blocking exclusive lock on byte 0. `Ok(false)` if a peer holds it.
-    pub fn try_lock(file: &File) -> io::Result<bool> {
+    fn whole() -> libc::flock {
         // SAFETY: an all-zero `flock` is a valid plain-data value.
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
         fl.l_type = libc::F_WRLCK as _;
         fl.l_whence = libc::SEEK_SET as _;
         fl.l_start = 0;
         fl.l_len = 1;
+        fl
+    }
+
+    /// Errors meaning "this filesystem does not do byte-range locks".
+    fn is_unsupported(errno: i32) -> bool {
+        errno == libc::ENOLCK
+            || errno == libc::ENOSYS
+            || errno == libc::EINVAL
+            || errno == libc::EOPNOTSUPP
+            || errno == libc::ENOTSUP
+    }
+
+    /// Take a non-blocking exclusive lock on byte 0.
+    pub fn try_lock(file: &File) -> io::Result<Lock> {
+        let fl = whole();
         loop {
             // SAFETY: `fd` is a valid open descriptor and `fl` a valid `flock`.
             let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &fl) };
             if ret == 0 {
-                return Ok(true);
+                return Ok(Lock::Got);
             }
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EACCES) => return Ok(false),
+                Some(libc::EAGAIN) | Some(libc::EACCES) => return Ok(Lock::Contended),
                 Some(libc::EINTR) => continue,
+                Some(e) if is_unsupported(e) => return Ok(Lock::Unsupported),
+                _ => return Err(err),
+            }
+        }
+    }
+
+    /// Ask whether a peer holds the lock, without taking it.
+    pub fn is_locked(file: &File) -> io::Result<Peek> {
+        let mut fl = whole();
+        loop {
+            // SAFETY: as above; `F_GETLK` only writes the conflicting lock into `fl`.
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut fl) };
+            if ret == 0 {
+                return Ok(if fl.l_type as i32 == libc::F_UNLCK as i32 {
+                    Peek::Free
+                } else {
+                    Peek::Held
+                });
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(e) if is_unsupported(e) => return Ok(Peek::Unsupported),
                 _ => return Err(err),
             }
         }
@@ -255,6 +418,7 @@ mod os {
 
 #[cfg(windows)]
 mod os {
+    use super::{Lock, Peek};
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
@@ -284,8 +448,8 @@ mod os {
         ) -> i32;
     }
 
-    /// Take a non-blocking exclusive lock on byte 0. `Ok(false)` if a peer holds it.
-    pub fn try_lock(file: &File) -> io::Result<bool> {
+    /// Take a non-blocking exclusive lock on byte 0.
+    pub fn try_lock(file: &File) -> io::Result<Lock> {
         let mut ov = Overlapped {
             internal: 0,
             internal_high: 0,
@@ -305,21 +469,35 @@ mod os {
             )
         };
         if ok != 0 {
-            return Ok(true);
+            return Ok(Lock::Got);
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(ERROR_LOCK_VIOLATION) => Ok(false),
+            Some(ERROR_LOCK_VIOLATION) => Ok(Lock::Contended),
             _ => Err(err),
         }
+    }
+
+    /// Windows has no query-only call, so this takes the lock; the caller closes
+    /// the handle straight after, which releases it.
+    pub fn is_locked(file: &File) -> io::Result<Peek> {
+        Ok(match try_lock(file)? {
+            Lock::Got => Peek::Free,
+            Lock::Contended => Peek::Held,
+            Lock::Unsupported => Peek::Unsupported,
+        })
     }
 }
 
 /// No file locks: claims exclude threads of this process only.
 #[cfg(not(any(unix, windows)))]
 mod os {
-    pub fn try_lock(_file: &std::fs::File) -> std::io::Result<bool> {
-        Ok(true)
+    use super::{Lock, Peek};
+    pub fn try_lock(_file: &std::fs::File) -> std::io::Result<Lock> {
+        Ok(Lock::Unsupported)
+    }
+    pub fn is_locked(_file: &std::fs::File) -> std::io::Result<Peek> {
+        Ok(Peek::Unsupported)
     }
 }
 
@@ -338,6 +516,7 @@ mod tests {
         let dir = tmp();
         let path = dir.join("x.lock");
         let first = try_claim(&path).expect("first claim");
+        assert!(first.is_os_locked());
         assert!(try_claim(&path).is_none(), "already held");
         assert!(matches!(probe(&path), Probe::Held));
         drop(first);
@@ -365,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_one_claim_never_releases_another() {
+    fn probing_never_takes_or_drops_a_lock() {
         // POSIX drops a process's locks on a file when ANY descriptor for it
         // closes; the registry must keep a second open from ever happening.
         let dir = tmp();
@@ -377,6 +556,21 @@ mod tests {
             try_claim(&path).is_none(),
             "probing must not have closed our lock"
         );
+        drop(held);
+        // And a probe of a free file leaves it free for the next claimer.
+        assert!(matches!(probe(&path), Probe::Free));
+        assert!(try_claim(&path).is_some());
+    }
+
+    #[test]
+    fn one_file_under_two_spellings_is_one_claim() {
+        let dir = tmp();
+        let path = dir.join("x.lock");
+        let held = try_claim(&path).unwrap();
+        // The same file through a `..` detour.
+        let detour = dir.join("sub").join("..").join("x.lock");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(try_claim(&detour).is_none());
         drop(held);
     }
 
@@ -406,5 +600,20 @@ mod tests {
             assert_eq!(holders, 1, "exactly one claimer may win");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn a_filesystem_that_rejects_locks_degrades_to_thread_only_claims() {
+        let dir = tmp();
+        let path = dir.join("x.lock");
+        FORCE_UNSUPPORTED.with(|f| f.set(true));
+        let first = try_claim(&path).expect("must still claim");
+        assert!(!first.is_os_locked());
+        assert!(try_claim(&path).is_none(), "threads are still excluded");
+        drop(first);
+        assert!(try_claim(&path).is_some(), "and it is released on drop");
+        // A probe cannot say: the caller must use another signal.
+        assert!(matches!(probe(&path), Probe::Unknown));
+        FORCE_UNSUPPORTED.with(|f| f.set(false));
     }
 }
