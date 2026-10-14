@@ -729,6 +729,7 @@ mod imp {
             0xC000_0090 | 0xC000_0091 | 0xC000_0093 => SIGFPE, // FLT_INVALID_OPERATION/OVERFLOW/UNDERFLOW
             0xC000_008F | 0xC000_0092 => SIGFPE, // FLT_INEXACT_RESULT / FLT_STACK_CHECK
             0xC000_02B4 | 0xC000_02B5 => SIGFPE, // FLT_MULTIPLE_FAULTS / FLT_MULTIPLE_TRAPS
+            0xC000_008D => SIGFPE,               // FLT_DENORMAL_OPERAND
             _ => 0,
         }
     }
@@ -2969,6 +2970,9 @@ mod imp {
                 0xC000_0092,
                 0xC000_0093,
                 0xC000_008F,
+                0xC000_008D,
+                0xC000_02B4,
+                0xC000_02B5,
             ] {
                 assert_eq!(exception_to_signal(code as i32), 8, "code {code:#x}");
             }

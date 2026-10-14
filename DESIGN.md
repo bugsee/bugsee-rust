@@ -193,7 +193,7 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 
 **Uncaught-panic reporting (mark-and-recover, default).** The hook only *captures*; it never reports. Which path a panic takes is then decided by what actually happens to the process:
 - **caught** at a `guard`/`catch_unwind` boundary → reported there as `handled`, and `report_caught` **deletes** the snapshot so nothing later misreads it as fatal;
-- **aborting** (`panic = "abort"`) → SIGABRT → the native handler records it → next-launch recovery *correlates* signal + snapshot into one managed crash;
+- **aborting** (`panic = "abort"`) → SIGABRT → the native handler records it → next-launch recovery *correlates* signal + snapshot into one managed crash (Unix; on Windows Rust's `abort()` is a fast-fail with no signal, so recovery reports the snapshot alone - see §12);
 - **uncaught + unwinding** (the Rust **default**) → no signal at all. The panic unwinds out of `main`, and `Recorder::drop` observes `std::thread::panicking()` and therefore **keeps** the liveness marker; next-launch recovery finds the lone surviving snapshot and reports it as a fatal panic.
 
 That last case previously produced **no report whatsoever** — the SDK shut down "cleanly", dropped the marker, and recovery had nothing to find. The two invariants that make a lone surviving snapshot unambiguous are the `report_caught` deletion above and the `thread::panicking()`-gated marker retention.
