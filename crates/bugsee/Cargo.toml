@@ -29,7 +29,7 @@ panic = ["dep:bugsee-panic"]
 # Native fatal-crash handler (signal/Mach exception) + next-launch recovery.
 native = ["dep:bugsee-native"]
 # System/process telemetry sampling (traces.system) via sysinfo.
-telemetry = ["dep:sysinfo"]
+telemetry = ["dep:sysinfo", "dep:libc"]
 
 # The crash matrix needs the REAL main thread: an uncaught panic must unwind out
 # of `main`, and the panic observer treats any other thread as "a thread died",
@@ -43,4 +43,7 @@ required-features = ["native"]
 # Local UTC offset and the hardware model are libc calls on unix; `libc` is
 # already in the tree via `bugsee-core` / `bugsee-native`, so this adds nothing.
 [target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

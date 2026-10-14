@@ -436,7 +436,7 @@ can fix.
    macOS/iOS, DMI `product_name` then the device-tree `model` on Linux, and the
    SMBIOS `SystemProductName` registry value on Windows; firmware placeholders
    ("To Be Filled By O.E.M.") are reported as absent, and Android reports none.
-   Windows `locale` falls back to `GetUserDefaultLocaleName` when the POSIX
+   Windows `locale` falls back to the first preferred UI language (`GetUserPreferredUILanguages`, then `GetUserDefaultLocaleName`) when the POSIX
    variables are unset. Windows code is type-checked and clippy-clean but its
    tests have not been run on real hardware.
 

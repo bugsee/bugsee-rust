@@ -11,36 +11,44 @@
 //! This is the one place in the host crate that calls into the OS directly, so
 //! the `unsafe` is confined here and kept to single FFI calls with no
 //! invariants beyond their arguments. No binding crate is used: `libc` is
-//! already in the tree, and the three Win32 calls are declared by hand (a
-//! binding crate for three functions is a worse trade than 15 lines of
+//! already in the tree, and the handful of Win32 calls are declared by hand (a
+//! binding crate for a few functions is a worse trade than a few lines of
 //! `extern`). Everything is best-effort and returns `None` rather than a guess.
 
 /// Minutes east of UTC for the local time zone right now.
 ///
 /// Not the `time` crate: it refuses to read the local offset once a process is
-/// multithreaded (an SDK always is), because `localtime_r` can race a
-/// concurrent `setenv("TZ")`. We accept that narrow race for a single
-/// diagnostic number, which the crate's blanket refusal does not allow.
+/// multithreaded (an SDK always is), because `localtime_r` reads `TZ` through
+/// `getenv` and a concurrent `setenv` elsewhere in the process is a data race
+/// that, in glibc, can be a use-after-free of `environ` — not merely a wrong
+/// number. We accept that risk for one diagnostic value because this is called
+/// exactly once, from `init` (`api.rs`), before the SDK starts its own threads.
+/// Hosts that mutate the environment from other threads should call `init`
+/// first.
 ///
 /// Sampled once when the environment is built, so a DST change during a very
-/// long run is not reflected in that run's reports.
+/// long run is not reflected in that run's reports. Unix targets whose `libc`
+/// has no `tm_gmtoff` (illumos, Solaris, AIX, newlib, VxWorks) report `None`.
 pub(crate) fn utc_offset_minutes() -> Option<i32> {
     imp::utc_offset_minutes()
 }
 
-/// The machine's model string, e.g. `MacBookPro18,3`, `iPhone14,2`,
-/// `ThinkPad X1 Carbon`, `Raspberry Pi 4 Model B`.
+/// The machine's model string, e.g. `MacBookPro18,3` (macOS), `iPhone14,2`
+/// (iOS), `ThinkPad X1 Carbon` or `Raspberry Pi 4 Model B`.
 ///
 /// On desktop Linux and Windows this is the firmware's product name, which on
 /// white-box or DIY machines is often a placeholder; those are reported as
-/// absent (see [`clean_model`]) rather than as a model.
+/// absent (see [`clean_model`]) rather than as a model. Note that on some
+/// vendors the field holds a part number rather than a marketing name.
 pub(crate) fn hardware_model() -> Option<String> {
     imp::hardware_model()
 }
 
-/// The user's locale from the OS settings, in the `en_US` form. Only Windows
-/// has a setting beyond the POSIX environment variables the caller already
-/// reads; elsewhere this is `None`.
+/// The user's locale from the OS settings, in the `en_US` form, for when the
+/// POSIX environment variables the caller already reads say nothing. Only
+/// Windows has such a setting wired up. macOS GUI apps and iOS do not set
+/// `LANG` either, so they currently report no locale; reading the preferred
+/// language from CoreFoundation is a follow-up.
 pub(crate) fn locale() -> Option<String> {
     imp::locale()
 }
@@ -49,15 +57,19 @@ pub(crate) fn locale() -> Option<String> {
 /// reject the placeholders firmware vendors ship when they never filled the
 /// field in. Reporting "To Be Filled By O.E.M." as a hardware model would be
 /// worse than reporting nothing.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn clean_model(raw: &str) -> Option<String> {
     let value = raw.replace('\0', "");
     let value = value.trim();
-    const PLACEHOLDERS: [&str; 8] = [
+    const PLACEHOLDERS: [&str; 11] = [
         "to be filled by o.e.m.",
         "system product name",
         "default string",
         "not specified",
         "not applicable",
+        "all series",
+        "type1productconfigid",
+        "invalid",
         "unknown",
         "none",
         "n/a",
@@ -68,14 +80,52 @@ fn clean_model(raw: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+/// `en-US` -> `en_US`. Keeps the language and the region only: a 4-letter
+/// script (`sr-Latn-RS` -> `sr_RS`) or variant (`ca-ES-valencia` -> `ca_ES`) is
+/// skipped, so the value matches the language_REGION form the other SDKs send.
+/// The region is the first subtag after the language that is 2 letters or 3
+/// digits; a tag without one (`fr`, `sr-Latn`) yields the bare language.
+/// Anything from a `_` on (`de-DE_phoneb`, a Windows sort-order suffix) is cut
+/// first.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn locale_from_bcp47(tag: &str) -> Option<String> {
+    let tag = tag.split('_').next().unwrap_or("");
+    let mut parts = tag.split('-');
+    let lang = parts.next().filter(|l| !l.is_empty())?;
+    let region = parts.find(|p| {
+        (p.len() == 2 && p.bytes().all(|b| b.is_ascii_alphabetic()))
+            || (p.len() == 3 && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    Some(match region {
+        Some(region) => format!("{lang}_{region}"),
+        None => lang.to_string(),
+    })
+}
+
 #[cfg(unix)]
 mod imp {
     use super::clean_model;
 
+    // The OSes whose `libc::tm` carries `tm_gmtoff`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     pub(super) fn utc_offset_minutes() -> Option<i32> {
-        // SAFETY: `localtime_r` writes only into the `tm` we hand it and reads
-        // the `time_t` by value; a zeroed `tm` is a valid out-parameter.
+        // SAFETY: `tzset` takes no arguments; `localtime_r` writes only into
+        // the `tm` we hand it and reads the `time_t` by value; a zeroed `tm` is
+        // a valid out-parameter. See the caller's note on the `TZ` race.
         let gmtoff = unsafe {
+            // POSIX, but not every `libc` crate target binds it.
+            extern "C" {
+                fn tzset();
+            }
+            tzset();
             let now = libc::time(std::ptr::null_mut());
             let mut tm: libc::tm = std::mem::zeroed();
             if libc::localtime_r(&now, &mut tm).is_null() {
@@ -86,11 +136,38 @@ mod imp {
         Some((gmtoff / 60) as i32)
     }
 
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    pub(super) fn utc_offset_minutes() -> Option<i32> {
+        None
+    }
+
+    /// macOS: `hw.model` is the model identifier ("MacBookPro18,3"). Every other
+    /// Apple OS: `hw.model` is the *board* id ("D63AP"), and the product
+    /// identifier ("iPhone14,2") is `hw.machine`, the same value iOS SDKs read
+    /// from `utsname.machine`. In the simulator `hw.machine` is the host's
+    /// architecture, so the simulated device's identifier is taken from
+    /// `SIMULATOR_MODEL_IDENTIFIER` first.
     #[cfg(target_vendor = "apple")]
     pub(super) fn hardware_model() -> Option<String> {
-        // `hw.model` is the model identifier on both macOS ("MacBookPro18,3")
-        // and iOS ("iPhone14,2").
+        #[cfg(not(target_os = "macos"))]
+        if let Some(sim) = std::env::var("SIMULATOR_MODEL_IDENTIFIER")
+            .ok()
+            .and_then(|v| clean_model(&v))
+        {
+            return Some(sim);
+        }
+        #[cfg(target_os = "macos")]
         let name = c"hw.model";
+        #[cfg(not(target_os = "macos"))]
+        let name = c"hw.machine";
         let mut len: libc::size_t = 0;
         // SAFETY: a null buffer asks for the required length only.
         let rc = unsafe {
@@ -164,6 +241,12 @@ mod imp {
     extern "system" {
         fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
         fn GetUserDefaultLocaleName(name: *mut u16, len: i32) -> i32;
+        fn GetUserPreferredUILanguages(
+            flags: u32,
+            count: *mut u32,
+            buf: *mut u16,
+            len: *mut u32,
+        ) -> i32;
     }
 
     #[link(name = "advapi32")]
@@ -180,23 +263,26 @@ mod imp {
     }
 
     const TIME_ZONE_ID_INVALID: u32 = 0xFFFF_FFFF;
+    const TIME_ZONE_ID_STANDARD: u32 = 1;
     const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    const MUI_LANGUAGE_NAME: u32 = 0x8;
     const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
     const RRF_RT_REG_SZ: u32 = 0x0000_0002;
 
     /// Windows reports the *bias*: minutes WEST of UTC (`UTC = local + bias`),
     /// plus a correction while daylight time is in force. The contract wants
-    /// minutes east, so negate.
+    /// minutes east, so negate. `TIME_ZONE_ID_UNKNOWN` (no DST rules for the
+    /// zone) is just the bias.
     pub(super) fn offset_from_bias(
         bias: i32,
         standard_bias: i32,
         daylight_bias: i32,
         id: u32,
     ) -> i32 {
-        let adjust = if id == TIME_ZONE_ID_DAYLIGHT {
-            daylight_bias
-        } else {
-            standard_bias
+        let adjust = match id {
+            TIME_ZONE_ID_DAYLIGHT => daylight_bias,
+            TIME_ZONE_ID_STANDARD => standard_bias,
+            _ => 0,
         };
         -(bias + adjust)
     }
@@ -263,18 +349,45 @@ mod imp {
         clean_model(&String::from_utf16_lossy(&buf))
     }
 
-    /// `en-US` -> `en_US`; a script subtag (`zh-Hans-CN`) is dropped so the
-    /// value matches the language_REGION form the other SDKs send.
-    pub(super) fn locale_from_bcp47(tag: &str) -> Option<String> {
-        let mut parts = tag.split('-');
-        let lang = parts.next().filter(|l| !l.is_empty())?;
-        match parts.next_back() {
-            Some(region) => Some(format!("{lang}_{region}")),
-            None => Some(lang.to_string()),
+    /// The user's first preferred UI language (`en-US`), which is what POSIX
+    /// `LC_MESSAGES` and Android's `Locale.getDefault()` correspond to.
+    fn ui_language() -> Option<String> {
+        let mut count: u32 = 0;
+        let mut len: u32 = 0;
+        // SAFETY: a null buffer asks for the required length (in u16 units).
+        let ok = unsafe {
+            GetUserPreferredUILanguages(
+                MUI_LANGUAGE_NAME,
+                &mut count,
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if ok == 0 || len < 2 {
+            return None;
         }
+        let mut buf = vec![0u16; len as usize];
+        // SAFETY: `buf` holds `len` u16 units, the size just reported.
+        let ok = unsafe {
+            GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, buf.as_mut_ptr(), &mut len)
+        };
+        if ok == 0 {
+            return None;
+        }
+        // A double-NUL-terminated list; the first entry is the preferred one.
+        let first = buf.split(|&c| c == 0).next()?;
+        super::locale_from_bcp47(&String::from_utf16_lossy(first))
     }
 
+    /// Prefers the UI language, falling back to the regional-format locale
+    /// (`GetUserDefaultLocaleName`) if the former cannot be read. The two can
+    /// differ (English UI with German number formats); the UI language is the
+    /// better match for what other platforms report as the locale.
     pub(super) fn locale() -> Option<String> {
+        ui_language().or_else(regional_locale)
+    }
+
+    fn regional_locale() -> Option<String> {
         // LOCALE_NAME_MAX_LENGTH is 85, including the terminator.
         let mut buf = [0u16; 85];
         // SAFETY: `buf` is writable for the `len` code units we pass.
@@ -282,7 +395,7 @@ mod imp {
         if n <= 1 {
             return None;
         }
-        locale_from_bcp47(&String::from_utf16_lossy(&buf[..n as usize - 1]))
+        super::locale_from_bcp47(&String::from_utf16_lossy(&buf[..n as usize - 1]))
     }
 }
 
@@ -313,6 +426,9 @@ mod tests {
             "System Product Name",
             "Default string",
             "unknown",
+            "All Series",
+            "Type1ProductConfigId",
+            "INVALID",
         ] {
             assert_eq!(clean_model(raw), None, "{raw:?} must be absent");
         }
@@ -358,7 +474,7 @@ mod tests {
         assert_eq!(utc_offset_minutes(), Some(sign * (h * 60 + m)));
     }
 
-    #[cfg(target_vendor = "apple")]
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_reports_a_hardware_model() {
         let model = hardware_model().expect("hw.model must resolve on Apple hosts");
@@ -374,16 +490,25 @@ mod tests {
         assert_eq!(offset_from_bias(300, 0, -60, 2), -240);
         // India has no DST and a half-hour zone: UTC+5:30.
         assert_eq!(offset_from_bias(-330, 0, 0, 0), 330);
+        // TIME_ZONE_ID_UNKNOWN ignores the (garbage-prone) standard bias.
+        assert_eq!(offset_from_bias(-330, 77, 0, 0), 330);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_locale_tags_map_to_the_posix_form() {
-        use super::imp::locale_from_bcp47;
-        assert_eq!(locale_from_bcp47("en-US").as_deref(), Some("en_US"));
-        assert_eq!(locale_from_bcp47("zh-Hans-CN").as_deref(), Some("zh_CN"));
-        assert_eq!(locale_from_bcp47("fr").as_deref(), Some("fr"));
-        assert_eq!(locale_from_bcp47(""), None);
+    fn bcp47_tags_map_to_the_posix_form() {
+        for (tag, expected) in [
+            ("en-US", Some("en_US")),
+            ("zh-Hans-CN", Some("zh_CN")),
+            ("fr", Some("fr")),
+            ("sr-Latn", Some("sr")),
+            ("sr-Latn-RS", Some("sr_RS")),
+            ("ca-ES-valencia", Some("ca_ES")),
+            ("de-DE_phoneb", Some("de_DE")),
+            ("es-419", Some("es_419")),
+            ("", None),
+        ] {
+            assert_eq!(locale_from_bcp47(tag).as_deref(), expected, "{tag:?}");
+        }
     }
 
     #[cfg(windows)]
