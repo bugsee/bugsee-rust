@@ -125,8 +125,8 @@ pub enum Admission {
 /// local blacklist is ever reached. Instead the first copy stays queued and
 /// later copies with the identical, non-empty signature set are dropped; once it
 /// has been delivered a recurrence is queued again. The queue is also capped
-/// (entries and bytes): beyond it the newest recovered crash is dropped rather
-/// than grow the directory without bound. Reports without signatures are never
+/// (entries and bytes): beyond it the caller keeps the crash's evidence for the
+/// background pass rather than queue more on the launch path. Reports without signatures are never
 /// treated as duplicates.
 pub fn admit_recovered(data_dir: &Path, signatures: &[String]) -> Admission {
     let wanted: BTreeSet<&String> = signatures.iter().collect();

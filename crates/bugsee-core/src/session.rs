@@ -56,6 +56,16 @@ impl Session {
                     // Lock BEFORE writing the pid: the marker is empty (and fresh,
                     // so peers skip it) until then.
                     let lock = Session::take_lock(data_dir, candidate);
+                    if lock.is_none() {
+                        // No kernel lock to tell peers we are alive: a heartbeat
+                        // file, touched by the worker, is the substitute.
+                        let _ = std::fs::write(
+                            crate::recovery::heartbeat_path(&Session::marker_path(
+                                data_dir, candidate,
+                            )),
+                            b"",
+                        );
+                    }
                     // The marker stays a bare pid, readable by older builds.
                     let _ = write!(f, "{}", std::process::id());
                     break (candidate, lock);
@@ -133,6 +143,10 @@ impl Session {
     pub fn end(&self) {
         let _ = std::fs::remove_file(Session::marker_path(&self.data_dir, self.generation));
         let _ = std::fs::remove_file(Session::lock_path(&self.data_dir, self.generation));
+        let _ = std::fs::remove_file(crate::recovery::heartbeat_path(&Session::marker_path(
+            &self.data_dir,
+            self.generation,
+        )));
     }
 }
 
@@ -217,6 +231,12 @@ mod tests {
         crate::claim::FORCE_UNSUPPORTED.with(|f| f.set(false));
         assert!(session._lock.is_none());
         assert!(!Session::lock_path(&dir, session.generation()).exists());
+        // Instead it keeps a heartbeat file, removed on a clean end.
+        let beat =
+            crate::recovery::heartbeat_path(&Session::marker_path(&dir, session.generation()));
+        assert!(beat.exists());
+        session.end();
+        assert!(!beat.exists());
     }
 
     #[test]

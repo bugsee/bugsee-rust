@@ -185,6 +185,39 @@ fn the_session_cap_limits_the_launch_path() {
     assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 4);
 }
 
+/// A unique crash the launch pass has no queue room for is not destroyed: the
+/// worker's (uncapped) pass queues it.
+#[test]
+fn a_full_queue_defers_a_unique_crash_to_the_worker_instead_of_discarding_it() {
+    let tmp = TempDir::new();
+    let dir = tmp.0.join("data");
+    seed_crashed(&dir, 1..=1);
+    for i in 0..queue::MAX_QUEUED_REPORTS {
+        queue::enqueue(
+            &dir,
+            &bugsee_core::AssembledReport {
+                bundle_name: format!("{}.bundle.zip", bugsee_core::util::random_hex(10)),
+                zip: b"z".to_vec(),
+                request_json: format!("{{\"signatures\":[\"other-{i}\"]}}").into_bytes(),
+            },
+        )
+        .unwrap();
+    }
+
+    let rec =
+        Recorder::launch(config(&dir, Duration::from_millis(500)), Arc::new(Offline)).unwrap();
+    rec.recover_on_launch_path();
+    // The launch pass refused it (the worker may already be queueing it, so
+    // only the outcome is asserted): it ends up queued, not discarded, and
+    // without having used up its recovery attempts.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while queue::list_pending(&dir).len() <= queue::MAX_QUEUED_REPORTS {
+        assert!(Instant::now() < deadline, "the worker never recovered it");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(rec);
+}
+
 /// A hook that never returns must not hold `launch` past the budget.
 #[test]
 fn a_blocked_before_send_cannot_stall_the_launch_path() {

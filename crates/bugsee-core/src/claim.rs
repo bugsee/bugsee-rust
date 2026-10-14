@@ -118,37 +118,49 @@ pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
 pub(crate) enum Probe {
     Held,
     Free,
+    /// There is no lock file (any longer). Not the same as [`Probe::Free`]: a
+    /// caller that saw the file exist and finds it gone must not conclude that its
+    /// holder died, since a session without kernel locks unlinks its lock file.
+    Vanished,
     /// The filesystem cannot say (it rejects locks): use another liveness signal.
     Unknown,
 }
 
-/// Is `path` currently claimed? A missing file is free. A file that cannot be
-/// inspected is reported held: the conservative answer never disturbs a peer.
+/// Is `path` currently claimed? A missing file is [`Probe::Vanished`]. A file that cannot be
+/// inspected is [`Probe::Unknown`], never assumed held: a crashed session's
+/// leftover lock file must not hide the crash on a volume that has become
+/// read-only.
 ///
 /// On unix this asks (`F_GETLK`) without taking the lock, so a probe can never
 /// steal the lock from a creator that has made the file but not yet locked it.
 pub(crate) fn probe(path: &Path) -> Probe {
-    if !path.exists() {
-        return Probe::Free;
-    }
     let key = key_of(path);
     if !registry().insert(&key) {
         return Probe::Held; // held by a thread of this process, or being probed
     }
-    let result = match OpenOptions::new().read(true).write(true).open(path) {
+    // Read-only: a querying lock call needs no write access, and a leftover lock
+    // file on a read-only volume (or with 0444 mode) must still be probeable.
+    #[cfg(test)]
+    BEFORE_PROBE_OPEN.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook();
+        }
+    });
+    let result = match OpenOptions::new().read(true).open(path) {
         Ok(file) => {
             let r = match test_is_locked(&file) {
                 Ok(Peek::Free) => Probe::Free,
                 Ok(Peek::Held) => Probe::Held,
-                Ok(Peek::Unsupported) => Probe::Unknown,
-                Err(_) => Probe::Held,
+                // Cannot tell (no lock support, or the call failed): let the
+                // caller use another liveness signal rather than assume a live
+                // holder and hide a crash forever.
+                Ok(Peek::Unsupported) | Err(_) => Probe::Unknown,
             };
             drop(file); // close before leaving the registry
             r
         }
-        // Vanished since the existence check: nothing holds it.
-        Err(_) if !path.exists() => Probe::Free,
-        Err(_) => Probe::Held,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::Vanished,
+        Err(_) => Probe::Unknown,
     };
     registry().remove(&key);
     result
@@ -247,8 +259,6 @@ fn key_of(path: &Path) -> PathBuf {
 enum Lock {
     Got,
     Contended,
-    /// Only unix can tell "locks unsupported" apart from other errors.
-    #[cfg_attr(not(unix), allow(dead_code))]
     Unsupported,
 }
 
@@ -264,6 +274,17 @@ thread_local! {
     /// Test hook: make this thread's lock calls behave as on a filesystem that
     /// rejects locks.
     pub(crate) static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+type Hook = Box<dyn Fn()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs inside `probe` just before it opens the file, to simulate
+    /// the lock file vanishing between a caller's existence check and the probe.
+    pub(crate) static BEFORE_PROBE_OPEN: std::cell::RefCell<Option<Hook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn test_try_lock(file: &File) -> std::io::Result<Lock> {
@@ -453,6 +474,10 @@ mod os {
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
     const ERROR_LOCK_VIOLATION: i32 = 33;
+    // The filesystem has no byte-range locking (some network shares, FAT shims).
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    const ERROR_CALL_NOT_IMPLEMENTED: i32 = 120;
 
     #[repr(C)]
     struct Overlapped {
@@ -500,6 +525,9 @@ mod os {
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(ERROR_LOCK_VIOLATION) => Ok(Lock::Contended),
+            Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_CALL_NOT_IMPLEMENTED) => {
+                Ok(Lock::Unsupported)
+            }
             _ => Err(err),
         }
     }
@@ -565,7 +593,7 @@ mod tests {
     fn a_missing_lock_file_probes_free_and_is_not_created() {
         let dir = tmp();
         let path = dir.join("nope.lock");
-        assert!(matches!(probe(&path), Probe::Free));
+        assert!(matches!(probe(&path), Probe::Vanished));
         assert!(!path.exists());
     }
 
