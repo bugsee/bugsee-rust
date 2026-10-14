@@ -1961,7 +1961,7 @@ const EAGER_RETRY: Duration = Duration::from_secs(30);
 
 /// Register the backend session now, once: a no-op when a token is already held
 /// (an earlier attempt, or a delivery, got one), so there is exactly one
-/// `POST /v2/sessions` per launch that is online. Never fails the caller: errors
+/// session registration per launch that is online. Never fails the caller: errors
 /// are dropped and the lazy path in [`transport::deliver`] registers later. The
 /// lock is not held across the network call.
 fn register_eagerly(shared: &Shared) {

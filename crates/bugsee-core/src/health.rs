@@ -9,11 +9,10 @@
 //! (issue #12), the SDK half of release health / crash-free sessions.
 //!
 //! **Experimental and unstable; there is no backend contract for it.** The
-//! backend derives crash-free sessions itself: it counts one session per
-//! `POST /v2/sessions` and one crash per crash report received (`appserver`
-//! `shared/statistics`: `sessions`, `issues.crashes`; crash-free =
-//! `(sessions - crashes) / sessions`), and it has no endpoint that accepts a
-//! session's end, status, duration or error count. These records are therefore
+//! backend derives crash-free sessions itself: it counts a session once, when
+//! it is registered, and a crash when a crash report is received (the rate is
+//! sessions minus crashes, over sessions), and it has no way for an SDK to
+//! report a session's end, status, duration or error count. These records are therefore
 //! kept locally and never sent; what release health does send is the session
 //! registration itself, made eagerly at launch (see `runtime`), because a
 //! session the backend never hears of cannot be counted. Off by default.
