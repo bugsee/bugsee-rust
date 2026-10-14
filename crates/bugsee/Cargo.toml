@@ -17,6 +17,11 @@ backtrace = "0.3"
 ureq = { version = "2", optional = true, features = ["json"] }
 sysinfo = { version = "0.33", optional = true, default-features = false, features = ["system", "disk"] }
 
+# Unconditional on unix: the data-directory ownership checks (`options.rs`) call
+# `geteuid`, and the `telemetry` feature's local-UTC-offset / hardware-model probes
+# (`hostinfo.rs`) call libc too. It is already in the tree via `bugsee-core` /
+# `bugsee-native`, so this adds nothing; keeping it non-optional is what lets
+# `--no-default-features` build.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -233,6 +233,10 @@ pub struct HostFacts {
     pub disk_free: Option<u64>,
     /// `platform.locale`, in the `en_US` form the other SDKs report.
     pub locale: Option<String>,
+    /// `platform.utc_offset`, minutes east of UTC when the facts were taken.
+    pub utc_offset: Option<i32>,
+    /// `hardware.model`, the machine's model string (e.g. `"MacBookPro18,3"`).
+    pub hardware_model: Option<String>,
 }
 
 impl Environment {
@@ -260,6 +264,8 @@ impl Environment {
         env.platform.disk_total = facts.disk_total;
         env.platform.disk_free = facts.disk_free;
         env.platform.locale = facts.locale.clone();
+        env.platform.utc_offset = facts.utc_offset;
+        env.hardware.model = facts.hardware_model.clone();
         env
     }
 
@@ -374,6 +380,8 @@ mod tests {
             disk_total: Some(500000),
             disk_free: Some(120000),
             locale: Some("en_US".into()),
+            utc_offset: Some(-300),
+            hardware_model: Some("MacBookPro18,3".into()),
         };
         let v = serde_json::to_value(Environment::detect_with(
             "1.0.0",
@@ -389,6 +397,10 @@ mod tests {
         assert_eq!(v["platform"]["disk_total"], 500000);
         assert_eq!(v["platform"]["disk_free"], 120000);
         assert_eq!(v["platform"]["locale"], "en_US");
+        // Negative: west of UTC. The sign convention is the contract's ("minutes
+        // east"), so pin it here rather than only in the host crate.
+        assert_eq!(v["platform"]["utc_offset"], -300);
+        assert_eq!(v["hardware"]["model"], "MacBookPro18,3");
     }
 
     #[test]
@@ -407,12 +419,14 @@ mod tests {
             "disk_total",
             "disk_free",
             "locale",
+            "utc_offset",
         ] {
             assert!(
                 !platform.contains_key(key),
                 "{key} should be omitted, not null"
             );
         }
+        assert!(!v["hardware"].as_object().unwrap().contains_key("model"));
     }
 
     #[test]
