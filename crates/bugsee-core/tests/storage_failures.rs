@@ -432,3 +432,270 @@ fn a_failed_put_retries_at_the_put_and_does_not_mint_a_duplicate_issue() {
         "the retry must resume at the PUT, not create the issue again"
     );
 }
+
+#[cfg(unix)]
+/// Lay down what a previous run left behind: a queued report nobody delivered and
+/// a session that died (marker left, owner gone).
+fn seed_leftovers(dir: &Path) {
+    use bugsee_core::capture::record;
+    use bugsee_core::model::report::TimeWindow;
+    use bugsee_core::reporting::assemble_docs;
+
+    let env = bugsee_core::model::environment::Environment::detect_with(
+        "t",
+        &Default::default(),
+        &Default::default(),
+    );
+    let window = TimeWindow { start: 0, end: 1 };
+    let queued = assemble_docs(
+        Vec::new(),
+        window,
+        &manual_upload_meta(),
+        &env,
+        None,
+        &[],
+        "T",
+        1,
+    )
+    .unwrap();
+    bugsee_core::queue::enqueue(dir, &queued).unwrap();
+
+    let part = dir.join("parts").join("1").join("0");
+    std::fs::create_dir_all(&part).unwrap();
+    let mut bytes = Vec::new();
+    let payload = br#"{"timestamp":100,"level":1,"source":2,"message":"earlier crash"}"#;
+    record::frame(100, payload, &mut bytes);
+    std::fs::write(part.join("log.part"), &bytes).unwrap();
+    std::fs::create_dir_all(dir.join("sessions")).unwrap();
+    std::fs::write(dir.join("sessions").join("1.alive"), "0").unwrap();
+    std::fs::write(dir.join("gen"), "1").unwrap();
+}
+
+#[cfg(unix)]
+fn wait_for_bundles(transport: &MockTransport, n: usize) -> usize {
+    let start = std::time::Instant::now();
+    while transport.uploaded_bundles.lock().unwrap().len() < n
+        && start.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Settle: anything delivered again would show up now.
+    std::thread::sleep(Duration::from_millis(400));
+    let got = transport.uploaded_bundles.lock().unwrap().len();
+    got
+}
+
+/// A directory that cannot take new files can still hold reports and crashes a
+/// previous run persisted (that is what a full disk looks like). They must be
+/// delivered, and not again on every drain.
+#[cfg(unix)]
+#[test]
+fn leftovers_in_a_directory_that_cannot_take_new_files_are_still_delivered() {
+    use std::os::unix::fs::PermissionsExt;
+    for memory_only in [false, true] {
+        let dir = TempDir::new();
+        let data = dir.path.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        seed_leftovers(&data);
+        for d in [data.join("queue"), data.join("sessions"), data.clone()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        // root ignores permission bits, which would make this test vacuous.
+        if std::fs::write(data.join("probe"), b"x").is_ok() {
+            eprintln!("skipped: permission bits are not enforced for this user");
+            return;
+        }
+
+        let transport = Arc::new(MockTransport::default());
+        let mut config = RecorderConfig::new(&data, "T");
+        if memory_only {
+            // What the facade does once its write probe has failed.
+            config.memory_only = Some("write probe failed".into());
+        }
+        let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+        assert_eq!(recorder.storage_mode(), StorageMode::Memory);
+
+        assert_eq!(
+            wait_for_bundles(&transport, 2),
+            2,
+            "the queued report and the recovered crash, each delivered once \
+             (memory_only={memory_only})"
+        );
+        drop(recorder);
+        restore_permissions(&data);
+        restore_permissions(&data.join("queue"));
+        restore_permissions(&data.join("sessions"));
+    }
+}
+
+#[test]
+fn a_too_similar_verdict_is_remembered_without_a_disk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Refuse(Arc<AtomicUsize>);
+    impl bugsee_core::Transport for Refuse {
+        fn register_session(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            Ok("token".into())
+        }
+        fn create_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(bugsee_core::TransportError::TooManySimilar {
+                signatures: vec!["sig-loop".into()],
+            })
+        }
+        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), bugsee_core::TransportError> {
+            Ok(())
+        }
+    }
+
+    let dir = TempDir::new();
+    let issues = Arc::new(AtomicUsize::new(0));
+    let recorder = Recorder::launch(
+        RecorderConfig::new(blocked_path(&dir.path), "T"),
+        Arc::new(Refuse(issues.clone())),
+    )
+    .expect("launch");
+    for _ in 0..3 {
+        let mut meta = manual_upload_meta();
+        meta.signatures = vec!["sig-loop".into()];
+        recorder.report(meta, None);
+        assert!(recorder.flush(Duration::from_secs(10)));
+    }
+    assert_eq!(
+        issues.load(Ordering::SeqCst),
+        1,
+        "after the first refusal the same fault must not be sent again"
+    );
+}
+
+#[test]
+fn a_clean_shutdown_gives_unsent_memory_reports_a_last_attempt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The first attempt fails, so the report is still unsent when we stop.
+    struct FailOnce {
+        attempts: AtomicUsize,
+        delivered: AtomicUsize,
+    }
+    struct Handle(Arc<FailOnce>);
+    impl bugsee_core::Transport for Handle {
+        fn register_session(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            Ok("token".into())
+        }
+        fn create_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            if self.0.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(bugsee_core::TransportError::Transient("blip".into()))
+            } else {
+                Ok("https://uploads.example/x".into())
+            }
+        }
+        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), bugsee_core::TransportError> {
+            self.0.delivered.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let dir = TempDir::new();
+    let state = Arc::new(FailOnce {
+        attempts: AtomicUsize::new(0),
+        delivered: AtomicUsize::new(0),
+    });
+    let recorder = Recorder::launch(
+        RecorderConfig::new(blocked_path(&dir.path), "T"),
+        Arc::new(Handle(state.clone())),
+    )
+    .expect("launch");
+    recorder.report(manual_upload_meta(), None);
+    // No flush: just drop, as a `LaunchGuard` does.
+    drop(recorder);
+    assert_eq!(state.delivered.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_directory_wiped_and_recreated_mid_run_gets_its_liveness_marker_back() {
+    let dir = TempDir::new();
+    let data = dir.path.join("data");
+    let transport = Arc::new(MockTransport::default());
+    let mut config = RecorderConfig::new(&data, "T");
+    config.rotate_interval = Duration::from_millis(50);
+    let recorder = Recorder::launch(config, transport).expect("launch");
+
+    std::fs::remove_dir_all(&data).unwrap();
+    // The rotation tick recreates the tree (`create_dir_all`) but the marker
+    // only comes back if the SDK rewrites it.
+    let start = std::time::Instant::now();
+    let alive = || {
+        std::fs::read_dir(data.join("sessions"))
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".alive"))
+            })
+            .unwrap_or(false)
+    };
+    while !alive() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(alive(), "a crash after the wipe must still be recoverable");
+    assert!(recorder.is_degraded(), "the lost window is a degradation");
+}
+
+/// A later default can win while an earlier, full one still holds leftovers.
+#[cfg(unix)]
+#[test]
+fn extra_directories_are_recovered_alongside_a_working_data_dir() {
+    let dir = TempDir::new();
+    let data = dir.path.join("data");
+    let full = dir.path.join("full-default");
+    std::fs::create_dir_all(&full).unwrap();
+    seed_leftovers(&full);
+
+    let transport = Arc::new(MockTransport::default());
+    let mut config = RecorderConfig::new(&data, "T");
+    config.extra_data_dirs = vec![full.clone()];
+    let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+    assert_eq!(recorder.storage_mode(), StorageMode::Disk);
+    assert_eq!(wait_for_bundles(&transport, 2), 2);
+    assert!(bugsee_core::queue::list_pending(&full).is_empty());
+}
+
+#[test]
+fn signatures_blacklisted_on_disk_are_honoured_in_memory_mode() {
+    let dir = TempDir::new();
+    let data = dir.path.join("data");
+    std::fs::create_dir_all(data.join("queue")).unwrap();
+    std::fs::write(data.join("queue").join(".blacklist"), "sig-known\n").unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    let mut config = RecorderConfig::new(&data, "T");
+    config.memory_only = Some("write probe failed".into());
+    let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+
+    let mut known = manual_upload_meta();
+    known.signatures = vec!["sig-known".into()];
+    recorder.report(known, None);
+    recorder.report(manual_upload_meta(), None);
+    assert!(recorder.flush(Duration::from_secs(10)));
+    assert_eq!(
+        transport.created_requests.lock().unwrap().len(),
+        1,
+        "only the report without the blacklisted signature is sent"
+    );
+}

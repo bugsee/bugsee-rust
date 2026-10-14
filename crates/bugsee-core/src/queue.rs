@@ -46,6 +46,12 @@ pub fn try_claim(report: &QueuedReport) -> Option<crate::claim::Claim> {
     crate::claim::try_claim(&report.claim_path())
 }
 
+/// [`try_claim`] that still lets delivery proceed when the queue directory cannot
+/// accept a claim file (full or read-only); see [`crate::claim::try_claim_lenient`].
+pub fn try_claim_lenient(report: &QueuedReport) -> Option<Option<crate::claim::Claim>> {
+    crate::claim::try_claim_lenient(&report.claim_path())
+}
+
 fn sibling(bundle: &Path, ext: &str) -> PathBuf {
     let mut s = bundle.as_os_str().to_os_string();
     s.push(".");
@@ -178,6 +184,11 @@ pub fn signatures_of(report: &AssembledReport) -> Vec<String> {
 
 fn blacklist_path(data_dir: &Path) -> PathBuf {
     queue_dir(data_dir).join(".blacklist")
+}
+
+/// The locally blacklisted signatures in `data_dir` (empty if none or unreadable).
+pub fn blacklisted_signatures(data_dir: &Path) -> BTreeSet<String> {
+    load_blacklist(data_dir)
 }
 
 fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
