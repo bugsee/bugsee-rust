@@ -27,6 +27,8 @@
 
 mod api;
 mod frames;
+#[cfg(feature = "telemetry")]
+mod hostinfo;
 mod options;
 mod perf;
 mod report;

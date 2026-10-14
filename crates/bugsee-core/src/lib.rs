@@ -19,10 +19,14 @@
 pub mod bundle;
 pub mod capture;
 pub mod claim;
+pub mod crash_flush;
 pub mod errors;
 pub mod fork;
+#[doc(hidden)]
+pub mod health;
 pub mod model;
 pub mod panic_info;
+pub(crate) mod process;
 pub mod queue;
 pub mod recovery;
 pub mod reporting;

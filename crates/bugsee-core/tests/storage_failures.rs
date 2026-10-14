@@ -700,6 +700,100 @@ fn signatures_blacklisted_on_disk_are_honoured_in_memory_mode() {
     );
 }
 
+/// A terminal verdict on a queued report in a directory we cannot delete from
+/// must not be re-sent on every drain (a flush retries every 20 ms, the uploader
+/// polls every 5 s).
+#[cfg(unix)]
+#[test]
+fn terminal_verdicts_on_an_undeletable_queue_are_not_resent() {
+    use bugsee_core::model::report::TimeWindow;
+    use bugsee_core::reporting::assemble_docs;
+    use bugsee_core::TransportError;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum Verdict {
+        TooManySimilar,
+        Duplicate,
+        Permanent,
+    }
+    struct Terminal(Verdict, Arc<AtomicUsize>);
+    impl bugsee_core::Transport for Terminal {
+        fn register_session(&self, _: &str, _: &[u8]) -> Result<String, TransportError> {
+            Ok("token".into())
+        }
+        fn create_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &[u8],
+        ) -> Result<String, TransportError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Err(match self.0 {
+                Verdict::TooManySimilar => TransportError::TooManySimilar {
+                    signatures: vec!["sig".into()],
+                },
+                Verdict::Duplicate => TransportError::DuplicateDropped,
+                Verdict::Permanent => TransportError::Permanent("rejected".into()),
+            })
+        }
+        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    for verdict in [
+        Verdict::TooManySimilar,
+        Verdict::Duplicate,
+        Verdict::Permanent,
+    ] {
+        let dir = TempDir::new();
+        let data = dir.path.join("data");
+        let env = bugsee_core::model::environment::Environment::detect_with(
+            "t",
+            &Default::default(),
+            &Default::default(),
+        );
+        let queued = assemble_docs(
+            Vec::new(),
+            TimeWindow { start: 0, end: 1 },
+            &manual_upload_meta(),
+            &env,
+            None,
+            &[],
+            "T",
+            1,
+        )
+        .unwrap();
+        bugsee_core::queue::enqueue(&data, &queued).unwrap();
+        for d in [data.join("queue"), data.clone()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        if std::fs::write(data.join("probe"), b"x").is_ok() {
+            eprintln!("skipped: permission bits are not enforced for this user");
+            return;
+        }
+
+        let issues = Arc::new(AtomicUsize::new(0));
+        let mut config = RecorderConfig::new(&data, "T");
+        config.memory_only = Some("write probe failed".into());
+        let recorder =
+            Recorder::launch(config, Arc::new(Terminal(verdict, issues.clone()))).expect("launch");
+        // A flush spins its drain loop until the deadline, the case that stormed.
+        let _ = recorder.flush(Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            issues.load(Ordering::SeqCst),
+            1,
+            "the verdict is final; the undeletable bundle must not be re-sent"
+        );
+        drop(recorder);
+        restore_permissions(&data);
+        restore_permissions(&data.join("queue"));
+    }
+}
+
 /// A stop that lands while a flush is in its memory pass must not be followed by
 /// a (possibly hanging) disk upload: the uploader has to reach its stop arm and
 /// give the in-memory backlog its last attempt.
