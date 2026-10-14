@@ -1838,11 +1838,20 @@ fn drain_until_empty(
             Some(start + deadline),
             true,
         );
+        // A stop that arrived during the memory pass must not be followed by a
+        // blocking disk upload: the uploader has to reach `UploadMsg::Stop` and
+        // run the stop-time memory drain, which a hung HTTP call would starve.
+        if shared.stopping.load(Ordering::SeqCst) {
+            return false;
+        }
         'dirs: for &data_dir in dirs {
             for report in pending_reports(shared, data_dir) {
                 let Some(_claim) = queue::try_claim_lenient(&report) else {
                     continue; // a peer is delivering it; the loop below waits it out
                 };
+                if shared.stopping.load(Ordering::SeqCst) {
+                    return false; // checked after the claim so no upload starts
+                }
                 let Ok((zip, request_json, retry, _next)) = queue::load(&report) else {
                     continue;
                 };

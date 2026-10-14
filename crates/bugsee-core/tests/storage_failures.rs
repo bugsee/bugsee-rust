@@ -699,3 +699,144 @@ fn signatures_blacklisted_on_disk_are_honoured_in_memory_mode() {
         "only the report without the blacklisted signature is sent"
     );
 }
+
+/// A stop that lands while a flush is in its memory pass must not be followed by
+/// a (possibly hanging) disk upload: the uploader has to reach its stop arm and
+/// give the in-memory backlog its last attempt.
+#[test]
+fn a_stop_during_a_flush_skips_disk_uploads_so_memory_gets_its_last_attempt() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+
+    struct T {
+        mem_calls: AtomicUsize,
+        mem_in_flight: AtomicBool,
+        disk_calls: AtomicUsize,
+        delivered: AtomicUsize,
+        gate: (Mutex<bool>, Condvar),
+    }
+    struct Handle(Arc<T>);
+    impl bugsee_core::Transport for Handle {
+        fn register_session(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            Ok("token".into())
+        }
+        fn create_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            request: &[u8],
+        ) -> Result<String, bugsee_core::TransportError> {
+            let transient = || bugsee_core::TransportError::Transient("offline".into());
+            if String::from_utf8_lossy(request).contains("disk-report") {
+                self.0.disk_calls.fetch_add(1, Ordering::SeqCst);
+                return Err(transient());
+            }
+            match self.0.mem_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(transient()),
+                1 => {
+                    // The flush's memory pass: held until the stop has begun.
+                    self.0.mem_in_flight.store(true, Ordering::SeqCst);
+                    let mut open = self.0.gate.0.lock().unwrap();
+                    while !*open {
+                        open = self.0.gate.1.wait(open).unwrap();
+                    }
+                    Err(transient())
+                }
+                _ => Ok("https://uploads.example/x".into()),
+            }
+        }
+        fn upload_bundle(&self, _: &str, _: &[u8]) -> Result<(), bugsee_core::TransportError> {
+            self.0.delivered.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !f() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let dir = TempDir::new();
+    let data = dir.path.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // A queued disk report that is backing off, so only a forced flush tries it.
+    {
+        use bugsee_core::model::report::TimeWindow;
+        let env = bugsee_core::model::environment::Environment::detect_with(
+            "t",
+            &Default::default(),
+            &Default::default(),
+        );
+        let mut meta = manual_upload_meta();
+        meta.summary = Some("disk-report".into());
+        let docs = bugsee_core::reporting::assemble_docs(
+            Vec::new(),
+            TimeWindow { start: 0, end: 1 },
+            &meta,
+            &env,
+            None,
+            &[],
+            "T",
+            1,
+        )
+        .unwrap();
+        bugsee_core::queue::enqueue(&data, &docs).unwrap();
+        for r in bugsee_core::queue::list_pending(&data) {
+            bugsee_core::queue::set_meta(&r, 0, epoch_ms() + 3_600_000);
+        }
+    }
+
+    let state = Arc::new(T {
+        mem_calls: AtomicUsize::new(0),
+        mem_in_flight: AtomicBool::new(false),
+        disk_calls: AtomicUsize::new(0),
+        delivered: AtomicUsize::new(0),
+        gate: (Mutex::new(false), Condvar::new()),
+    });
+    let mut config = RecorderConfig::new(&data, "T");
+    config.memory_only = Some("test".into());
+    let recorder = Recorder::launch(config, Arc::new(Handle(state.clone()))).expect("launch");
+    let handle = recorder.handle();
+
+    let mut meta = manual_upload_meta();
+    meta.summary = Some("mem-report".into());
+    recorder.report(meta, None);
+    wait_until("first memory attempt", || {
+        state.mem_calls.load(Ordering::SeqCst) >= 1
+    });
+
+    // Let the startup/scheduled passes settle; only what follows is the flush's.
+    std::thread::sleep(Duration::from_millis(500));
+    let disk_before = state.disk_calls.load(Ordering::SeqCst);
+    let flusher = std::thread::spawn(move || handle.flush(Duration::from_secs(10)));
+    wait_until("flush in its memory pass", || {
+        state.mem_in_flight.load(Ordering::SeqCst)
+    });
+    let stopper = std::thread::spawn(move || drop(recorder));
+    // `stopping` is set well within this.
+    std::thread::sleep(Duration::from_millis(300));
+    *state.gate.0.lock().unwrap() = true;
+    state.gate.1.notify_all();
+    stopper.join().unwrap();
+    assert!(!flusher.join().unwrap());
+
+    assert_eq!(
+        state.disk_calls.load(Ordering::SeqCst),
+        disk_before,
+        "a disk upload was started after the stop"
+    );
+    assert_eq!(
+        state.delivered.load(Ordering::SeqCst),
+        1,
+        "the stop-time drain must give the memory backlog its last attempt"
+    );
+}
