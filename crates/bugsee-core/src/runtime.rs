@@ -1024,6 +1024,7 @@ fn spawn_pipeline(
     let worker_shared = Arc::clone(shared);
     let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_drain_dir = drain_dir.map(Path::to_path_buf);
+    let worker_recover_dir = worker_drain_dir.clone();
     let marker = data_dir.map(|d| Session::marker_path(d, generation));
     // Recovery can run long (a host `before_send`, many sessions); it keeps this
     // session's heartbeat going meanwhile, as the worker loop is not yet running.
@@ -1089,6 +1090,7 @@ fn spawn_pipeline(
                 sampler,
                 worker_upload_tx,
                 generation,
+                worker_recover_dir,
             );
         })?;
 
@@ -1333,6 +1335,7 @@ fn worker_loop(
     mut sampler: Option<Box<dyn TelemetrySampler>>,
     upload_tx: Sender<UploadMsg>,
     generation: u64,
+    recover_dir: Option<PathBuf>,
 ) {
     // Rotation/eviction/telemetry must run on a wall-clock cadence, NOT only when
     // `recv_timeout` times out. Under sustained capture traffic every `recv`
@@ -1430,10 +1433,12 @@ fn worker_loop(
         }
         // The launch-path pass left a session for us (queue cap) after our one
         // pass had already run, because it outlived the wait: take it now.
-        if shared.launch_done.load(Ordering::SeqCst)
-            && shared.launch_deferred.swap(false, Ordering::SeqCst)
-        {
-            if let Some(dir) = &data_dir {
+        // `recover_dir` is the tree startup recovery used: it exists in memory
+        // mode too, where `data_dir` (the capture tree) does not.
+        if let Some(dir) = &recover_dir {
+            if shared.launch_done.load(Ordering::SeqCst)
+                && shared.launch_deferred.swap(false, Ordering::SeqCst)
+            {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_recovery(&shared, dir, generation, marker.as_deref(), true);
                 }));
