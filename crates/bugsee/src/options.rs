@@ -39,6 +39,7 @@ pub struct LaunchOptions {
     pub(crate) before_send: Option<BeforeSend>,
     pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
     pub(crate) sample_rate: f64,
+    pub(crate) launch_recovery_budget: Duration,
 }
 
 impl LaunchOptions {
@@ -63,6 +64,7 @@ impl LaunchOptions {
             before_send: None,
             before_breadcrumb: None,
             sample_rate: 1.0,
+            launch_recovery_budget: bugsee_core::runtime::DEFAULT_LAUNCH_RECOVERY_BUDGET,
         }
     }
 
@@ -209,6 +211,23 @@ impl LaunchOptions {
     /// (`"com.example.app"`) to match how the mobile SDKs report it.
     pub fn app_package_id(mut self, package_id: impl Into<String>) -> Self {
         self.app_package_id = Some(package_id.into());
+        self
+    }
+
+    /// Time `launch` may spend queueing the previous run's crash reports before
+    /// it returns. Default 500 ms.
+    ///
+    /// A host that crashes again right after launch (a crash loop under a
+    /// supervisor) still gets the previous crash reported, because it is made
+    /// durable on this path; only the upload is asynchronous. The newest crashed
+    /// session is always queued, and at most 8 are queued here, newest first;
+    /// the budget stops further ones from starting once it has elapsed, and
+    /// whatever is left is recovered on the background worker. It is checked
+    /// between sessions, so one very large session can exceed it (the cost of a
+    /// session grows with its capture window, `max_window`/`max_bytes`). `Duration::ZERO` skips the launch-path
+    /// pass and recovers everything in the background.
+    pub fn launch_recovery_budget(mut self, budget: Duration) -> Self {
+        self.launch_recovery_budget = budget;
         self
     }
 

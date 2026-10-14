@@ -53,6 +53,10 @@ const UPLOAD_RETRY_CAP: u32 = 60;
 /// Maximum next-launch recovery attempts for one pending session before it is
 /// abandoned (guards against a corrupt-parts poison pill re-running every launch).
 const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+/// Default time `launch` may spend queueing the previous run's crashes.
+pub const DEFAULT_LAUNCH_RECOVERY_BUDGET: Duration = Duration::from_millis(500);
+/// Default cap on crashed sessions queued on the launch path.
+pub const DEFAULT_LAUNCH_RECOVERY_SESSIONS: usize = 8;
 /// Default in-flight capture-entry cap (drop-newest beyond this).
 const DEFAULT_MAX_QUEUED: usize = 8192;
 /// Default in-flight *report* cap. Reports are far heavier than capture entries
@@ -179,6 +183,12 @@ pub struct RecorderConfig {
     /// crashed sessions and deliver its queue. For a host layer that moved its
     /// default location and must not strand reports left at the old one.
     pub legacy_data_dir: Option<PathBuf>,
+    /// Time `launch` may spend queueing the previous run's crashes before it
+    /// returns (see [`Recorder::launch`]). Zero skips the launch-path pass: all
+    /// recovery then happens on the worker thread after `launch` returns.
+    pub launch_recovery_budget: Duration,
+    /// Most crashed sessions the launch-path pass recovers.
+    pub launch_recovery_max_sessions: usize,
 }
 
 impl RecorderConfig {
@@ -201,6 +211,8 @@ impl RecorderConfig {
             max_queued_entries: DEFAULT_MAX_QUEUED,
             memory_only: None,
             legacy_data_dir: None,
+            launch_recovery_budget: DEFAULT_LAUNCH_RECOVERY_BUDGET,
+            launch_recovery_max_sessions: DEFAULT_LAUNCH_RECOVERY_SESSIONS,
         }
     }
 }
@@ -338,6 +350,14 @@ struct Pipeline {
 impl Recorder {
     /// Start the workers and begin capturing. Recovers any prior session that
     /// ended abnormally, queueing it for delivery.
+    ///
+    /// The newest crashed sessions (at most
+    /// [`RecorderConfig::launch_recovery_max_sessions`], newest first, within
+    /// [`RecorderConfig::launch_recovery_budget`]) are turned into durable queue
+    /// entries before this returns, so a host that crashes again immediately has
+    /// already got the previous crash's report on disk. Upload is asynchronous and
+    /// resumes from the queue. Anything beyond the caps is recovered by the worker
+    /// thread right after.
     pub fn launch(config: RecorderConfig, transport: Arc<dyn Transport>) -> std::io::Result<Self> {
         let env = Environment::detect_with(
             &config.sdk_version,
@@ -403,6 +423,26 @@ impl Recorder {
         // recovering them only reads and deletes. So an existing directory is
         // still drained and recovered from in memory mode.
         let drain_dir = (session.is_some() || data_dir.is_dir()).then_some(data_dir.as_path());
+        // Queue the previous run's crashes before returning (issue #10): a host
+        // that crashes again right after launch must not outrun their report.
+        // This runs after this session's marker exists and before the native
+        // handler is installed; a session's evidence stays on disk until its
+        // report is queued, so a crash inside this pass just retries next launch
+        // (bounded by `MAX_RECOVERY_ATTEMPTS`).
+        let mut attempted = BTreeSet::new();
+        if let (Some(dir), false) = (drain_dir, config.launch_recovery_budget.is_zero()) {
+            let generation = session.as_ref().map_or(u64::MAX, Session::generation);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_launch_recovery(
+                    &shared,
+                    dir,
+                    generation,
+                    config.launch_recovery_budget,
+                    config.launch_recovery_max_sessions,
+                    &mut attempted,
+                )
+            }));
+        }
         let pipeline = spawn_pipeline(
             &shared,
             store.is_some().then_some(data_dir.as_path()),
@@ -415,6 +455,7 @@ impl Recorder {
             config.sampler,
             true,
             config.legacy_data_dir,
+            attempted,
         )?;
 
         Ok(Recorder {
@@ -508,6 +549,7 @@ impl Recorder {
             sampler,
             false,
             None,
+            BTreeSet::new(),
         )?;
 
         // The parent's session is still the parent's: leave its marker alone.
@@ -861,6 +903,7 @@ fn spawn_pipeline(
     sampler: Option<Box<dyn TelemetrySampler>>,
     fresh_launch: bool,
     legacy_data_dir: Option<PathBuf>,
+    launch_attempted: BTreeSet<u64>,
 ) -> std::io::Result<Pipeline> {
     // Uploader thread: drains the durable queue with retry.
     let (upload_tx, upload_rx) = channel();
@@ -913,13 +956,13 @@ fn spawn_pipeline(
                 // it must, or that crash waits for the master to restart. Claims
                 // keep siblings from recovering the same session twice.
                 if let Some(dir) = &worker_drain_dir {
-                    run_recovery(&worker_shared, dir, generation);
+                    run_recovery(&worker_shared, dir, generation, &launch_attempted);
                 }
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 if let Some(dir) = &legacy_data_dir {
                     queue::gc_orphans(dir);
-                    run_recovery(&worker_shared, dir, u64::MAX);
+                    run_recovery(&worker_shared, dir, u64::MAX, &BTreeSet::new());
                 }
             }));
             legacy_ready.store(true, Ordering::SeqCst);
@@ -948,29 +991,79 @@ fn spawn_pipeline(
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
 /// The crashed session's state is discarded ONLY after the report is durably
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
-fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
+///
+/// `skip` holds generations the launch-path pass already attempted: one it could
+/// only hold in memory still has its evidence on disk, and doing it again would
+/// report it twice.
+fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64, skip: &BTreeSet<u64>) {
     for pending in recovery::find_pending(data_dir, current_generation) {
-        // Several processes share this directory (a prefork master and its
-        // workers, above all): exactly one recovers a given session.
-        let Some(_claim) = recovery::claim_pending(data_dir, &pending) else {
-            continue;
-        };
-        // Count the attempt *before* processing: a corrupt session that panics
-        // the build/assemble path is a poison pill that would otherwise re-run —
-        // and abort the whole loop — on every launch. After the cap, abandon it.
-        let attempts = recovery::bump_attempts(data_dir, &pending);
-        if attempts > MAX_RECOVERY_ATTEMPTS {
-            recovery::discard(data_dir, &pending);
-            continue;
+        if !skip.contains(&pending.generation) {
+            recover_claimed(shared, data_dir, &pending);
         }
-        // Isolate each pending so one corrupt session cannot block recovering the
-        // rest (a panic here would otherwise unwind the entire loop).
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recover_one(shared, data_dir, &pending);
-        }));
     }
     // Reap parts/attempts left by cleanly-exited or already-recovered generations.
     recovery::gc_orphans(data_dir, current_generation);
+}
+
+/// Claim one pending session and recover it. A session another process holds is
+/// skipped.
+fn recover_claimed(shared: &Shared, data_dir: &Path, pending: &recovery::PendingSession) {
+    // Several processes share this directory (a prefork master and its
+    // workers, above all): exactly one recovers a given session.
+    let Some(_claim) = recovery::claim_pending(data_dir, pending) else {
+        return;
+    };
+    // Count the attempt *before* processing: a corrupt session that panics
+    // the build/assemble path is a poison pill that would otherwise re-run —
+    // and abort the whole loop — on every launch. After the cap, abandon it.
+    let attempts = recovery::bump_attempts(data_dir, pending);
+    if attempts > MAX_RECOVERY_ATTEMPTS {
+        recovery::discard(data_dir, pending);
+        return;
+    }
+    // Isolate each pending so one corrupt session cannot block recovering the
+    // rest (a panic here would otherwise unwind the entire loop).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        recover_one(shared, data_dir, pending);
+    }));
+}
+
+/// Directory entries the launch-path pass reads before giving up on finding more.
+const LAUNCH_SCAN_CAP: usize = 4096;
+
+/// The launch-path recovery pass (issue #10): turn the newest crashed sessions
+/// into durable queue entries BEFORE `launch` returns, so a host that dies again
+/// within milliseconds (a crash loop under a supervisor) cannot outrun the report
+/// of the crash before it. Only the queueing is synchronous; upload stays on the
+/// uploader thread.
+///
+/// Bounded three ways: at most `max_sessions` are recovered, the scan reads at
+/// most [`LAUNCH_SCAN_CAP`] directory entries, and no new session is started once
+/// `budget` has elapsed. The budget is checked between sessions, so one session
+/// can overrun it; the newest session is always attempted whatever the budget,
+/// since it is the one a crash loop is about to make unreachable. Newest first:
+/// the latest crash is the one most likely to be on the build now running, and
+/// what is left is not lost, since the worker's unbounded pass recovers the rest.
+///
+/// Fills `attempted` with the generations it tried, for the worker's pass to skip.
+fn run_launch_recovery(
+    shared: &Shared,
+    data_dir: &Path,
+    current_generation: u64,
+    budget: Duration,
+    max_sessions: usize,
+    attempted: &mut BTreeSet<u64>,
+) {
+    let started = Instant::now();
+    for pending in
+        recovery::find_pending_bounded(data_dir, current_generation, LAUNCH_SCAN_CAP, max_sessions)
+    {
+        if !attempted.is_empty() && started.elapsed() >= budget {
+            break;
+        }
+        attempted.insert(pending.generation);
+        recover_claimed(shared, data_dir, &pending);
+    }
 }
 
 /// Build, filter, assemble and enqueue one pending session's crash report,

@@ -61,6 +61,22 @@ pub struct RecoveredReport {
 /// because it launched earlier) has a live marker that is *not* a crash. Its
 /// marker is left in place for a future launch to recover once the peer is gone.
 pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSession> {
+    find_pending_bounded(data_dir, current_generation, usize::MAX, usize::MAX)
+}
+
+/// Like [`find_pending`], for the launch path: newest generation first, and
+/// bounded. At most `scan_cap` directory entries are read and at most `limit`
+/// sessions returned, so a directory a crash loop has filled does not make launch
+/// scan, probe and stat without end. Names are sorted before any file is touched,
+/// so only the newest candidates cost a probe. A scan cut off by `scan_cap` may
+/// miss the newest session; the worker's unbounded pass picks up whatever the
+/// bounded one left.
+pub fn find_pending_bounded(
+    data_dir: &Path,
+    current_generation: u64,
+    scan_cap: usize,
+    limit: usize,
+) -> Vec<PendingSession> {
     let mut pending = Vec::new();
     let sessions = data_dir.join("sessions");
     let read = match std::fs::read_dir(&sessions) {
@@ -68,8 +84,8 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         Err(_) => return pending,
     };
     let self_pid = std::process::id();
-    for entry in read.flatten() {
-        let marker = entry.path();
+    let mut candidates: Vec<u64> = Vec::new();
+    for entry in read.flatten().take(scan_cap) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(gen_str) = name.strip_suffix(".alive") else {
             continue;
@@ -77,9 +93,16 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         let Ok(generation) = gen_str.parse::<u64>() else {
             continue;
         };
-        if generation >= current_generation {
-            continue;
+        if generation < current_generation {
+            candidates.push(generation);
         }
+    }
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    for generation in candidates {
+        if pending.len() >= limit {
+            break;
+        }
+        let marker = sessions.join(format!("{generation}.alive"));
         // A session whose `<gen>.lock` exists is arbitrated by that OS lock: held
         // means a live process (in any pid namespace), free means it died. The
         // marker's pid is not consulted, since it is only meaningful inside the
@@ -777,6 +800,27 @@ mod tests {
             .iter()
             .map(|p| p.generation)
             .collect()
+    }
+
+    #[test]
+    fn the_bounded_scan_is_newest_first_and_capped() {
+        let dir = tmp();
+        for g in [3u64, 9, 1, 7, 5] {
+            marker(&dir, g, "0");
+        }
+        let got = |current, scan, limit| -> Vec<u64> {
+            find_pending_bounded(&dir, current, scan, limit)
+                .iter()
+                .map(|p| p.generation)
+                .collect()
+        };
+        assert_eq!(got(u64::MAX, 100, 100), vec![9, 7, 5, 3, 1]);
+        assert_eq!(got(u64::MAX, 100, 2), vec![9, 7]);
+        // Only older generations than the caller's own are candidates.
+        assert_eq!(got(7, 100, 100), vec![5, 3, 1]);
+        // A scan cut short reads fewer entries (which ones is directory order).
+        assert!(got(u64::MAX, 2, 100).len() <= 2);
+        assert!(got(u64::MAX, 0, 100).is_empty());
     }
 
     #[test]
