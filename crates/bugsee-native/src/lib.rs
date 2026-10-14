@@ -7,8 +7,7 @@
 
 //! Native fatal-crash capture.
 //!
-//! Installs a process crash handler (via the `crash-handler` crate) that, on a
-//! fatal signal/exception, writes a tiny **async-signal-safe** crash-info marker
+//! Installs a process crash handler that, on a fatal signal/exception, writes a tiny **async-signal-safe** crash-info marker
 //! next to the current session's capture parts, then lets default handling
 //! terminate the process. The marker is picked up on the next launch by
 //! `bugsee-core`'s recovery path, which builds the thin native `crash.json`.
@@ -46,9 +45,9 @@
 //!
 //! # Supported platforms
 //!
-//! Linux, Android, macOS and Windows. The handler is built on the
-//! `crash-handler` crate, which has no iOS (or tvOS/watchOS) backend, so on
-//! every other target this crate compiles to a stub whose [`install`] returns
+//! Linux, Android, macOS and Windows. Unix targets use the SDK's own signal
+//! handler; only Windows is built on the `crash-handler` crate. Neither has an
+//! iOS (or tvOS/watchOS) backend, so on every other target this crate compiles to a stub whose [`install`] returns
 //! an `Unsupported` error — the facade treats that as "no native capture"
 //! rather than failing the build, which is what lets the iOS C ABI link at all.
 //! Native crash capture for iOS needs its own backend; it is not provided here.

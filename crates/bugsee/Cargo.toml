@@ -26,7 +26,7 @@ default = ["net", "panic", "native", "telemetry"]
 net = ["dep:ureq"]
 # Global Rust panic observer + catch_unwind boundary guards.
 panic = ["dep:bugsee-panic"]
-# Native fatal-crash handler (signal/Mach exception) + next-launch recovery.
+# Native fatal-crash handler (POSIX signal / Windows SEH) + next-launch recovery.
 native = ["dep:bugsee-native"]
 # System/process telemetry sampling (traces.system) via sysinfo.
 telemetry = ["dep:sysinfo"]

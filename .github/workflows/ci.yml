@@ -71,6 +71,49 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: scripts/ffi-header.sh check
 
+  # What ships to Mac App Store / sandboxed apps is the C ABI library, so check
+  # THAT binary's imports rather than inferring from tests: no `dlsym` (the way
+  # `crash-handler` reached a private libproc symbol) and no libproc import
+  # beyond the public `libproc.h` functions `sysinfo` uses.
+  macos-no-private-api:
+    name: macOS binary has no private API imports
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-no-private-api
+
+      - name: Build C ABI (release)
+        run: cargo build --release --locked -p bugsee-ffi
+
+      # Fails closed: `-j` prints bare names (the default format differs between
+      # Apple's nm and llvm-nm), and the public imports we KNOW are present must be
+      # found, so a parser that matches nothing cannot pass.
+      - name: Check undefined symbols
+        run: |
+          LIB=target/release/libbugsee_ffi.dylib
+          nm -u -j "$LIB" > imports.txt
+          cat imports.txt
+          for want in _proc_pidinfo _proc_pidpath; do
+            grep -qx "$want" imports.txt || { echo "::error::expected import $want not found; symbol listing unparsable"; exit 1; }
+          done
+          if grep -qx '_dlsym' imports.txt; then
+            echo "::error::$LIB imports _dlsym"; exit 1
+          fi
+          BAD=$(grep -E '^_proc_' imports.txt | grep -vxE '_proc_(listallpids|pid_rusage|pidinfo|pidpath)' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::non-allowlisted libproc imports:"; echo "$BAD"; exit 1
+          fi
+          if strings "$LIB" | grep -q 'proc_get_wakemon_params'; then
+            echo "::error::$LIB references proc_get_wakemon_params"; exit 1
+          fi
+
   msrv:
     name: build (MSRV 1.88)
     runs-on: ubuntu-latest
