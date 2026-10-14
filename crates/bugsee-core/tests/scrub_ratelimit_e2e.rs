@@ -40,28 +40,41 @@ impl Drop for TempDir {
     }
 }
 
-// Split so the literal never appears whole in source (push protection / secret scanners).
-const STRIPE_LIKE: &str = concat!("sk_", "live_", "4eC39HqLyjWDarjtT1zdp7dc");
+// Secret-shaped values are assembled from halves so no whole literal sits in the
+// source (GitHub push protection rejects those).
+const GH: &str = concat!("gh", "p_abcdefghijklmnopqrstuvwxyz0123456789");
+const SK: &str = concat!("sk_", "live_4eC39HqLyjWDarjtT1zdp7dc");
+const AWS: &str = concat!("AKI", "AIOSFODNN7EXAMPLE");
+const JWT: &str = concat!(
+    "ey",
+    "JhbGciOiJIUzI1NiJ9.",
+    "ey",
+    "JzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+);
 
-const SECRETS: &[&str] = &[
-    "alice.smith@corp-example.com",
-    STRIPE_LIKE,
-    "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-    "AKIAIOSFODNN7EXAMPLE",
-    "4111 1111 1111 1111",
-    "hunter2-super-pw",
-    "/Users/jdoe/",
-    "/home/jdoe/",
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
-];
+fn secrets() -> Vec<String> {
+    [
+        "alice.smith@corp-example.com",
+        SK,
+        GH,
+        AWS,
+        "4111 1111 1111 1111",
+        "hunter2-super-pw",
+        "/Users/jdoe/",
+        "/home/jdoe/",
+        JWT,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 
 /// One string packed with every kind of secret.
 fn dirty() -> String {
     format!(
-        "mail alice.smith@corp-example.com key {STRIPE_LIKE} \
-     gh ghp_abcdefghijklmnopqrstuvwxyz0123456789 aws AKIAIOSFODNN7EXAMPLE \
-     card 4111 1111 1111 1111 password=hunter2-super-pw at /Users/jdoe/proj/a.rs \
-     and /home/jdoe/b.rs jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        "mail alice.smith@corp-example.com key {SK} gh {GH} aws {AWS} \
+         card 4111 1111 1111 1111 password=hunter2-super-pw at /Users/jdoe/proj/a.rs \
+         and /home/jdoe/b.rs jwt {JWT}"
     )
 }
 
@@ -170,9 +183,9 @@ fn seeded_secrets_in_every_report_section_do_not_survive_by_default() {
             if name == ".apptoken" {
                 continue;
             }
-            for secret in SECRETS {
+            for secret in secrets() {
                 assert!(
-                    !body.contains(secret),
+                    !body.contains(&secret),
                     "{secret:?} survived in {name}: {body}"
                 );
             }
@@ -322,15 +335,15 @@ fn in_memory_mode_reports_are_scrubbed_too() {
             if name == ".apptoken" {
                 continue;
             }
-            for secret in SECRETS {
-                assert!(!body.contains(secret), "{secret:?} survived in {name}");
+            for secret in secrets() {
+                assert!(!body.contains(&secret), "{secret:?} survived in {name}");
             }
         }
     }
     for req in transport.created_requests.lock().unwrap().iter() {
         let body = String::from_utf8_lossy(req);
-        for secret in SECRETS {
-            assert!(!body.contains(secret), "{secret:?} in request.json");
+        for secret in secrets() {
+            assert!(!body.contains(&secret), "{secret:?} in request.json");
         }
     }
 }

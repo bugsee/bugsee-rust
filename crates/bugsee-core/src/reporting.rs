@@ -194,7 +194,9 @@ pub fn assemble_docs(
     }
 
     if let Some(mut bytes) = crash_json {
-        if let Some(clean) = scrubber.and_then(|s| s.scrub_json_bytes(&bytes)) {
+        if let Some(clean) =
+            scrubber.and_then(|s| s.scrub_json_bytes_keeping(&bytes, &["signatures"]))
+        {
             bytes = clean;
         }
         files.push(FileDescriptor::capture("crash.json", "crash"));
@@ -239,14 +241,15 @@ pub fn assemble_docs(
     };
     let mut request_json = serde_json::to_vec(&request)?;
     if let Some(s) = scrubber {
-        // The environment (paths, host names) is scrubbed; the reporter's own
-        // `email` is an identity they supplied on purpose and is kept.
+        // `request` was built from the already-scrubbed metadata (summary,
+        // description, labels) and the reporter's own `email` is an identity they
+        // supplied on purpose, so only the environment (paths, host names) is
+        // scrubbed here.
         if let Ok(mut v) = serde_json::to_value(&request) {
-            let email = v.as_object_mut().and_then(|m| m.remove("email"));
-            if s.scrub_value(&mut v) {
-                if let (Some(m), Some(e)) = (v.as_object_mut(), email) {
-                    m.insert("email".into(), e);
-                }
+            let changed = v
+                .get_mut("environment")
+                .is_some_and(|env| s.scrub_value(env));
+            if changed {
                 request_json = serde_json::to_vec(&v)?;
             }
         }

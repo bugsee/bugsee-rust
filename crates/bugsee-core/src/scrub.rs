@@ -100,7 +100,8 @@ pub struct ScrubConfig {
     pub paths: bool,
     /// Matched values left alone. A match is kept when its text equals an entry,
     /// or when the entry starts with `@` and the (email) match ends with it, so
-    /// `"@example.com"` keeps every example.com address.
+    /// `"@example.com"` keeps every example.com address. `deny` beats `allow`:
+    /// a literal in `deny` is redacted even where an `allow` entry would keep it.
     pub allow: Vec<String>,
     /// Literal substrings that are always redacted (e.g. an internal host name
     /// or a customer id).
@@ -218,10 +219,6 @@ const STEMS: &[&str] = &[
 /// Names matched only exactly (too ambiguous to match as substrings).
 const EXACT: &[&str] = &["key", "sig", "pin", "otp"];
 
-/// Keys that look like a stem but are SDK-owned structure that must survive
-/// (`signatures` is the crash dedup list).
-const KEY_EXCEPTIONS: &[&str] = &["signatures"];
-
 /// Free-text names that are unambiguous: matched as a suffix.
 const TEXT_STRONG: &[&str] = &[
     "password",
@@ -269,6 +266,24 @@ fn with_normalized<R>(name: &str, f: impl FnOnce(&[u8]) -> R) -> R {
     f(&buf[..n])
 }
 
+/// Case-insensitive `starts_with` that lets `_`, `-`, space and `.` appear
+/// between the letters/digits of `needle` (but not before the first).
+fn fuzzy_starts_with(rest: &[u8], needle: &[u8]) -> bool {
+    let mut ri = 0;
+    for (ni, &nc) in needle.iter().enumerate() {
+        if ni > 0 && nc.is_ascii_alphanumeric() {
+            while ri < rest.len() && matches!(rest[ri], b'_' | b'-' | b' ' | b'.') {
+                ri += 1;
+            }
+        }
+        if ri >= rest.len() || !rest[ri].eq_ignore_ascii_case(&nc) {
+            return false;
+        }
+        ri += 1;
+    }
+    true
+}
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -276,43 +291,122 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 /// Whether a key (JSON object key, header name, query/form parameter) names a
 /// value that must be redacted. The single credential-key matcher shared by the
 /// scrubber and `bugsee-reqwest`.
+///
+/// A stem does not count when the surrounding word makes it something else:
+/// `author`/`authority`/`:authority` (not `auth`), `tokenizer`/`token_type`/
+/// `token_count` (not `token`), `secretary`, `session_state`/`sessionStart`/
+/// `session_timeout` (not a session id), `method_signature`. Remaining
+/// trade-offs: `pwd` also matches the shell's `PWD`/`OLDPWD` variables (their
+/// values are a working directory, so the path detector still scrubs the
+/// username), and any other key containing a stem (`password_hint`) is redacted.
 pub fn is_sensitive_key(name: &str) -> bool {
     with_normalized(name, |n| {
-        !KEY_EXCEPTIONS.iter().any(|e| n == e.as_bytes())
-            && (EXACT.iter().any(|e| n == e.as_bytes())
-                || STEMS.iter().any(|s| contains(n, s.as_bytes())))
+        EXACT.iter().any(|e| n == e.as_bytes()) || STEMS.iter().any(|s| stem_hit(n, s.as_bytes()))
     })
 }
 
-/// Prefixed token shapes: `(prefix, min tail length, tail needs a digit)`. The
-/// tail is a run of `[A-Za-z0-9_-]`.
-const TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
-    ("sk_live_", 8, false),
-    ("sk_test_", 8, false),
-    ("rk_live_", 8, false),
-    ("rk_test_", 8, false),
-    ("whsec_", 16, false),
-    ("ghp_", 20, false),
-    ("gho_", 20, false),
-    ("ghu_", 20, false),
-    ("ghs_", 20, false),
-    ("ghr_", 20, false),
-    ("github_pat_", 20, false),
-    ("glpat-", 15, false),
-    ("xoxb-", 10, false),
-    ("xoxp-", 10, false),
-    ("xoxa-", 10, false),
-    ("xoxs-", 10, false),
-    ("xoxr-", 10, false),
-    ("sk-ant-", 20, false),
-    ("sk-", 20, true),
-    ("hf_", 20, false),
-    ("AKIA", 16, false),
-    ("ASIA", 16, false),
-    ("AIza", 30, false),
-    ("SG.", 20, false),
-    ("npm_", 30, false),
-    ("shpat_", 20, false),
+/// Whether `stem` occurs in `n` in a sense that is not excluded by its context.
+fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
+    let mut from = 0;
+    while from + stem.len() <= n.len() {
+        let Some(p) = n[from..].windows(stem.len()).position(|w| w == stem) else {
+            return false;
+        };
+        let at = from + p;
+        let (before, rest) = (&n[..at], &n[at + stem.len()..]);
+        let excluded = match stem {
+            b"auth" => rest.starts_with(b"or") && !rest.starts_with(b"oriz"),
+            b"token" => [
+                &b"iz"[..],
+                b"type",
+                b"count",
+                b"len",
+                b"limit",
+                b"usage",
+                b"used",
+                b"budget",
+            ]
+            .iter()
+            .any(|x| rest.starts_with(x)),
+            b"secret" => rest.starts_with(b"ary"),
+            b"session" => [
+                &b"start"[..],
+                b"state",
+                b"status",
+                b"timeout",
+                b"duration",
+                b"count",
+                b"length",
+                b"type",
+                b"ttl",
+                b"age",
+                b"expir",
+            ]
+            .iter()
+            .any(|x| rest.starts_with(x)),
+            b"signature" => [&b"method"[..], b"function", b"fn", b"type", b"call"]
+                .iter()
+                .any(|x| before.ends_with(x)),
+            _ => false,
+        };
+        if !excluded {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// What a prefixed token's tail must look like beyond its length, so ordinary
+/// identifiers that merely start with the prefix (`sk-cluster-node-01-primary`)
+/// do not match.
+#[derive(Clone, Copy)]
+enum Need {
+    None,
+    /// A digit and both letter cases (OpenAI-style `sk-` keys).
+    DigitAndMixed,
+    /// A digit or both letter cases.
+    DigitOrMixed,
+    /// Exactly 16 characters of `[A-Z0-9]` (AWS access key ids).
+    Upper16,
+}
+
+/// Prefixed token shapes: `(prefix, min tail length, tail shape)`. The tail is
+/// a run of `[A-Za-z0-9_-]`.
+const TOKEN_PREFIXES: &[(&str, usize, Need)] = &[
+    ("sk_live_", 8, Need::None),
+    ("sk_test_", 8, Need::None),
+    ("rk_live_", 8, Need::None),
+    ("rk_test_", 8, Need::None),
+    ("whsec_", 16, Need::None),
+    ("ghp_", 20, Need::None),
+    ("gho_", 20, Need::None),
+    ("ghu_", 20, Need::None),
+    ("ghs_", 20, Need::None),
+    ("ghr_", 20, Need::None),
+    ("github_pat_", 20, Need::None),
+    ("glpat-", 15, Need::None),
+    ("xoxb-", 10, Need::None),
+    ("xoxp-", 10, Need::None),
+    ("xoxa-", 10, Need::None),
+    ("xoxs-", 10, Need::None),
+    ("xoxr-", 10, Need::None),
+    ("sk-ant-", 20, Need::None),
+    ("sk-", 20, Need::DigitAndMixed),
+    ("hf_", 20, Need::DigitOrMixed),
+    ("AKIA", 16, Need::Upper16),
+    ("ASIA", 16, Need::Upper16),
+    ("AIza", 30, Need::None),
+    ("SG.", 20, Need::None),
+    ("npm_", 30, Need::None),
+    ("shpat_", 20, Need::None),
+];
+
+/// "Top-level domains" that are really file extensions (`logo@2x.png`).
+const FILE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tif", "tiff", "css", "js", "ts",
+    "json", "toml", "yaml", "yml", "txt", "md", "pdf", "html", "htm", "rs", "so", "dll", "dylib",
+    "exe", "zip", "gz", "mp3", "mp4", "mov", "woff", "woff2", "ttf",
 ];
 
 /// First bytes of every shape `tokens` can match (a word-start filter).
@@ -338,12 +432,31 @@ impl Default for Scrubber {
     }
 }
 
+/// How a secret-named structured key is redacted.
+#[derive(Clone, Copy)]
+struct StructKey {
+    /// Only strings that look like a credential (see [`looks_like_secret`]).
+    looks_only: bool,
+    /// Numbers under the key are redacted too.
+    numeric: bool,
+}
+
+/// A long, space-free, colon-free string: plausibly a credential rather than an
+/// ordinary word or a `user:42:profile` cache key.
+fn looks_like_secret(s: &str) -> bool {
+    s.len() >= 16 && !s.contains(char::is_whitespace) && !s.contains(':')
+}
+
 /// Which free-text key class a name belongs to.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum KeyClass {
     None,
     Strong,
     Ambiguous,
+    /// `Cookie`/`Set-Cookie`: the value runs to the end of the line.
+    Cookie,
+    /// A key the host listed in `sensitive_keys`: always redacted.
+    Explicit,
 }
 
 impl Scrubber {
@@ -431,6 +544,18 @@ impl Scrubber {
         if !self.cfg.enabled {
             return false;
         }
+        // A card number stored as a JSON integer.
+        if let Value::Number(n) = &*v {
+            let hit = self.cfg.cards
+                && n.as_u64().is_some_and(|u| {
+                    let d = u.to_string();
+                    (13..=19).contains(&d.len()) && self.has_card(&d)
+                });
+            if hit {
+                *v = Value::String(CARD.to_string());
+            }
+            return hit;
+        }
         match v {
             Value::String(s) => match self.scrub_str(s) {
                 Cow::Borrowed(_) => false,
@@ -443,8 +568,8 @@ impl Scrubber {
             Value::Object(m) => {
                 let mut changed = false;
                 for (k, x) in m.iter_mut() {
-                    if self.cfg.keyed && self.structured_key_is_sensitive(k) {
-                        changed |= self.redact_strings(x);
+                    if let Some(sk) = self.structured_key(k).filter(|_| self.cfg.keyed) {
+                        changed |= self.redact_strings(x, sk);
                     } else {
                         changed |= self.scrub_value(x);
                     }
@@ -455,34 +580,88 @@ impl Scrubber {
         }
     }
 
-    /// Replace every string leaf under `v` (a secret-keyed value) by a marker.
-    fn redact_strings(&self, v: &mut Value) -> bool {
+    /// Replace every string leaf under `v` (a secret-keyed value) by a marker;
+    /// numbers too when the key unambiguously holds a secret (`pin`, `otp`,
+    /// `password`, ...). Booleans and nulls are never touched.
+    fn redact_strings(&self, v: &mut Value, sk: StructKey) -> bool {
         match v {
             Value::String(s) => {
-                if s.is_empty() || s == REDACTED || self.allowed(s) {
+                if s.is_empty()
+                    || s == REDACTED
+                    || self.allowed(s)
+                    || (sk.looks_only && !looks_like_secret(s))
+                {
                     false
                 } else {
                     *s = REDACTED.to_string();
                     true
                 }
             }
-            Value::Array(a) => a.iter_mut().fold(false, |c, x| self.redact_strings(x) | c),
+            Value::Number(_) if sk.numeric => {
+                *v = Value::String(REDACTED.to_string());
+                true
+            }
+            Value::Array(a) => a
+                .iter_mut()
+                .fold(false, |c, x| self.redact_strings(x, sk) | c),
             Value::Object(m) => m
                 .values_mut()
-                .fold(false, |c, x| self.redact_strings(x) | c),
+                .fold(false, |c, x| self.redact_strings(x, sk) | c),
             _ => false,
         }
+    }
+
+    /// How a structured key should be redacted, or `None` if it is not secret.
+    fn structured_key(&self, key: &str) -> Option<StructKey> {
+        if !self.structured_key_is_sensitive(key) {
+            return None;
+        }
+        Some(with_normalized(key, |n| StructKey {
+            // `key`/`sig` are also ordinary words (`{"key":"Enter"}`, cache
+            // keys): only redact values that look like a credential.
+            looks_only: n == b"key" || n == b"sig",
+            numeric: n == b"pin"
+                || n == b"otp"
+                || TEXT_STRONG.iter().any(|k| n.ends_with(k.as_bytes()))
+                || self.extra_keys.iter().any(|k| n.ends_with(k.as_bytes())),
+        }))
+    }
+
+    fn has_card(&self, digits: &str) -> bool {
+        let mut spans = Vec::new();
+        self.cards(digits, &mut spans);
+        !spans.is_empty()
     }
 
     /// Scrub a serialized JSON document. `None` when nothing changed (the
     /// caller keeps its original bytes). Unparseable input is scrubbed as text.
     pub fn scrub_json_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        self.scrub_json_bytes_keeping(bytes, &[])
+    }
+
+    /// [`scrub_json_bytes`](Self::scrub_json_bytes), leaving the given TOP-LEVEL
+    /// keys untouched (SDK-owned structure such as `crash.json`'s `signatures`,
+    /// which the `signature` key stem would otherwise redact).
+    pub fn scrub_json_bytes_keeping(&self, bytes: &[u8], keep: &[&str]) -> Option<Vec<u8>> {
         if !self.cfg.enabled {
             return None;
         }
         match serde_json::from_slice::<Value>(bytes) {
             Ok(mut v) => {
-                if self.scrub_value(&mut v) {
+                let held: Vec<(String, Value)> = match &mut v {
+                    Value::Object(m) => keep
+                        .iter()
+                        .filter_map(|k| m.remove(*k).map(|x| ((*k).to_string(), x)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let changed = self.scrub_value(&mut v);
+                if let Value::Object(m) = &mut v {
+                    for (k, x) in held {
+                        m.insert(k, x);
+                    }
+                }
+                if changed {
                     serde_json::to_vec(&v).ok()
                 } else {
                     None
@@ -560,10 +739,15 @@ impl Scrubber {
         Some(out)
     }
 
-    /// A conservative byte-level pre-check: `false` guarantees the scrubber
-    /// would not change `raw` (a JSON text), so callers can skip parsing it.
-    /// `true` just means "look closer". Always `true` when user-defined deny
-    /// literals or sensitive keys are configured (they are arbitrary).
+    /// A conservative byte-level pre-check: `false` means the scrubber would
+    /// not change `raw` (a JSON text), so callers can skip parsing it. `true`
+    /// just means "look closer". Always `true` when user-defined deny literals
+    /// or sensitive keys are configured (they are arbitrary), and whenever the
+    /// text contains a `\u` escape (the checked substrings could be spelled
+    /// through it). Key stems are matched allowing `_`, `-`, space and `.`
+    /// between letters (`p_w_d`, `P-W-D`), which is the separator set real
+    /// keys use; the scrubber's normaliser would accept any punctuation, so
+    /// the guarantee assumes those four separators.
     pub fn might_match(&self, raw: &[u8]) -> bool {
         if !self.cfg.deny.is_empty() || !self.extra_keys.is_empty() {
             return true;
@@ -609,7 +793,7 @@ impl Scrubber {
         let mut digits = 0usize;
         let mut gap = 0usize;
         for (i, &c) in raw.iter().enumerate() {
-            if c == b'@' || c == b'=' {
+            if c == b'@' || c == b'=' || (c == b'\\' && raw.get(i + 1) == Some(&b'u')) {
                 return true;
             }
             if c.is_ascii_digit() {
@@ -629,10 +813,7 @@ impl Scrubber {
             if lc.is_ascii_alphabetic() || matches!(lc, b'-' | b':') {
                 let rest = &raw[i..];
                 for n in NEEDLES {
-                    if n[0] == lc
-                        && rest.len() >= n.len()
-                        && rest[..n.len()].eq_ignore_ascii_case(n)
-                    {
+                    if n[0] == lc && fuzzy_starts_with(rest, n) {
                         return true;
                     }
                 }
@@ -689,9 +870,11 @@ impl Scrubber {
 
     fn text_key_class(&self, key: &str) -> KeyClass {
         with_normalized(key, |n| {
-            if TEXT_STRONG.iter().any(|k| n.ends_with(k.as_bytes()))
-                || self.extra_keys.iter().any(|k| n.ends_with(k.as_bytes()))
-            {
+            if n.ends_with(b"cookie") {
+                KeyClass::Cookie
+            } else if self.extra_keys.iter().any(|k| n.ends_with(k.as_bytes())) {
+                KeyClass::Explicit
+            } else if TEXT_STRONG.iter().any(|k| n.ends_with(k.as_bytes())) {
                 KeyClass::Strong
             } else if EXACT.iter().any(|k| n == k.as_bytes())
                 || TEXT_AMBIGUOUS_SUFFIX
@@ -736,6 +919,11 @@ impl Scrubber {
                 .take_while(u8::is_ascii_alphabetic)
                 .count();
             if tld_len < 2 {
+                continue;
+            }
+            // `icon@2x.png` is an asset name, not an address.
+            let tld = &dom[dot + 1..dot + 1 + tld_len];
+            if FILE_EXTENSIONS.iter().any(|x| tld.eq_ignore_ascii_case(x)) {
                 continue;
             }
             let en = at + 1 + dot + 1 + tld_len;
@@ -892,6 +1080,10 @@ impl Scrubber {
             if class == KeyClass::None {
                 continue;
             }
+            // `my_app::token: refreshed` - a path segment, not a key.
+            if j >= 2 && b[j - 1] == b':' && b[j - 2] == b':' {
+                continue;
+            }
             // Value.
             let mut k = i + 1;
             while k < b.len() && matches!(b[k], b' ' | b'\t') {
@@ -910,17 +1102,22 @@ impl Scrubber {
             };
             let vs = k;
             let mut ve = match quote {
-                Some(q) => {
+                Some(q) if escaped => {
                     let e = b[vs..]
                         .iter()
                         .position(|&c| c == q)
                         .map_or(b.len(), |p| vs + p);
-                    if escaped && e > vs && b[e - 1] == b'\\' {
+                    if e > vs && b[e - 1] == b'\\' {
                         e - 1
                     } else {
                         e
                     }
                 }
+                Some(q) => find_close(b, vs, q),
+                None if class == KeyClass::Cookie => b[vs..]
+                    .iter()
+                    .position(|&c| c == b'\r' || c == b'\n')
+                    .map_or(b.len(), |p| vs + p),
                 None if vs < b.len() && matches!(b[vs], b'{' | b'[') => bracketed_end(b, vs),
                 None => {
                     if vrun.0 <= vs && vs < vrun.1 {
@@ -977,13 +1174,22 @@ impl Scrubber {
                 }
                 ve = e;
             }
+            // Bounded looks (the first 64 bytes), never O(len) per attempt.
+            let head = &b[vs..ve.min(vs + 64)];
             if class == KeyClass::Ambiguous {
                 // Ordinary words ("auth: failed", "session: started") are not
-                // secrets: need `=` or a quoted key and a secret-looking value.
-                let v = &b[vs..ve];
-                // Bounded look: a digit among the first 64 bytes (never O(len) per attempt).
-                let secretish = v.len() >= 8 && v[..v.len().min(64)].iter().any(u8::is_ascii_digit);
+                // secrets: need `=` or a quoted key and a secret-looking value
+                // (8+ chars with a digit; `user:42:profile` cache keys excluded).
+                let secretish =
+                    ve - vs >= 8 && head.iter().any(u8::is_ascii_digit) && !head.contains(&b':');
                 if !(sep == b'=' || quoted_key) || !secretish {
+                    continue;
+                }
+            } else if class == KeyClass::Strong && sep == b':' && !quoted_key && quote.is_none() {
+                // Prose, not a credential: "invalid token: expected ident",
+                // "password: must be at least 8". A bare `token: abc123` still is.
+                let loose = ve - vs >= 6 && !head.iter().all(u8::is_ascii_lowercase);
+                if !loose {
                     continue;
                 }
             }
@@ -1134,6 +1340,8 @@ impl Scrubber {
                 // `/home/feed` is a route, `/home/bob/x` a path; a bare
                 // `/Users/bob` or `X:\Users\bob` still names the user.
                 || (!deeper && !windows && root == 4)
+                // Shared system folders, not a person.
+                || matches!(name, "Shared" | "Public" | "Default")
                 || self.allowed(name)
             {
                 continue;
@@ -1145,6 +1353,23 @@ impl Scrubber {
             });
         }
     }
+}
+
+/// Position of the closing `q` of a quoted value starting at `vs`, skipping
+/// backslash-escaped quotes (`"a\"b"`); the end of the input if unterminated.
+fn find_close(b: &[u8], vs: usize, q: u8) -> usize {
+    for i in vs..b.len() {
+        if b[i] == q {
+            let mut k = 0;
+            while i > vs + k && b[i - 1 - k] == b'\\' {
+                k += 1;
+            }
+            if k % 2 == 0 {
+                return i;
+            }
+        }
+    }
+    b.len()
 }
 
 /// End of a `{...}` / `[...]` value starting at `vs` (matching close, or the
@@ -1173,6 +1398,8 @@ struct Run {
     start: usize,
     end: usize,
     last_digit: Option<usize>,
+    last_upper: Option<usize>,
+    last_lower: Option<usize>,
 }
 
 impl Run {
@@ -1180,10 +1407,14 @@ impl Run {
     fn end_from(&mut self, b: &[u8], t: usize) -> usize {
         if !(self.start <= t && t < self.end) {
             let mut e = t;
-            let mut last_digit = None;
+            let (mut last_digit, mut last_upper, mut last_lower) = (None, None, None);
             while e < b.len() && is_token_char(b[e]) {
                 if b[e].is_ascii_digit() {
                     last_digit = Some(e);
+                } else if b[e].is_ascii_uppercase() {
+                    last_upper = Some(e);
+                } else if b[e].is_ascii_lowercase() {
+                    last_lower = Some(e);
                 }
                 e += 1;
             }
@@ -1191,6 +1422,8 @@ impl Run {
                 start: t,
                 end: e,
                 last_digit,
+                last_upper,
+                last_lower,
             };
         }
         self.end
@@ -1200,19 +1433,36 @@ impl Run {
     fn digit_from(&self, t: usize) -> bool {
         self.last_digit.is_some_and(|d| d >= t)
     }
+
+    /// Whether the run, from `t` on, has both upper- and lower-case letters.
+    fn mixed_from(&self, t: usize) -> bool {
+        self.last_upper.is_some_and(|d| d >= t) && self.last_lower.is_some_and(|d| d >= t)
+    }
 }
 
 /// `(start, end)` of a prefixed token starting at `i`.
 fn prefixed_token(b: &[u8], i: usize, run: &mut Run) -> Option<(usize, usize)> {
     let rest = &b[i..];
-    for &(prefix, min_tail, need_digit) in TOKEN_PREFIXES {
+    for &(prefix, min_tail, need) in TOKEN_PREFIXES {
         // Compare the first byte inline; most words stop here.
         if rest[0] != prefix.as_bytes()[0] || !rest.starts_with(prefix.as_bytes()) {
             continue;
         }
         let t = i + prefix.len();
         let e = run.end_from(b, t);
-        if e - t >= min_tail && (!need_digit || run.digit_from(t)) {
+        let ok = e - t >= min_tail
+            && match need {
+                Need::None => true,
+                Need::DigitAndMixed => run.digit_from(t) && run.mixed_from(t),
+                Need::DigitOrMixed => run.digit_from(t) || run.mixed_from(t),
+                Need::Upper16 => {
+                    e - t == 16
+                        && b[t..e]
+                            .iter()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                }
+            };
+        if ok {
             return Some((i, e));
         }
     }
@@ -1265,13 +1515,24 @@ fn credential_after_scheme(b: &[u8], i: usize) -> Option<(usize, usize)> {
     }
     let ts = j;
     // Base64/URL-safe credential chars: token chars plus `. ~ + / =`.
-    let mut mixed = false;
+    // `mixed`: a digit or one of `. ~ + / =` (a plain `-`/`_` joined word like
+    // "token-based" is prose); `cased`: both letter cases.
+    let (mut mixed, mut upper, mut lower) = (false, false, false);
     while j < b.len() && (is_token_char(b[j]) || matches!(b[j], b'.' | b'~' | b'+' | b'/' | b'=')) {
-        mixed |= !b[j].is_ascii_alphabetic();
+        mixed |= b[j].is_ascii_digit() || matches!(b[j], b'.' | b'~' | b'+' | b'/' | b'=');
+        upper |= b[j].is_ascii_uppercase();
+        lower |= b[j].is_ascii_lowercase();
         j += 1;
     }
-    let min = if strict { 8 } else { 6 };
-    (j - ts >= min && (!strict || mixed)).then_some((ts, j))
+    let len = j - ts;
+    // "Bearer tokens are ..." is prose; a credential has a digit/symbol, mixed
+    // case, or is long.
+    let ok = if strict {
+        len >= 8 && mixed
+    } else {
+        len >= 6 && (mixed || (upper && lower) || len >= 20)
+    };
+    ok.then_some((ts, j))
 }
 
 fn is_word(c: u8) -> bool {
@@ -1365,6 +1626,12 @@ mod tests {
         Scrubber::default().scrub_str(x).into_owned()
     }
 
+    /// Join halves at runtime so no whole secret-shaped literal appears in the
+    /// source (GitHub push protection rejects those).
+    fn j(a: &str, b: &str) -> String {
+        format!("{a}{b}")
+    }
+
     #[test]
     fn clean_strings_are_borrowed() {
         let sc = Scrubber::default();
@@ -1395,26 +1662,56 @@ mod tests {
 
     #[test]
     fn tokens() {
-        assert_eq!(s("k=sk_live_abcdefgh12345678"), "k=[token]");
-        assert_eq!(s("ghp_abcdefghijklmnopqrstuvwxyz0123456789"), "[token]");
-        assert_eq!(s("hf_abcdefghijklmnopqrstuvwxyzABCDEF"), "[token]");
-        assert_eq!(s("whsec_abcdefghijklmnopqrstuvwx"), "[token]");
-        assert_eq!(s("id AKIAIOSFODNN7EXAMPLE x"), "id [token] x");
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(s(&j("k=sk_", "live_abcdefgh12345678")), "k=[token]");
+        assert_eq!(
+            s(&j("gh", "p_abcdefghijklmnopqrstuvwxyz0123456789")),
+            "[token]"
+        );
+        assert_eq!(s(&j("hf", "_abcdefghijklmnopqrstuvwxyzABCDEF")), "[token]");
+        assert_eq!(s(&j("whsec", "_abcdefghijklmnopqrstuvwx")), "[token]");
+        assert_eq!(
+            s(&format!("id {}{} x", "AKI", "AIOSFODNN7EXAMPLE")),
+            "id [token] x"
+        );
+        let jwt = format!(
+            "{}.{}.{}",
+            j("ey", "JhbGciOiJIUzI1NiJ9"),
+            j("ey", "JzdWIiOiIxMjM0NTY3ODkwIn0"),
+            "dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        );
         assert_eq!(s(&format!("t {jwt}!")), "t [token]!");
         assert_eq!(s("Bearer abcdef0123456789"), "Bearer [token]");
         assert_eq!(s("Bearer: abc123"), "Bearer: [token]");
         assert_eq!(s("Bearer abc123"), "Bearer [token]");
-        assert_eq!(
-            s("sk-learn-something-long-enough"),
-            "sk-learn-something-long-enough"
-        );
+    }
+
+    #[test]
+    fn token_shapes_are_tight() {
+        // Prose and identifiers that merely start like a token stay readable.
+        for t in [
+            "bearer tokens are rotated daily",
+            "Bearer token-based auth",
+            "sk-cluster-node-01-primary-east",
+            "sk-learn-something-long-enough",
+            "AKIA is the prefix",
+            concat!("AKI", "AIOSFODNN7EXAMPLEXX"),
+            "AKIAiosfodnn7example1234",
+            "hf_abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert_eq!(s(t), t, "{t}");
+        }
+        // Real shapes still match.
+        assert_eq!(s(&format!("{}{}", "AKI", "AIOSFODNN7EXAMPLE")), "[token]");
+        assert_eq!(s(&j("sk-", "ProjAbCdEfGhIjKlMnOp0123456789xyz")), "[token]");
+        assert_eq!(s(&j("hf_", "abcdEFGHijklMNOPqrstUVWX")), "[token]");
     }
 
     #[test]
     fn pem_private_keys_and_url_userinfo() {
-        let pem = "x -----BEGIN RSA PRIVATE KEY-----\nMIIEow\nIBAAKCAQEA\n-----END RSA PRIVATE KEY----- y";
-        assert_eq!(s(pem), "x [token] y");
+        let begin = j("-----BEGIN RSA ", "PRIVATE KEY-----");
+        let end = j("-----END RSA ", "PRIVATE KEY-----");
+        let pem = format!("x {begin}\nMIIEow\nIBAAKCAQEA\n{end} y");
+        assert_eq!(s(&pem), "x [token] y");
         let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
         assert_eq!(s(cert), cert);
         assert_eq!(
@@ -1512,9 +1809,10 @@ mod tests {
 
     #[test]
     fn overlapping_spans_merge_without_leaking_the_tail() {
-        let out = s("a@b.com-ghp_abcdefghijklmnopqrstuvwxyz0123456789 end");
+        let g = j("gh", "p_abcdefghijklmnopqrstuvwxyz0123456789");
+        let out = s(&format!("a@b.com-{g} end"));
         assert!(!out.contains("ghp_") && !out.contains("abcdefgh"), "{out}");
-        let out = s("redis://u:ghp_abcdefghijklmnopqrstuvwxyz0123456789@h.example.com/x");
+        let out = s(&format!("redis://u:{g}@h.example.com/x"));
         assert!(!out.contains("abcdefghijkl"), "{out}");
     }
 
@@ -1562,6 +1860,7 @@ mod tests {
             "session_ttl": 30,
             "signatures": ["a1b2c3"]
         });
+        let keep = v.clone();
         assert!(sc.scrub_value(&mut v));
         assert_eq!(v["message"], "user [email] failed");
         assert_eq!(v["headers"]["Authorization"], "[redacted]");
@@ -1573,10 +1872,18 @@ mod tests {
         assert_eq!(v["list"][0], "/Users/[user]/x");
         assert_eq!(v["api_key"][0], "[redacted]");
         assert_eq!(v["api_key"][1]["b"], "[redacted]");
-        assert_eq!(v["api_key"][1]["n"], 3);
+        // Numbers under an unambiguous secret key are redacted too.
+        assert_eq!(v["api_key"][1]["n"], "[redacted]");
         assert_eq!(v["api_key"][2], true);
         assert_eq!(v["session_ttl"], 30);
-        assert_eq!(v["signatures"][0], "a1b2c3");
+        // `signatures` is only exempt where the SDK says so (crash.json).
+        assert_eq!(v["signatures"][0], "[redacted]");
+        let out = sc
+            .scrub_json_bytes_keeping(&serde_json::to_vec(&keep).unwrap(), &["signatures"])
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v2["signatures"][0], "a1b2c3");
+        assert_eq!(v2["message"], "user [email] failed");
         assert!(sc.scrub_json_bytes(br#"{"a":"fine"}"#).is_none());
     }
 
@@ -1596,9 +1903,9 @@ mod tests {
                 "debug_id": "41111111-1111-1111-1111-111111111111"
             }]
         });
-        let mut v = crash.clone();
-        assert!(!sc.scrub_value(&mut v));
-        assert_eq!(v, crash);
+        assert!(sc
+            .scrub_json_bytes_keeping(&serde_json::to_vec(&crash).unwrap(), &["signatures"])
+            .is_none());
         assert!(sc
             .scrub_envelope(br#"{"version":2,"events":[{"t":"app::auth::x"}]}"#)
             .is_none());
@@ -1628,6 +1935,143 @@ mod tests {
             "日本 password=[redacted] 日本"
         );
         assert_eq!(s("/Users/ёлка/x"), "/Users/[user]/x");
+    }
+
+    #[test]
+    fn numeric_secrets_and_card_integers() {
+        let sc = Scrubber::default();
+        let mut v = serde_json::json!({
+            "pin": 1234, "otp": 654321, "password": 12345678, "secret": [1, 2],
+            "token_count": 7, "retry": 3, "key": 42,
+            "card": 4111111111111111u64, "ts": 1712345678901u64, "ok": true
+        });
+        assert!(sc.scrub_value(&mut v));
+        assert_eq!(v["pin"], "[redacted]");
+        assert_eq!(v["otp"], "[redacted]");
+        assert_eq!(v["password"], "[redacted]");
+        assert_eq!(v["secret"][1], "[redacted]");
+        assert_eq!(v["token_count"], 7);
+        assert_eq!(v["key"], 42);
+        assert_eq!(v["card"], "[card]");
+        assert_eq!(v["ts"], 1712345678901u64);
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn colon_prose_is_not_a_secret() {
+        for t in [
+            "invalid token: expected ident",
+            "unexpected token: `}`",
+            "password: must be at least 8 characters",
+            "INFO my_app::token: refreshed",
+            "secret: required",
+        ] {
+            assert_eq!(s(t), t, "{t}");
+        }
+        assert_eq!(s("password: hunter2"), "password: [redacted]");
+        assert_eq!(s("token: abc123def456"), "token: [redacted]");
+        assert_eq!(
+            s(r#"{"password": "short"}"#),
+            r#"{"password": "[redacted]"}"#
+        );
+    }
+
+    #[test]
+    fn cookie_header_takes_the_whole_line() {
+        assert_eq!(
+            s("Cookie: a=1; sid=abcdef1234; theme=dark\nHost: x"),
+            "Cookie: [redacted]\nHost: x"
+        );
+        assert_eq!(s("Set-Cookie: id=1; Path=/"), "Set-Cookie: [redacted]");
+    }
+
+    #[test]
+    fn escaped_quotes_inside_quoted_values() {
+        assert_eq!(
+            s(r#"{"password": "a\"bcdefgh tail", "n": 1}"#),
+            r#"{"password": "[redacted]", "n": 1}"#
+        );
+    }
+
+    #[test]
+    fn stem_exceptions_and_key_value_looks() {
+        for k in [
+            "author",
+            "authority",
+            ":authority",
+            "tokenizer",
+            "token_type",
+            "token_count",
+            "method_signature",
+            "secretary",
+            "sessionStart",
+            "session_state",
+            "session_timeout",
+            "keyboard",
+            "monkey",
+        ] {
+            assert!(!is_sensitive_key(k), "{k}");
+        }
+        for k in [
+            "authorization",
+            "auth",
+            "oauth_token",
+            "access_token",
+            "client_secret",
+            "sessionId",
+            "session",
+            "signature",
+            "signatures",
+            "AccountKey",
+            "x-api-key",
+            "PWD",
+            "p_w_d_token",
+        ] {
+            assert!(is_sensitive_key(k), "{k}");
+        }
+        let sc = Scrubber::default();
+        let mut v = serde_json::json!({"key": "Enter", "sig": "ok", "author": "Bob"});
+        assert!(!sc.scrub_value(&mut v));
+        let mut v = serde_json::json!({"key": "abcdEFGH1234abcdEFGH1234", "other": {"key": "user:42:profile"}});
+        assert!(sc.scrub_value(&mut v));
+        assert_eq!(v["key"], "[redacted]");
+        assert_eq!(v["other"]["key"], "user:42:profile");
+        assert_eq!(s("key=user:42:profile"), "key=user:42:profile");
+        assert_eq!(s("key=abcd1234efgh5678"), "key=[redacted]");
+    }
+
+    #[test]
+    fn file_names_and_shared_folders_are_not_pii() {
+        assert_eq!(s("icon@2x.png logo@3x.JPG"), "icon@2x.png logo@3x.JPG");
+        assert_eq!(s("a@example.com"), "[email]");
+        assert_eq!(s("/Users/Shared/Library/x"), "/Users/Shared/Library/x");
+        // deny beats allow.
+        let sc = Scrubber::new(ScrubConfig::default().allow("acme").deny("acme"));
+        assert_eq!(sc.scrub_str("acme corp").as_ref(), "[redacted] corp");
+    }
+
+    /// `might_match == false` must mean "scrubbing changes nothing".
+    #[test]
+    fn prefilter_never_skips_a_record_that_would_change() {
+        let sc = Scrubber::default();
+        for rec in [
+            r#"{"m":"a@b.com"}"#,
+            r#"{"password":"x"}"#,
+            r#"{"m":"4111 1111 1111 1111"}"#,
+            r#"{"p_w_d":"hunter2"}"#,
+            r#"{"P-W-D":"x"}"#,
+            r#"{"p w d":"x"}"#,
+            r#"{"m":"\u0061@b.com"}"#,
+            r#"{"\u0070assword":"x"}"#,
+            r#"{"card":4111111111111111}"#,
+            r#"{"m":"/home/bob/x"}"#,
+            r#"{"m":"Authorization: Bearer abc123"}"#,
+        ] {
+            if sc.scrub_json_bytes(rec.as_bytes()).is_some() {
+                assert!(sc.might_match(rec.as_bytes()), "{rec}");
+            }
+        }
+        assert!(!sc.might_match(br#"{"timestamp":1,"level":2,"message":"connection reset"}"#));
     }
 
     /// Deterministic pseudo-random (xorshift) soup of every trigger fragment.
@@ -1669,7 +2113,7 @@ mod tests {
             "日",
             "Bearer ",
             "Basic ",
-            "-----BEGIN PRIVATE KEY-----",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
             "-----END ",
             "://",
             "x",
@@ -1702,6 +2146,11 @@ mod tests {
         let limit = std::time::Duration::from_secs(if cfg!(debug_assertions) { 20 } else { 2 });
         for unit in [
             "sk-",
+            "cookie:",
+            "password: \"a\\\"",
+            "\\\"",
+            "hf_",
+            "bearer: ",
             "eyJ-",
             "eyJ.",
             "auth:",
@@ -1717,7 +2166,7 @@ mod tests {
             "Bearer ",
             "basic ",
             "://",
-            "-----BEGIN PRIVATE KEY-----",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
             "ghp_",
             "AKIA",
             "[",
