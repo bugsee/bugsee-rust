@@ -18,7 +18,7 @@ crate="$root/crates/bugsee-ffi"
 header="$crate/include/bugsee.h"
 
 generate() {
-  (cd "$crate" && cbindgen --config cbindgen.toml --crate bugsee-ffi --output "$1" >/dev/null 2>&1)
+  (cd "$crate" && cbindgen --config cbindgen.toml --crate bugsee-ffi --output "$1" >/dev/null)
 }
 
 case "${1:-}" in
