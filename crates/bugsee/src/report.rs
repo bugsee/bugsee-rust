@@ -36,7 +36,7 @@ impl Report {
                 signatures: Vec::new(),
                 source: Source {
                     trigger: TriggerType::CodeUpload,
-                    origin: None,
+                    origin: bugsee_core::origin::capture_origin(),
                 },
                 attrs: Map::new(),
                 attachments: Vec::new(),
