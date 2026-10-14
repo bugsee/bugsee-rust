@@ -19,10 +19,14 @@
 pub mod bundle;
 pub mod capture;
 pub mod claim;
+pub mod crash_flush;
 pub mod errors;
 pub mod fork;
+#[doc(hidden)]
+pub mod health;
 pub mod model;
 pub mod panic_info;
+pub(crate) mod process;
 pub mod queue;
 pub mod ratelimit;
 pub mod recovery;
@@ -33,6 +37,8 @@ pub mod session;
 pub mod signature;
 pub mod transport;
 pub mod util;
+#[cfg(windows)]
+mod win32;
 
 pub use model::{
     entry::{

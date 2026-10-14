@@ -87,7 +87,9 @@ pub fn host_facts(data_dir: &Path) -> HostFacts {
         memory_free: to_mb(sys.available_memory()),
         disk_total,
         disk_free,
-        locale: locale(),
+        locale: locale().or_else(crate::hostinfo::locale),
+        utc_offset: crate::hostinfo::utc_offset_minutes(),
+        hardware_model: crate::hostinfo::hardware_model(),
     }
 }
 
@@ -136,10 +138,9 @@ fn disk_for(data_dir: &Path) -> (Option<u64>, Option<u64>) {
 /// present. Gating it off would also have meant gating this function's tests,
 /// losing coverage of platform-independent string logic for no benefit.
 ///
-/// What Windows still lacks is the *fallback* when the environment says
-/// nothing: `GetUserDefaultLocaleName` needs a Win32 binding or a crate, and
-/// this SDK has taken no new dependencies. The field is optional, so such a
-/// report simply omits it rather than carrying a wrong value.
+/// When the environment says nothing, [`host_facts`] falls back to the
+/// platform's own setting (`hostinfo::locale`, Windows only). The field is
+/// optional, so a host with neither simply omits it.
 fn locale() -> Option<String> {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()

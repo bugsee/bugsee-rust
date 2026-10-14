@@ -11,6 +11,8 @@
 //! and after stop.
 
 use std::io;
+#[cfg(unix)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -143,6 +145,8 @@ impl Bugsee {
         config.sample_rate = options.sample_rate;
         config.scrub = options.scrub.clone();
         config.rate_limit = options.rate_limit.clone();
+        config.launch_recovery_budget = options.launch_recovery_budget;
+        config.release_health = options.release_health;
         config.app_identity = bugsee_core::model::environment::AppIdentity {
             package_id: options.app_package_id.clone(),
             version: options.app_version.clone(),
@@ -180,6 +184,7 @@ impl Bugsee {
 
         #[cfg(feature = "panic")]
         let panic_info_path = recorder.panic_info_path();
+        let recovery_handle = recorder.handle();
 
         // Install the native crash handler pointing at this generation's marker.
         // Replace under a brief lock, then drop the OLD handler outside it.
@@ -232,6 +237,14 @@ impl Bugsee {
             bugsee_panic::set_report_from_hook(options.report_panics_from_hook);
         }
 
+        register_exit_flush(options.flush_at_exit);
+        // Last, once the native handler and the panic hook are in place: a fault
+        // inside the recovery pass is then recorded, with a stack, against THIS
+        // session (the previous crash's evidence stays on disk and is retried,
+        // attempt-counted). Run outside every lock: it can call the host's
+        // `before_send` on a helper thread, and waits at most the launch budget.
+        recovery_handle.recover_on_launch_path();
+
         Ok(LaunchGuard { _private: () })
     }
 
@@ -260,7 +273,58 @@ impl Bugsee {
         })
     }
 
-    /// Stop the SDK and flush pending work (dropping the recorder joins the worker).
+    // Release-health diagnostics (#12). Unstable and hidden: there is no backend
+    // contract for session health, so no stable API is promised for it. They
+    // clone a handle out first, so no file I/O runs under the global lock.
+
+    #[doc(hidden)]
+    pub fn __session_health() -> Option<bugsee_core::health::SessionRecord> {
+        Self::handle()?.session_health()
+    }
+
+    #[doc(hidden)]
+    pub fn __finished_sessions() -> Vec<bugsee_core::health::SessionRecord> {
+        Self::handle()
+            .map(|h| h.finished_sessions())
+            .unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn __acknowledge_session(generation: u64) {
+        if let Some(h) = Self::handle() {
+            h.acknowledge_session(generation);
+        }
+    }
+
+    /// Stop the SDK: persist everything captured so far, then end the session
+    /// cleanly. Idempotent, and a no-op when not launched. Never uploads.
+    ///
+    /// # The shutdown contract
+    ///
+    /// | Exit path | Captured data and queued reports | Next launch |
+    /// |---|---|---|
+    /// | `stop`/`shutdown`, or the launch guard dropped (return from `main`) | Everything captured is persisted; a report not yet uploaded stays in the durable queue | No abnormal-exit report; queued reports are delivered once |
+    /// | `exit()` / `process::exit` | As above only with [`LaunchOptions::flush_at_exit`]; otherwise whatever the worker had already written | With the option: as above. Without: one abnormal-exit report |
+    /// | `SIGTERM`/`SIGINT` with [`Bugsee::install_termination_flush`] | Flushed (bounded), then a clean stop if the signal would have terminated the process | As the first row. The host's own handler is still called |
+    /// | `SIGTERM`/`SIGINT` without the hook, `SIGKILL`, OOM kill, power loss | Records are appended as the worker drains them, so completed records and queued reports survive; the last few in flight may not | One abnormal-exit report, carrying the recovered window |
+    /// | Fatal signal, aborting panic, unwinding panic out of `main` | See the crash capture docs | One crash report |
+    ///
+    /// A stopped session's marker is gone and a recovered one is consumed when
+    /// its report is queued, so a graceful stop followed by a restart reports
+    /// nothing twice. Delivery itself is **at-least-once**: a process killed
+    /// while a report's upload was in flight may send it again next launch. In
+    /// memory mode (see [`StorageMode`]) nothing survives the process: `flush`
+    /// before exiting is the real guarantee, and `stop` only gives the
+    /// in-memory backlog one last attempt of at most 1.5 s.
+    ///
+    /// Bounds: `stop` waits at most 2 s each for the capture worker and the
+    /// uploader to acknowledge. If the worker does not (a host callback
+    /// wedged), the marker is deliberately left, so the session is recovered
+    /// rather than lost. The uploader does not gate the marker: an upload in
+    /// flight (an HTTP call can outlast the 2 s) is abandoned and its report
+    /// re-sent next launch. It is not async-signal-safe and must not be called from a signal
+    /// handler (use [`Bugsee::install_termination_flush`]). In a `fork` child
+    /// it acts on that child's own recorder.
     pub fn stop() {
         check_fork();
         #[cfg(feature = "native")]
@@ -274,6 +338,69 @@ impl Bugsee {
         // if a thread were wedged).
         let recorder = RECORDER.lock().take();
         drop(recorder);
+    }
+
+    /// Flush, then stop: the one call to make before a deliberate exit.
+    ///
+    /// Waits up to `timeout` for captured work to be persisted and the upload
+    /// queue to drain ([`Bugsee::flush`]), then [`Bugsee::stop`]s, which ends
+    /// the session cleanly whatever the flush returned. Returns the flush
+    /// result: `true` if every report was delivered. `false` is not a loss —
+    /// undelivered reports stay in the durable queue for the next launch (in
+    /// disk mode) — and also covers "not launched". Idempotent. Worst-case time is
+    /// `timeout` plus about 4 s (the two 2 s acknowledgement bounds on `stop`).
+    pub fn shutdown(timeout: Duration) -> bool {
+        let flushed = Self::flush(timeout);
+        Self::stop();
+        flushed
+    }
+
+    /// Opt in to flushing on `SIGTERM`/`SIGINT` (unix) or console control
+    /// events (Windows: Ctrl+C, Ctrl+Break, close, logoff, shutdown).
+    ///
+    /// Containers and process managers stop a service with `SIGTERM` and kill it
+    /// after a grace period; without this the process dies with the signal's
+    /// default action and the next launch reports an abnormal termination. It is
+    /// never installed by default and it never takes the signal from you:
+    ///
+    /// - **Unix.** The handler only writes to a self-pipe, then calls whatever
+    ///   handler was installed before it. A thread does the flush. If the
+    ///   previous disposition was the default (terminate), it runs
+    ///   [`Bugsee::shutdown`] with `timeout`, restores the default and re-raises
+    ///   the signal, so the exit status is unchanged and only delayed; a second
+    ///   signal meanwhile terminates at once. If the host had its own handler (or
+    ///   ignores the signal) the SDK only flushes, and the host decides when to
+    ///   exit and ends the session by dropping the guard / calling `stop`. Call
+    ///   this **after** installing your own handler, or make yours chain: a
+    ///   handler installed later that does not chain replaces this one.
+    ///   Signals covered: `SIGTERM`, `SIGINT`. A `fork` child inherits the
+    ///   handler but not its thread; it terminates by default as usual, and
+    ///   calling this again in the child re-arms it there.
+    /// - **Windows.** A console control handler that runs [`Bugsee::shutdown`]
+    ///   (flush, then a clean stop) for Ctrl+C, Ctrl+Break, close, logoff and
+    ///   shutdown, then returns `FALSE` so the next handler still runs. Windows
+    ///   cannot tell it whether that next handler will end the process, so a
+    ///   host that handles Ctrl+C itself and keeps running must register its
+    ///   handler **after** this call (handlers run last-registered first, so
+    ///   its swallowing the event means ours never runs). Windows gives
+    ///   close/logoff/shutdown handlers only a few seconds: use a short
+    ///   `timeout`. A service-control stop is not a console event and is not
+    ///   covered; call [`Bugsee::shutdown`] from your stop handler.
+    ///
+    ///
+    /// If the signal is ignored (`SIG_IGN`) when this is called, it is left
+    /// alone. If the host installs its own handler **after** this call, the SDK
+    /// notices (it asks the kernel what is in force) and only flushes, never
+    /// terminating the process; a host handler that itself calls `exit` while
+    /// [`LaunchOptions::flush_at_exit`] is on would run `shutdown` in signal
+    /// context and can deadlock, so end the process from a normal thread.
+    ///
+    /// Idempotent; a second call only updates `timeout`. Works before `launch`
+    /// (it flushes nothing until there is something to flush). Choose `timeout`
+    /// below your orchestrator's grace period (Kubernetes defaults to 30 s) by
+    /// at least the ~4 s stop bounds.
+    pub fn install_termination_flush(timeout: Duration) -> io::Result<()> {
+        crate::termination::install(timeout)
     }
 
     /// Whether the SDK is launched and not paused.
@@ -464,6 +591,13 @@ impl Bugsee {
     }
 
     /// Block until pending work drains, or `timeout` elapses.
+    ///
+    /// Persists everything captured before the call and tries to upload every
+    /// queued report; returns `true` only if the outbound queue is then empty
+    /// (`false` on timeout, a failing transport, or when not launched).
+    /// Idempotent, callable from any thread, and it leaves the SDK running. A
+    /// `false` loses nothing in disk mode: the reports stay queued. Not
+    /// async-signal-safe. See [`Bugsee::stop`] for the per-exit-path contract.
     pub fn flush(timeout: Duration) -> bool {
         // Off-lock: flush blocks; must not hold the mutex across the wait.
         Self::handle().map(|h| h.flush(timeout)).unwrap_or(false)
@@ -489,6 +623,51 @@ impl Bugsee {
         RECORDER.lock().as_ref().map(|r| r.handle())
     }
 }
+
+/// Exit-time flush timeout in milliseconds, `0` when not requested.
+#[cfg(unix)]
+static EXIT_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+/// The process that registered the `atexit` handler. A `fork` child inherits
+/// the registration, and running `shutdown` there would revive the SDK in a
+/// process that may be mid-`fork`-and-`exec`; the child must do its own stop.
+#[cfg(unix)]
+static EXIT_FLUSH_PID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(unix)]
+extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+extern "C" fn flush_at_exit() {
+    let ms = EXIT_FLUSH_MS.load(Ordering::SeqCst);
+    if ms > 0 && EXIT_FLUSH_PID.load(Ordering::SeqCst) == std::process::id() {
+        let _ = std::panic::catch_unwind(|| Bugsee::shutdown(Duration::from_millis(ms)));
+    }
+}
+
+/// Arm (or, with `None`, disarm) the `atexit` handler. libc cannot unregister
+/// it, so it is registered once per process and consults the timeout.
+///
+/// Unix only: on Windows `std::process::exit` calls `ExitProcess` directly and
+/// never runs CRT `atexit` handlers, and in a `cdylib` such a handler would run
+/// at DLL detach under the loader lock. Windows hosts call `shutdown`.
+#[cfg(unix)]
+fn register_exit_flush(timeout: Option<Duration>) {
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    let ms = timeout.map_or(0, |t| t.as_millis().clamp(1, u64::MAX as u128) as u64);
+    EXIT_FLUSH_MS.store(ms, Ordering::SeqCst);
+    EXIT_FLUSH_PID.store(std::process::id(), Ordering::SeqCst);
+    if ms > 0 && !REGISTERED.swap(true, Ordering::SeqCst) {
+        // SAFETY: registering a plain `extern "C"` function.
+        unsafe {
+            atexit(flush_at_exit);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn register_exit_flush(_timeout: Option<Duration>) {}
 
 /// If this process was `fork()`ed since the SDK last looked, rebuild what the
 /// fork did not carry over. Cheap on the hot path: one atomic load.

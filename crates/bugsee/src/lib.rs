@@ -27,11 +27,14 @@
 
 mod api;
 mod frames;
+#[cfg(feature = "telemetry")]
+mod hostinfo;
 mod options;
 mod perf;
 mod report;
 #[cfg(feature = "telemetry")]
 mod telemetry;
+mod termination;
 #[cfg(feature = "net")]
 pub mod transport;
 
