@@ -69,13 +69,28 @@ production-quality binding, **P2** polish / later.
   SDK returns no pointers at all. That is the right default and means nothing
   needs a `bugsee_free` yet — but it is nowhere written down. Write it in the
   header (it is the single most-asked FFI question).
-- Encoding is UTF-8; invalid UTF-8 → `INVALID_ARGUMENT` (fine, but undocumented;
-  Windows hosts hold UTF-16 and must convert).
-- NULL handling is **inconsistent**: `bugsee_capture_exception` silently accepts
-  NULL (defaults to `"Exception"` / `""`), every other function rejects it.
-  `bugsee_set_email(NULL)` is an error, so a host **cannot clear** an email, and
-  there is no `clear_attribute` at all (the Rust API has both). Pick one rule:
-  NULL is `INVALID_ARGUMENT` unless the parameter is documented nullable.
+- Encoding is UTF-8 (Windows hosts hold UTF-16 and must convert). Invalid
+  UTF-8 is `INVALID_ARGUMENT` for **every** string parameter, required or
+  optional (see the inventory below; fixed in this PR via `cstr_opt`, which
+  separates NULL from invalid UTF-8). Previously `cstr()` collapsed both to
+  `None`, so optional args silently took their default on a botched string,
+  e.g. a mis-encoded `endpoint` override launched against production.
+- NULL inventory (verified in `crates/bugsee-ffi/src/lib.rs`):
+
+  | Function / parameter | NULL | Invalid UTF-8 |
+  |---|---|---|
+  | `bugsee_launch_with_endpoint(app_token)` | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+  | `bugsee_launch_with_endpoint(endpoint)` | optional: default endpoint | `INVALID_ARGUMENT` |
+  | `bugsee_event_with_params(name)` | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+  | `bugsee_event_with_params(params_json)` | optional: empty object | `INVALID_ARGUMENT` |
+  | `bugsee_capture_exception(name)` | optional: `"Exception"` | `INVALID_ARGUMENT` |
+  | `bugsee_capture_exception(reason)` | optional: `""` | `INVALID_ARGUMENT` |
+  | all other string params (`log`, `event`, `trace`, `set_email`, `set_attribute` key/value, ...) | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+
+  `bugsee_set_email(NULL)` is an error, so a host **cannot clear** an email,
+  and there is no `clear_attribute` at all (the Rust API has both). Rule to
+  document in the header: NULL is `INVALID_ARGUMENT` unless the parameter is
+  listed above as optional.
 - NUL-terminated strings cap the data a host can pass (no embedded NUL, a copy
   for hosts whose strings are length-prefixed, e.g. PHP, Ruby, Dart). Add
   `(ptr, len)` variants for the payload-bearing calls (JSON bodies, messages).
@@ -220,7 +235,7 @@ header mistakes that Rust-to-Rust tests cannot.
 | 2 | Opaque options handle + setters; `bugsee_launch(options)` | P0 | 1 |
 | 3 | Last-error + `bugsee_status_string`; new status codes | P0 | 1 |
 | 4 | `bugsee_report_error` (structured external errors) + unhandled-exception path | P0 | 3 |
-| 5 | Header documentation pass: ownership, threads, lifecycle table (§2.3–2.4); consistent NULL / level / not-launched rules; `(ptr,len)` variants; `clear_*` | P1 | — |
+| 5 | Header documentation pass: ownership, threads, lifecycle table (§2.3–2.4); document the §2.3 NULL inventory (invalid UTF-8 on optional args is already `INVALID_ARGUMENT`, fixed in this PR); consistent level / not-launched rules; `(ptr,len)` variants; `clear_*` | P1 | — |
 | 6 | Split `HttpTransport` into protocol + HTTP primitive; callback transport in FFI | P1 | 2, 3 |
 | 7 | Export macro, linker export lists (ELF/Mach-O/PE), `bugsee.pc`, native-libs doc | P1 | — |
 | 8 | C smoke tests against the static and shared artifacts in CI | P1 | 7 |
@@ -230,3 +245,7 @@ header mistakes that Rust-to-Rust tests cannot.
 Items 1–3 and 5 are small and should land together; 4 and 6 are the ones that
 need design discussion first (4: unhandled path durability; 6: foreign-thread
 callback contract).
+
+The issue also asked for follow-up issues to be filed for the items above
+(at minimum 1-4, 6 and 9). They are not created by this PR and should be
+opened by the maintainers from this table.

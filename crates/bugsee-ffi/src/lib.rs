@@ -62,6 +62,22 @@ unsafe fn cstr(ptr: *const c_char) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Read an *optional* string argument: `Ok(None)` for NULL, `Ok(Some(_))` for
+/// valid UTF-8, `Err(())` for invalid UTF-8 (callers map that to
+/// `InvalidArgument` rather than silently using the default).
+///
+/// # Safety
+/// Same as [`cstr`].
+unsafe fn cstr_opt(ptr: *const c_char) -> Result<Option<String>, ()> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map(|s| Some(s.to_owned()))
+        .map_err(|_| ())
+}
+
 /// Run `f` inside a panic boundary, mapping a contained panic to `Panic`.
 fn guarded(f: impl FnOnce() -> BugseeStatus) -> BugseeStatus {
     match bugsee::guard(f) {
@@ -98,7 +114,10 @@ pub unsafe extern "C" fn bugsee_launch_with_endpoint(
             return BugseeStatus::InvalidArgument;
         };
         let mut options = LaunchOptions::new(token);
-        if let Some(ep) = unsafe { cstr(endpoint) } {
+        let Ok(endpoint) = (unsafe { cstr_opt(endpoint) }) else {
+            return BugseeStatus::InvalidArgument;
+        };
+        if let Some(ep) = endpoint {
             options = options.endpoint(ep);
         }
         launch_with_options(options)
@@ -196,7 +215,10 @@ pub unsafe extern "C" fn bugsee_event_with_params(
         let Some(name) = (unsafe { cstr(name) }) else {
             return BugseeStatus::InvalidArgument;
         };
-        let params = match unsafe { cstr(params_json) } {
+        let Ok(params_json) = (unsafe { cstr_opt(params_json) }) else {
+            return BugseeStatus::InvalidArgument;
+        };
+        let params = match params_json {
             Some(json) => match serde_json::from_str::<Map<String, Value>>(&json) {
                 Ok(m) => m,
                 Err(_) => return BugseeStatus::InvalidArgument,
@@ -279,8 +301,12 @@ pub unsafe extern "C" fn bugsee_capture_exception(
     reason: *const c_char,
 ) -> BugseeStatus {
     guarded(|| {
-        let name = unsafe { cstr(name) }.unwrap_or_else(|| "Exception".to_string());
-        let reason = unsafe { cstr(reason) }.unwrap_or_default();
+        let (Ok(name), Ok(reason)) = (unsafe { cstr_opt(name) }, unsafe { cstr_opt(reason) })
+        else {
+            return BugseeStatus::InvalidArgument;
+        };
+        let name = name.unwrap_or_else(|| "Exception".to_string());
+        let reason = reason.unwrap_or_default();
         Bugsee::capture_message(LogLevel::Error, format!("{name}: {reason}"));
         BugseeStatus::Ok
     })
@@ -347,5 +373,38 @@ mod tests {
         assert_eq!(status, BugseeStatus::InvalidArgument);
         let status = unsafe { bugsee_event(std::ptr::null()) };
         assert_eq!(status, BugseeStatus::InvalidArgument);
+    }
+
+    #[test]
+    fn invalid_utf8_on_optional_args_is_rejected() {
+        let bad = c"\xff\xfe".as_ptr();
+        let ok = c"x".as_ptr();
+        unsafe {
+            assert_eq!(
+                bugsee_launch_with_endpoint(ok, bad),
+                BugseeStatus::InvalidArgument
+            );
+            assert_eq!(
+                bugsee_event_with_params(ok, bad),
+                BugseeStatus::InvalidArgument
+            );
+            assert_eq!(
+                bugsee_capture_exception(bad, ok),
+                BugseeStatus::InvalidArgument
+            );
+            assert_eq!(
+                bugsee_capture_exception(ok, bad),
+                BugseeStatus::InvalidArgument
+            );
+            // NULL stays legal on optional args.
+            assert_eq!(
+                bugsee_capture_exception(std::ptr::null(), std::ptr::null()),
+                BugseeStatus::Ok
+            );
+            assert_eq!(
+                bugsee_event_with_params(ok, std::ptr::null()),
+                BugseeStatus::Ok
+            );
+        }
     }
 }
