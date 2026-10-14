@@ -96,7 +96,9 @@ impl Bugsee {
                 .or_else(|| (!skipped.is_empty()).then(|| skipped.join("; ")))
                 .unwrap_or_else(|| "no usable data directory".to_string())
         });
-        let data_dir = dir.unwrap_or_else(|| std::env::temp_dir().join("bugsee"));
+        // Memory mode never touches the path; an empty one avoids resolving a
+        // temp directory just to ignore it.
+        let data_dir = dir.unwrap_or_default();
         if memory_only.is_none() && !skipped.is_empty() {
             static WARNED: AtomicBool = AtomicBool::new(false);
             bugsee_core::util::warn_once(
@@ -586,9 +588,23 @@ fn revive_after_fork(epoch: u64) {
     #[cfg(feature = "panic")]
     if recorder.storage_mode() == StorageMode::Disk {
         bugsee_panic::set_snapshot_path(recorder.panic_info_path());
+    } else {
+        // The inherited path points into the PARENT's live session; a panic here
+        // must not write its snapshot there.
+        bugsee_panic::clear_snapshot_path();
     }
 
-    *RECORDER.lock() = Some(recorder);
+    // Lock order RECORDER -> RESOLUTION, as in `launch_with`/`storage_status`.
+    {
+        let mut slot = RECORDER.lock();
+        if recorder.storage_mode() == StorageMode::Memory {
+            if let Some(resolved) = RESOLUTION.lock().as_mut() {
+                resolved.dir = None;
+                resolved.source = DataDirSource::None;
+            }
+        }
+        *slot = Some(recorder);
+    }
     *failures = 0;
     SEEN_FORK_EPOCH.store(epoch, Ordering::SeqCst);
 }

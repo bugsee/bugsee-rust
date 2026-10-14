@@ -209,13 +209,16 @@ fn queue_write_failure_holds_the_report_in_memory() {
 }
 
 #[test]
-fn legacy_directory_leftovers_are_delivered_once() {
+fn legacy_directory_leftovers_are_delivered_once_and_cleaned_up() {
+    use bugsee_core::capture::record;
     use bugsee_core::model::report::TimeWindow;
     use bugsee_core::reporting::assemble_docs;
 
     let dir = TempDir::new();
     let legacy = dir.path.join("legacy");
     let data_dir = dir.path.join("data");
+
+    // A report an old build queued but never delivered...
     let meta = manual_upload_meta();
     let env = bugsee_core::model::environment::Environment::detect_with(
         "t",
@@ -226,23 +229,41 @@ fn legacy_directory_leftovers_are_delivered_once() {
     let stranded = assemble_docs(Vec::new(), window, &meta, &env, None, &[], "T", 1).unwrap();
     bugsee_core::queue::enqueue(&legacy, &stranded).unwrap();
 
+    // ...and a session of that build that died (marker left behind, owner gone).
+    let part = legacy.join("parts").join("1").join("0");
+    std::fs::create_dir_all(&part).unwrap();
+    let mut bytes = Vec::new();
+    let payload = br#"{"timestamp":100,"level":1,"source":2,"message":"legacy crash line"}"#;
+    record::frame(100, payload, &mut bytes);
+    std::fs::write(part.join("log.part"), &bytes).unwrap();
+    std::fs::create_dir_all(legacy.join("sessions")).unwrap();
+    std::fs::write(legacy.join("sessions").join("1.alive"), "0").unwrap();
+    std::fs::write(legacy.join("gen"), "1").unwrap();
+
     let transport = Arc::new(MockTransport::default());
     let mut config = RecorderConfig::new(&data_dir, "T");
     config.legacy_data_dir = Some(legacy.clone());
     let recorder = Recorder::launch(config, transport.clone()).expect("launch");
+
+    // Recovery runs on the worker before the flush is acknowledged, and a flush
+    // drains the legacy queue too.
     assert!(recorder.flush(Duration::from_secs(10)));
-    // The startup drain is asynchronous; flush covers only the data dir queue.
-    let start = std::time::Instant::now();
-    while transport.uploaded_bundles.lock().unwrap().is_empty()
-        && start.elapsed() < Duration::from_secs(10)
-    {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 1);
-    assert!(
-        bugsee_core::queue::list_pending(&legacy).is_empty(),
-        "a delivered legacy report must be removed"
+    assert_eq!(
+        transport.uploaded_bundles.lock().unwrap().len(),
+        2,
+        "the queued report and the recovered crash"
     );
+    assert!(bugsee_core::queue::list_pending(&legacy).is_empty());
+    assert!(
+        !legacy.join("sessions").join("1.alive").exists(),
+        "the recovered session's marker must be gone"
+    );
+    assert!(!legacy.join("parts").join("1").exists());
+
+    // Nothing is delivered a second time, however long we wait.
+    assert!(recorder.flush(Duration::from_secs(10)));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 2);
 }
 
 /// Blocks every delivery until released, so the backlog cannot drain.

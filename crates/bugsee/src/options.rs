@@ -238,7 +238,7 @@ impl LaunchOptions {
             self.data_dir.as_deref(),
             &self.app_token,
             &|name| std::env::var_os(name),
-            &std::env::temp_dir(),
+            &std::env::temp_dir,
         )
     }
 }
@@ -304,7 +304,7 @@ pub(crate) fn resolve_data_dir(
     explicit: Option<&Path>,
     app_token: &str,
     env: &dyn Fn(&str) -> Option<OsString>,
-    temp: &Path,
+    temp: &dyn Fn() -> PathBuf,
 ) -> DataDirResolution {
     let token = short_token(app_token);
 
@@ -334,6 +334,8 @@ pub(crate) fn resolve_data_dir(
         };
     }
 
+    // Only now: an explicit directory never needs the temp location.
+    let temp = temp();
     let mut candidates: Vec<(DataDirSource, PathBuf, bool)> = Vec::new();
     if let Some(base) = platform_data_base(env) {
         candidates.push((
@@ -363,8 +365,8 @@ pub(crate) fn resolve_data_dir(
     let legacy = temp.join("bugsee").join(&token);
     let legacy_dir = found
         .as_ref()
-        .filter(|(_, dir)| *dir != legacy)
-        .and_then(|_| trusted_existing_dir(&legacy).then_some(legacy));
+        .filter(|(_, dir)| legacy_is_adoptable(&legacy, dir))
+        .map(|_| legacy);
     match found {
         Some((source, dir)) => DataDirResolution {
             dir: Some(dir),
@@ -485,6 +487,24 @@ fn owned_by_us(_meta: &std::fs::Metadata) -> bool {
     true
 }
 
+/// Whether `legacy` (`<temp>/bugsee/<token>`) may be recovered from. Both it AND
+/// `<temp>/bugsee` must be real directories owned by us: a symlink at either
+/// would let someone else's tree, or our own live data directory, be processed
+/// (recovering our live session as a crash). Paths are compared canonicalised,
+/// not as strings, so another spelling of our own directory is rejected too.
+fn legacy_is_adoptable(legacy: &Path, chosen: &Path) -> bool {
+    let Some(parent) = legacy.parent() else {
+        return false;
+    };
+    if !trusted_existing_dir(parent) || !trusted_existing_dir(legacy) {
+        return false;
+    }
+    match (legacy.canonicalize(), chosen.canonicalize()) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => false,
+    }
+}
+
 /// Prove a file can be created in `dir`. `create_new` with an unpredictable name
 /// refuses to follow or reuse anything pre-planted at that path.
 fn probe_writable(dir: &Path) -> std::io::Result<()> {
@@ -601,7 +621,7 @@ mod tests {
         let s = scratch();
         let explicit = s.join("explicit");
         let env = [(DATA_DIR_ENV, s.join("from-env").into_os_string())];
-        let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&env), &s.join("tmp"));
+        let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&env), &|| s.join("tmp"));
         assert_eq!(r.source, DataDirSource::Explicit);
         assert_eq!(r.dir.as_deref(), Some(explicit.as_path()));
         assert!(r.skipped.is_empty() && r.explicit_rejected.is_none());
@@ -615,12 +635,9 @@ mod tests {
         let env = [(DATA_DIR_ENV, good_env.clone().into_os_string())];
         let mut full_env = env.to_vec();
         full_env.extend(home_env(&s.join("home")));
-        let r = resolve_data_dir(
-            Some(&blocked(&s, "f1")),
-            "tok",
-            &env_of(&full_env),
-            &s.join("tmp"),
-        );
+        let r = resolve_data_dir(Some(&blocked(&s, "f1")), "tok", &env_of(&full_env), &|| {
+            s.join("tmp")
+        });
         assert!(r.dir.is_none());
         assert_eq!(r.source, DataDirSource::None);
         assert!(r.explicit_rejected.is_some());
@@ -637,7 +654,7 @@ mod tests {
         let s = scratch();
         let mut env = vec![(DATA_DIR_ENV, blocked(&s, "f2").into_os_string())];
         env.extend(home_env(&s.join("home")));
-        let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &|| s.join("tmp"));
         assert!(r.dir.is_none() && r.explicit_rejected.is_some());
         assert!(!s.join("home").exists() && !s.join("tmp").exists());
         let _ = std::fs::remove_dir_all(&s);
@@ -648,7 +665,7 @@ mod tests {
         let s = scratch();
         let good = s.join("from-env");
         let env = [(DATA_DIR_ENV, good.clone().into_os_string())];
-        let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &|| s.join("tmp"));
         assert_eq!(r.source, DataDirSource::Environment);
         assert_eq!(r.dir, Some(good));
         let _ = std::fs::remove_dir_all(&s);
@@ -658,7 +675,7 @@ mod tests {
     fn platform_default_is_used_when_home_is_set() {
         let s = scratch();
         let home = s.join("home");
-        let r = resolve_data_dir(None, "tok-1", &env_of(&home_env(&home)), &s.join("tmp"));
+        let r = resolve_data_dir(None, "tok-1", &env_of(&home_env(&home)), &|| s.join("tmp"));
         assert_eq!(r.source, DataDirSource::PlatformDefault);
         assert!(r.dir.unwrap().starts_with(&home));
         let _ = std::fs::remove_dir_all(&s);
@@ -668,7 +685,7 @@ mod tests {
     fn no_home_falls_back_to_a_private_temp_directory() {
         let s = scratch();
         let tmp = s.join("tmp");
-        let r = resolve_data_dir(None, "tok-1", &env_of(&[]), &tmp);
+        let r = resolve_data_dir(None, "tok-1", &env_of(&[]), &|| tmp.clone());
         assert_eq!(r.source, DataDirSource::TempFallback);
         let dir = r.dir.unwrap();
         assert_eq!(dir, tmp.join(private_temp_name()).join("tok1"));
@@ -692,7 +709,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, tmp.join(private_temp_name())).unwrap();
-        let r = resolve_data_dir(None, "tok", &env_of(&[]), &tmp);
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
         assert!(r.dir.is_none(), "must not follow the symlink");
         assert_eq!(r.skipped.len(), 1);
         assert!(
@@ -706,12 +723,9 @@ mod tests {
     fn nothing_writable_resolves_to_none_and_lists_every_default_attempt() {
         let s = scratch();
         let blocked_home = blocked(&s, "f3");
-        let r = resolve_data_dir(
-            None,
-            "tok",
-            &env_of(&home_env(&blocked_home)),
-            &blocked(&s, "f4"),
-        );
+        let r = resolve_data_dir(None, "tok", &env_of(&home_env(&blocked_home)), &|| {
+            blocked(&s, "f4")
+        });
         assert_eq!(r.source, DataDirSource::None);
         assert!(r.dir.is_none());
         assert_eq!(r.skipped.len(), 2);
@@ -722,7 +736,7 @@ mod tests {
     fn an_empty_environment_variable_is_ignored() {
         let s = scratch();
         let env = [(DATA_DIR_ENV, OsString::new())];
-        let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &|| s.join("tmp"));
         assert_eq!(r.source, DataDirSource::TempFallback);
         let _ = std::fs::remove_dir_all(&s);
     }
@@ -733,18 +747,73 @@ mod tests {
     fn the_previous_default_location_is_offered_for_recovery_only_if_it_exists() {
         let s = scratch();
         let tmp = s.join("tmp");
-        let r = resolve_data_dir(None, "tok", &env_of(&[]), &tmp);
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
         assert!(r.legacy_dir.is_none(), "nothing to adopt yet");
 
         let legacy = tmp.join("bugsee").join("tok");
         std::fs::create_dir_all(&legacy).unwrap();
-        let r = resolve_data_dir(None, "tok", &env_of(&[]), &tmp);
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
         assert_eq!(r.legacy_dir, Some(legacy.clone()));
 
         // A host that chose its directory never used the legacy one.
         let explicit = s.join("explicit");
-        let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&[]), &tmp);
+        let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&[]), &|| tmp.clone());
         assert!(r.legacy_dir.is_none());
+        let _ = std::fs::remove_dir_all(&s);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_legacy_location_is_never_adopted() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let other = s.join("other");
+        std::fs::create_dir_all(other.join("tok")).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        // `<temp>/bugsee` itself is a symlink to a tree that has our token dir.
+        std::os::unix::fs::symlink(&other, tmp.join("bugsee")).unwrap();
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
+        assert!(r.dir.is_some() && r.legacy_dir.is_none());
+
+        // The token directory itself being a symlink is refused as well.
+        std::fs::remove_file(tmp.join("bugsee")).unwrap();
+        std::fs::create_dir_all(tmp.join("bugsee")).unwrap();
+        std::os::unix::fs::symlink(other.join("tok"), tmp.join("bugsee").join("tok")).unwrap();
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
+        assert!(r.legacy_dir.is_none());
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    // The platform default must be `<XDG_DATA_HOME>/bugsee/<token>` to collide.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn the_legacy_location_is_skipped_when_it_is_our_own_directory_by_another_spelling() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let legacy = tmp.join("bugsee").join("tok");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // The platform default resolves to the same directory, spelled with `..`.
+        let base = tmp.join("elsewhere").join("..");
+        std::fs::create_dir_all(tmp.join("elsewhere")).unwrap();
+        let env = [
+            ("HOME", base.clone().into_os_string()),
+            ("XDG_DATA_HOME", base.into_os_string()),
+        ];
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &|| tmp.clone());
+        assert_eq!(r.source, DataDirSource::PlatformDefault);
+        assert!(
+            r.legacy_dir.is_none(),
+            "our live data directory must not be recovered as a legacy one"
+        );
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn an_explicit_directory_never_asks_for_the_temp_location() {
+        let s = scratch();
+        let r = resolve_data_dir(Some(&s.join("explicit")), "tok", &env_of(&[]), &|| {
+            panic!("temp_dir must not be resolved eagerly")
+        });
+        assert_eq!(r.source, DataDirSource::Explicit);
         let _ = std::fs::remove_dir_all(&s);
     }
 }

@@ -834,6 +834,10 @@ fn spawn_pipeline(
     let uploader_shared = Arc::clone(shared);
     let uploader_data_dir = data_dir.map(Path::to_path_buf);
     let uploader_legacy = legacy_data_dir.clone();
+    // Set once the worker has finished recovering the legacy directory, so the
+    // uploader does not retire it while recovery is still about to fill its queue.
+    let legacy_ready = Arc::new(AtomicBool::new(legacy_data_dir.is_none()));
+    let uploader_ready = Arc::clone(&legacy_ready);
     let uploader = std::thread::Builder::new()
         .name("bugsee-uploader".into())
         .spawn(move || {
@@ -842,6 +846,7 @@ fn spawn_pipeline(
                 uploader_shared,
                 uploader_data_dir,
                 uploader_legacy,
+                uploader_ready,
                 backoff_base,
                 fresh_launch,
             )
@@ -878,9 +883,11 @@ fn spawn_pipeline(
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 if let Some(dir) = &legacy_data_dir {
+                    queue::gc_orphans(dir);
                     run_recovery(&worker_shared, dir, u64::MAX);
                 }
             }));
+            legacy_ready.store(true, Ordering::SeqCst);
             let _ = worker_upload_tx.send(UploadMsg::Wake);
             worker_loop(
                 rx,
@@ -1348,11 +1355,12 @@ fn uploader_loop(
     shared: Arc<Shared>,
     data_dir: Option<PathBuf>,
     legacy_data_dir: Option<PathBuf>,
+    legacy_ready: Arc<AtomicBool>,
     backoff_base: Duration,
     fresh_launch: bool,
 ) {
     let poll = Duration::from_secs(5);
-    let legacy = legacy_data_dir;
+    let mut legacy = legacy_data_dir;
     // A fresh launch retries any queued report immediately (force), ignoring
     // backoff scheduled by the prior session. A fork child skips this: the
     // parent's uploader is already working the shared queue. Guarded so a
@@ -1383,7 +1391,12 @@ fn uploader_loop(
             }
             Ok(UploadMsg::Drain { deadline, ack }) => {
                 let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain_until_empty(&shared, data_dir.as_deref(), backoff_base, deadline)
+                    let dirs: Vec<&Path> = data_dir
+                        .as_deref()
+                        .into_iter()
+                        .chain(legacy.as_deref())
+                        .collect();
+                    drain_until_empty(&shared, &dirs, backoff_base, deadline)
                 }))
                 .unwrap_or(false);
                 let _ = ack.send(empty);
@@ -1405,6 +1418,21 @@ fn uploader_loop(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        retire_legacy(&mut legacy, &legacy_ready);
+    }
+}
+
+/// Stop polling the legacy directory once recovery has run (it runs once per
+/// launch, so nothing new can appear) and its queue is empty.
+fn retire_legacy(legacy: &mut Option<PathBuf>, ready: &AtomicBool) {
+    if !ready.load(Ordering::SeqCst) {
+        return;
+    }
+    if legacy
+        .as_deref()
+        .is_some_and(|dir| queue::list_pending(dir).is_empty())
+    {
+        *legacy = None;
     }
 }
 
@@ -1672,7 +1700,7 @@ fn backoff_delay(retry: u32, base: Duration) -> i64 {
 /// whether the queue ended up empty.
 fn drain_until_empty(
     shared: &Shared,
-    data_dir: Option<&Path>,
+    dirs: &[&Path],
     backoff_base: Duration,
     deadline: Duration,
 ) -> bool {
@@ -1680,7 +1708,7 @@ fn drain_until_empty(
     loop {
         let now = epoch_ms();
         drain_memory(shared, backoff_base, true, false, Some(start + deadline));
-        if let Some(data_dir) = data_dir {
+        for &data_dir in dirs {
             for report in queue::list_pending(data_dir) {
                 let Some(_claim) = queue::try_claim(&report) else {
                     continue; // a peer is delivering it; the loop below waits it out
@@ -1704,7 +1732,7 @@ fn drain_until_empty(
                 }
             }
         }
-        let disk_empty = data_dir.is_none_or(|d| queue::list_pending(d).is_empty());
+        let disk_empty = dirs.iter().all(|d| queue::list_pending(d).is_empty());
         if disk_empty && shared.mem_queue.lock().is_empty() {
             return true;
         }

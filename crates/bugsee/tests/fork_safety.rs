@@ -519,6 +519,68 @@ fn a_panic_in_the_child_before_touching_the_sdk_does_not_write_into_the_parents_
     let _ = std::fs::remove_dir_all(&out);
 }
 
+/// A child that cannot open its own session falls back to memory. It must then
+/// stop pointing the panic observer into the PARENT's live session, and its
+/// storage status must say it has no directory.
+#[test]
+fn a_child_that_falls_back_to_memory_does_not_write_into_the_parents_session() {
+    let _serial = serial();
+    let data = scratch("data");
+    let out = scratch("out");
+    let guard = Bugsee::launch_with(
+        LaunchOptions::new("APP_TOKEN")
+            .data_dir(&data)
+            .native_crash_capture(false)
+            .with_transport(FileTransport::new(&out)),
+    )
+    .expect("launch");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Make a NEW session impossible (the child's `Session::begin` needs
+    // `sessions/` to be a directory) while the parent's parts stay writable.
+    let sessions = data.join("sessions");
+    let parked = data.join("sessions.parked");
+    std::fs::rename(&sessions, &parked).unwrap();
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    let child = fork_child(|| {
+        Bugsee::capture_message(LogLevel::Warning, "child-starting"); // revives
+        let Some(status) = Bugsee::storage_status() else {
+            return 2;
+        };
+        if status.mode != bugsee::StorageMode::Memory || status.data_dir.is_some() {
+            return 3;
+        }
+        let _ = std::thread::spawn(|| panic!("child-panic-in-memory-mode")).join();
+        0
+    });
+    assert!(exited_with(
+        wait_with_deadline(child, Duration::from_secs(30)),
+        0
+    ));
+
+    let stray: Vec<_> = std::fs::read_dir(data.join("parts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join("panic.info"))
+        .filter(|p| p.exists())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the child wrote its panic into its parent's session: {stray:?}"
+    );
+    // The parent is untouched.
+    let parent = Bugsee::storage_status().expect("status");
+    assert_eq!(parent.mode, bugsee::StorageMode::Disk);
+
+    let _ = std::fs::remove_file(&sessions);
+    let _ = std::fs::rename(&parked, &sessions);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 /// Fails transiently until `allow` exists, then behaves like [`FileTransport`].
 struct AllowTransport {
     allow: PathBuf,
