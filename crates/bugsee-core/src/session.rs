@@ -46,7 +46,9 @@ impl Session {
                 .open(&marker)
             {
                 Ok(mut f) => {
-                    let _ = write!(f, "{}", std::process::id());
+                    // "<pid> <start-time>": the start time lets recovery tell this
+                    // process from a later one that reuses the pid.
+                    let _ = write!(f, "{}", crate::process::self_token());
                     break candidate;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

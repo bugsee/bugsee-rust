@@ -23,6 +23,7 @@ pub mod errors;
 pub mod fork;
 pub mod model;
 pub mod panic_info;
+pub(crate) mod process;
 pub mod queue;
 pub mod recovery;
 pub mod reporting;

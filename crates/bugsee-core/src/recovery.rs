@@ -97,11 +97,13 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
             if marker_is_fresh(&marker) {
                 continue;
             }
-        } else if let Ok(pid) = owner.parse::<u32>() {
+        } else if let Some((pid, start)) = crate::process::parse_token(owner) {
             // Skip a marker still owned by a live *other* process. Our own pid is
             // never skipped (a live process cannot share our pid, so a marker
-            // bearing it is a dead prior incarnation — recover it).
-            if pid != self_pid && process_is_alive(pid) {
+            // bearing it is a dead prior incarnation — recover it). The marker
+            // may carry the owner's start time, which tells a recycled pid (a
+            // dead owner whose pid something else now uses) from the owner.
+            if pid != self_pid && crate::process::owner_is_alive(pid, start) {
                 continue;
             }
         }
@@ -144,30 +146,6 @@ fn marker_is_fresh(marker: &Path) -> bool {
                 .unwrap_or(true)
         })
         .unwrap_or(true)
-}
-
-/// Whether a process with `pid` currently exists.
-///
-/// Uses `kill(pid, 0)`, which sends no signal and only probes existence: `0`
-/// (permitted) or `EPERM` (exists, not permitted) both mean *alive*; `ESRCH`
-/// means gone. A rare pid-reuse false-positive can defer recovering a real crash
-/// to a later launch — acceptable vs. corrupting a running peer's live session.
-#[cfg(unix)]
-pub(crate) fn process_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: `kill` with signal 0 performs only an error/permission check and
-    // has no side effects; it is safe to call with any pid value.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// No portable liveness probe off-unix: treat as dead so recovery still proceeds
-/// (single-process is the common case; a live shared-dir peer is a unix concern).
-#[cfg(not(unix))]
-pub(crate) fn process_is_alive(_pid: u32) -> bool {
-    false
 }
 
 /// Build the crash report for a pending session. Precedence: a *fresh* aborting
@@ -348,13 +326,24 @@ pub fn bump_attempts(data_dir: &Path, pending: &PendingSession) -> u32 {
 
 /// Claim a pending session for recovery, so that of several processes sharing the
 /// data directory exactly one recovers it. The claim lives beside the liveness
-/// marker and is released when the returned guard drops.
+/// marker and is released when the returned guard drops. `None` if a peer holds
+/// it or has already recovered the session.
 pub fn claim_pending(data_dir: &Path, pending: &PendingSession) -> Option<crate::claim::Claim> {
-    crate::claim::try_claim(
+    let claim = crate::claim::try_claim(
         &data_dir
             .join("sessions")
             .join(format!("{}.claim", pending.generation)),
-    )
+    )?;
+    // The listing that produced `pending` may be stale: a peer that held this
+    // claim before us can have recovered and discarded the session in between
+    // (its claim released, the marker gone). Recovering it now would deliver a
+    // phantom second report for it. The marker is removed first by `discard`, so
+    // its absence, re-checked while holding the claim, is conclusive.
+    data_dir
+        .join("sessions")
+        .join(format!("{}.alive", pending.generation))
+        .exists()
+        .then_some(claim)
 }
 
 /// Reap leftover on-disk state from generations that no longer have a liveness
@@ -385,6 +374,16 @@ pub fn gc_orphans(data_dir: &Path, current_generation: u64) {
                 if let Ok(generation) = gen_str.parse::<u64>() {
                     if generation < current_generation && !alive(generation) {
                         let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            // A claim left by a holder that died after the session was discarded.
+            // Taking it (which succeeds only if it is stale) and dropping it
+            // removes it; a live holder's claim is left alone.
+            if let Some(gen_str) = name.strip_suffix(".claim") {
+                if let Ok(generation) = gen_str.parse::<u64>() {
+                    if generation < current_generation && !alive(generation) {
+                        drop(crate::claim::try_claim(&entry.path()));
                     }
                 }
             }

@@ -226,6 +226,11 @@ pub fn blacklist_add(data_dir: &Path, sigs: &[String]) {
 /// crash-atomic across its multiple files). Without this they accumulate
 /// unbounded. Call once at startup on the worker thread, before any enqueue, so
 /// it never races this process's own queue writes.
+///
+/// A peer sharing the directory may be mid-`enqueue` right now (sidecars written,
+/// bundle not yet renamed into place), and its in-flight files look exactly like
+/// orphans. Reaping them would strand the bundle without its `.req`, losing the
+/// report, so only files untouched for [`ORPHAN_GRACE`] are reaped.
 pub fn gc_orphans(data_dir: &Path) {
     let dir = queue_dir(data_dir);
     let read = match std::fs::read_dir(&dir) {
@@ -245,13 +250,28 @@ pub fn gc_orphans(data_dir: &Path) {
             .or_else(|| name.strip_suffix(".meta"))
             .or_else(|| name.strip_suffix(".endpoint"))
             .or_else(|| name.strip_suffix(".claim"))
+            .or_else(|| name.strip_suffix(".claim.takeover"))
             .or_else(|| name.strip_suffix(".tmp"));
         if let Some(bundle_name) = bundle_name {
-            if !dir.join(bundle_name).exists() {
+            if !dir.join(bundle_name).exists() && untouched_for(&path, ORPHAN_GRACE) {
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
+}
+
+/// How long an orphan-looking queue file must sit untouched before it is reaped
+/// (see [`gc_orphans`]); far longer than any `enqueue` takes.
+const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether `path` was last modified at least `grace` ago. Unknown or future-dated
+/// times count as recent: the conservative answer never disturbs a live peer.
+fn untouched_for(path: &Path, grace: std::time::Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= grace)
 }
 
 /// Whether any of `sigs` is locally blacklisted (report should be suppressed).
@@ -261,4 +281,31 @@ pub fn any_blacklisted(data_dir: &Path, sigs: &[String]) -> bool {
     }
     let set = load_blacklist(data_dir);
     sigs.iter().any(|s| set.contains(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_spares_a_peers_in_flight_enqueue_and_reaps_old_orphans() {
+        let data = std::env::temp_dir().join(format!("bugsee-qgc-{}", crate::util::random_hex(8)));
+        let dir = queue_dir(&data);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A peer mid-enqueue: sidecars written, bundle not yet renamed into place.
+        let fresh = dir.join("a.bundle.zip.req");
+        std::fs::write(&fresh, "{}").unwrap();
+        let old = dir.join("b.bundle.zip.req");
+        std::fs::write(&old, "{}").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_modified(std::time::SystemTime::now() - ORPHAN_GRACE * 2)
+            .unwrap();
+        drop(f);
+
+        gc_orphans(&data);
+
+        assert!(fresh.exists(), "an in-flight enqueue must not be reaped");
+        assert!(!old.exists(), "an old orphan must be reaped");
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }
