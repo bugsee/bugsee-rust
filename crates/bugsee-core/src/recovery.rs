@@ -128,8 +128,9 @@ fn session_is_crashed(data_dir: &Path, generation: u64, marker: &Path, self_pid:
 
 /// How recently a lock-less session's heartbeat file must have been touched for
 /// the session to count as alive. Generous because network filesystems cache file
-/// attributes for up to about a minute.
-const HEARTBEAT_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+/// attributes (Linux NFS `acregmax` defaults to 60 s), so a live beat can look much
+/// older than it is.
+const HEARTBEAT_STALE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The heartbeat file beside a marker. Only a session that could not take a lock
 /// (the filesystem rejects them) keeps one: it is touched every couple of seconds.
@@ -145,14 +146,15 @@ pub(crate) fn heartbeat_path(marker: &Path) -> PathBuf {
 /// only signal that works across pid namespaces when there are no locks. Without
 /// one, the recorded pid is probed, which is only meaningful within one pid
 /// namespace. A crash is therefore recovered only once the heartbeat has gone
-/// quiet for [`HEARTBEAT_STALE`] (a restart faster than that defers recovery to a
+/// quiet for [`HEARTBEAT_STALE`] (three minutes; a restart faster than that defers recovery to a
 /// later launch).
 fn legacy_marker_is_dead(marker: &Path, self_pid: u32) -> bool {
+    // A beat whose age cannot be established (a modification time in the future:
+    // the file server's clock runs ahead of ours) counts as fresh, like
+    // `marker_is_fresh`: only a beat demonstrably quiet condemns a session.
     if std::fs::metadata(heartbeat_path(marker))
         .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < HEARTBEAT_STALE)
+        .is_ok_and(|t| t.elapsed().map(|age| age < HEARTBEAT_STALE).unwrap_or(true))
     {
         return false;
     }
@@ -886,6 +888,19 @@ mod tests {
             .unwrap();
         drop(f);
         assert_eq!(gens(&dir), vec![1], "quiet heartbeat: crashed");
+    }
+
+    #[test]
+    fn a_future_dated_heartbeat_counts_as_alive() {
+        let dir = tmp();
+        let m = marker(&dir, 1, "4294967290");
+        let beat = heartbeat_path(&m);
+        std::fs::write(&beat, "").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&beat).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+        assert!(gens(&dir).is_empty());
     }
 
     #[test]

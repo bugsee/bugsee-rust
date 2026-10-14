@@ -900,6 +900,9 @@ fn spawn_pipeline(
     let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_drain_dir = drain_dir.map(Path::to_path_buf);
     let marker = data_dir.map(|d| Session::marker_path(d, generation));
+    // Recovery can run long (a host `before_send`, many sessions); it keeps this
+    // session's heartbeat going meanwhile, as the worker loop is not yet running.
+    let beat_marker = marker.clone();
     let worker_upload_tx = upload_tx.clone();
 
     let worker = std::thread::Builder::new()
@@ -930,13 +933,13 @@ fn spawn_pipeline(
                 // it must, or that crash waits for the master to restart. Claims
                 // keep siblings from recovering the same session twice.
                 if let Some(dir) = &worker_drain_dir {
-                    run_recovery(&worker_shared, dir, generation);
+                    run_recovery(&worker_shared, dir, generation, beat_marker.as_deref());
                 }
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 for dir in &legacy_data_dirs {
                     queue::gc_orphans(dir);
-                    run_recovery(&worker_shared, dir, u64::MAX);
+                    run_recovery(&worker_shared, dir, u64::MAX, beat_marker.as_deref());
                 }
             }));
             legacy_ready.store(true, Ordering::SeqCst);
@@ -965,8 +968,20 @@ fn spawn_pipeline(
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
 /// The crashed session's state is discarded ONLY after the report is durably
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
-fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
+fn run_recovery(
+    shared: &Shared,
+    data_dir: &Path,
+    current_generation: u64,
+    heartbeat_of: Option<&Path>,
+) {
+    let beat = || {
+        if let Some(marker) = heartbeat_of {
+            touch_heartbeat(marker);
+        }
+    };
+    beat();
     for pending in recovery::find_pending(data_dir, current_generation) {
+        beat();
         // Several processes share this directory (a prefork master and its
         // workers, above all): exactly one recovers a given session.
         let Some(_claim) = recovery::claim_pending(data_dir, &pending) else {
