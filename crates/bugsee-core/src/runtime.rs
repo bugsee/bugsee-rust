@@ -270,6 +270,10 @@ struct Shared {
     max_report_queued: usize,
     /// Whether telemetry sampling is paused (mirrors the facade's pause state).
     paused: AtomicBool,
+    /// Set when the recorder is being stopped: a flush in progress gives up at
+    /// once, so the stop is acknowledged inside its bound (and the session can
+    /// end cleanly) instead of waiting out the flush's whole deadline.
+    stopping: AtomicBool,
     /// Reports that could not be queued on disk, delivered from memory. An entry
     /// stays here until its delivery is settled, so the length is the real backlog.
     mem_queue: ForkLock<Vec<MemReport>>,
@@ -438,6 +442,7 @@ impl Recorder {
             report_queued: AtomicUsize::new(0),
             max_report_queued: DEFAULT_MAX_REPORT_QUEUED,
             paused: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             mem_queue: ForkLock::new(Vec::new()),
             next_mem_id: AtomicU64::new(0),
             mem_blacklist: ForkLock::new(BTreeSet::new()),
@@ -830,6 +835,7 @@ impl Drop for Recorder {
         // A thread wedged in a host callback with no timeout is DETACHED (its
         // JoinHandle dropped un-joined) rather than hanging the stopping thread
         // forever. (Called only after the facade released its global lock.)
+        self.shared.stopping.store(true, Ordering::SeqCst);
         let (tx, rx) = channel();
         let worker_acked =
             self.tx.send(Msg::Stop(tx)).is_ok() && rx.recv_timeout(Duration::from_secs(2)).is_ok();
@@ -849,7 +855,7 @@ impl Drop for Recorder {
                 let _ = handle.join();
             }
         }
-        // Only mark a genuinely clean shutdown. If either thread merely DETACHED
+        // Only mark a genuinely clean shutdown. If the capture worker merely DETACHED
         // (didn't ack in time — e.g. a slow flush), it may still be writing this
         // session's data, so removing the marker now would make next-launch
         // recovery miss the generation entirely if the process then dies mid-tail.
@@ -867,6 +873,12 @@ impl Drop for Recorder {
         // A panic that was merely *contained* never reaches here while
         // unwinding, and its snapshot is deleted by `report_caught`, so this
         // cannot turn a handled panic into a phantom crash.
+        // The uploader is deliberately NOT part of this condition: it never
+        // writes session parts, and it can be inside an HTTP call that no signal
+        // can interrupt (connect/read timeouts are tens of seconds). Waiting on
+        // it would turn every stop during a slow upload into a false
+        // abnormal-exit report. The cost is at-least-once delivery: a report
+        // whose upload was cut short is re-sent next launch.
         //
         // The health record is the exception: it is finished whenever the stop
         // is not a death by panic, whatever the threads acked. A detached
@@ -887,14 +899,15 @@ impl Drop for Recorder {
                 health.finish_clean(self.shared.health_errors.load(Ordering::SeqCst));
             }
         }
-        if worker_acked && uploader_acked && !std::thread::panicking() {
+        if worker_acked && !std::thread::panicking() {
             if let Some(session) = &self.session {
                 // The finished health record first, then the marker: a death in
                 // between leaves a marker that recovery settles idempotently.
                 session.end();
             }
-        } else if !(worker_acked && uploader_acked) {
-            // A detached thread may still be writing this session's data: keep
+        } else if !worker_acked {
+            // A detached capture worker may still be writing this session's data
+            // (the uploader writes none, so its detaching does not matter): keep
             // the liveness lock until the process exits so no peer recovers (and
             // deletes) the session underneath it.
             if let Some(session) = &mut self.session {
@@ -2042,6 +2055,8 @@ fn uploader_loop(
                         true,
                         false,
                         Some(Instant::now() + Duration::from_millis(1500)),
+                        // `stopping` is set by now; this IS the stop-time drain.
+                        false,
                     )
                 }));
                 let _ = ack.send(());
@@ -2112,7 +2127,9 @@ fn drain_all(
 /// is set so backing-off reports are retried immediately. Returns whether any
 /// report was attempted (used to pace `drain_until_empty`).
 fn drain(shared: &Shared, data_dir: Option<&Path>, backoff_base: Duration, force: bool) -> bool {
-    let attempted = drain_memory(shared, backoff_base, force, true, None);
+    // Not `honor_stop`: the scheduled pass behaves as before #8, and the
+    // stop-time drain relies on it having had its one attempt.
+    let attempted = drain_memory(shared, backoff_base, force, true, None, false);
     match data_dir {
         Some(dir) => drain_disk(shared, dir, backoff_base, force) | attempted,
         None => attempted,
@@ -2261,19 +2278,23 @@ fn notify_dropped(shared: &Shared, reason: DropReason) {
 /// An entry STAYS in the queue while it is being delivered (the lock is held only
 /// to pick it and to settle it, never across the network), so the queue length is
 /// the true backlog and [`MAX_MEMORY_REPORTS`] holds. Stops at `deadline`, like
-/// the disk loop in [`drain_until_empty`].
+/// the disk loop in [`drain_until_empty`]. With `honor_stop`, also stops as soon
+/// as the recorder is being stopped (only an explicit flush passes `true`).
 fn drain_memory(
     shared: &Shared,
     backoff_base: Duration,
     force: bool,
     count_failure: bool,
     deadline: Option<Instant>,
+    honor_stop: bool,
 ) -> bool {
     let mut attempted = false;
     // Each entry is tried once per call, whatever its outcome.
     let mut tried: Vec<u64> = Vec::new();
     loop {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(|d| Instant::now() >= d)
+            || (honor_stop && shared.stopping.load(Ordering::SeqCst))
+        {
             break;
         }
         // A dying process starts no delivery it cannot finish (crash_flush).
@@ -2376,13 +2397,32 @@ fn drain_until_empty(
 ) -> bool {
     let start = Instant::now();
     loop {
+        if shared.stopping.load(Ordering::SeqCst) {
+            return false; // stop wins; what is queued stays queued
+        }
         let now = epoch_ms();
-        drain_memory(shared, backoff_base, true, false, Some(start + deadline));
-        for &data_dir in dirs {
+        drain_memory(
+            shared,
+            backoff_base,
+            true,
+            false,
+            Some(start + deadline),
+            true,
+        );
+        // A stop that arrived during the memory pass must not be followed by a
+        // blocking disk upload: the uploader has to reach `UploadMsg::Stop` and
+        // run the stop-time memory drain, which a hung HTTP call would starve.
+        if shared.stopping.load(Ordering::SeqCst) {
+            return false;
+        }
+        'dirs: for &data_dir in dirs {
             for report in pending_reports(shared, data_dir) {
                 let Some(_claim) = queue::try_claim_lenient(&report) else {
                     continue; // a peer is delivering it; the loop below waits it out
                 };
+                if shared.stopping.load(Ordering::SeqCst) {
+                    return false; // checked after the claim so no upload starts
+                }
                 let Ok((zip, request_json, retry, _next)) = queue::load(&report) else {
                     continue;
                 };
@@ -2397,8 +2437,8 @@ fn drain_until_empty(
                     now,
                     false,
                 );
-                if start.elapsed() >= deadline {
-                    break;
+                if start.elapsed() >= deadline || shared.stopping.load(Ordering::SeqCst) {
+                    break 'dirs;
                 }
             }
         }
