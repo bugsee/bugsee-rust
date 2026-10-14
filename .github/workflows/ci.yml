@@ -58,6 +58,39 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # What ships to Mac App Store / sandboxed apps is the C ABI library, so check
+  # THAT binary's imports rather than inferring from tests: no `dlsym` (the way
+  # `crash-handler` reached a private libproc symbol) and no libproc import
+  # beyond the public `libproc.h` functions `sysinfo` uses.
+  macos-no-private-api:
+    name: macOS binary has no private API imports
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-no-private-api
+
+      - name: Build C ABI (release)
+        run: cargo build --release --locked -p bugsee-ffi
+
+      - name: Check undefined symbols
+        run: |
+          LIB=target/release/libbugsee_ffi.dylib
+          nm -u "$LIB" > imports.txt
+          if grep -qx '_dlsym' imports.txt; then
+            echo "::error::$LIB imports _dlsym"; exit 1
+          fi
+          BAD=$(grep -E '^_proc_' imports.txt | grep -vxE '_proc_(listallpids|pid_rusage|pidinfo|pidpath)' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::non-allowlisted libproc imports:"; echo "$BAD"; exit 1
+          fi
+
   msrv:
     name: build (MSRV 1.88)
     runs-on: ubuntu-latest

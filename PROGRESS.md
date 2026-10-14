@@ -18,7 +18,7 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 |---|---|
 | `bugsee-core` | Pure-`std` capture/persistence/export engine; recovery; queue; signatures. One contained `unsafe` (`kill(pid,0)` liveness probe, unix). |
 | `bugsee-panic` | Chained global panic observer + `catch_unwind` boundary guards. |
-| `bugsee-native` | Native fatal-crash handler (POSIX signal / Mach exception / Windows SEH) → allocation-free marker + frame capture + code-id-bearing module map (Mach-O `LC_UUID`, GNU build-id, PE CodeView) for next-launch recovery. |
+| `bugsee-native` | Native fatal-crash handler (POSIX signal on Linux/Android/macOS, SEH via `crash-handler` on Windows) → allocation-free marker + frame capture + code-id-bearing module map (Mach-O `LC_UUID`, GNU build-id, PE CodeView) for next-launch recovery. |
 | `bugsee` | Public facade + default `ureq` HTTP transport + APM. |
 | `bugsee-reqwest` | `reqwest` network-capture middleware (sanitized). |
 | `bugsee-tracing` | `tracing` `Layer`. |
@@ -479,8 +479,26 @@ can fix.
 3. **Cross-instance queue/recovery exclusivity.** Multiple processes sharing a data dir can
    double-deliver a recovered/queued report. A lock-file fix risks a *permanent block* if
    the holder dies, so it needs real design (the server already dedups).
-4. **`crash-handler` crate resolves a private Apple libproc symbol** (App-Store sensitivity).
-   Third-party; track upstream / consider a fork or a different backend.
+4. ~~**`crash-handler` crate resolves a private Apple libproc symbol** (App-Store sensitivity).~~
+   **RESOLVED (#15).** The symbol is `proc_get_wakemon_params`, `dlsym`'d from libproc in
+   `crash-handler` 0.8 `src/mac/state.rs` (no public header; used to lift the wakeups
+   resource limit before handling `EXC_RESOURCE`). It was reachable on macOS whenever
+   `crash-handler`'s Mach backend was installed. Chosen option: our own handler — macOS
+   already uses the SDK's POSIX signal handler plus the Apple frame-capture code, and
+   `crash-handler` is a Windows-only dependency (#20), so no Mach-exception backend, fork
+   or upstream change was needed. Verified: `nm -u` of a release `libbugsee_ffi.dylib`
+   shows only public `libproc.h` imports (`proc_listallpids`/`proc_pidinfo`/
+   `proc_pidpath`/`proc_pid_rusage`, from `sysinfo` via the `telemetry` feature, which is
+   a default feature and always on in `bugsee-ffi`) and no `_dlsym` import. CI enforces
+   this on the release `libbugsee_ffi.dylib` (macOS job); `tests/macos_no_private_api.rs`
+   additionally scans the `bugsee-native` test binary. Privacy manifest: this crate ships
+   no `PrivacyInfo.xcprivacy`. Apple's required-reason API enforcement applies to
+   iOS/iPadOS/tvOS/visionOS/watchOS submissions; for macOS a manifest is optional, but an
+   app that adds one should declare the categories the SDK can touch: file timestamp
+   (`stat`), disk space (volume capacity keys, and `getfsstat`, whose `statfs` result
+   carries free space — not named in Apple's list, so declare it conservatively), and
+   system boot time (`mach_absolute_time`/uptime/`sysctl`, via `telemetry`). Based on
+   reading the code and Apple's docs, not a real submission.
 5. **Dependency-spec dedup** (LOW): centralize `zip`/`backtrace` in `[workspace.dependencies]`.
 
 ### Architecture to revisit — crash-handling backend
