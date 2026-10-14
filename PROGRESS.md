@@ -515,7 +515,7 @@ Rust and are worth evaluating before building one.
 
 - Phase 2: subsystem quarantine (auto-disable a repeatedly-faulting integration).
 - Phase 3: best-effort in-flight flush at crash; full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
-- Phase 4: sessions / release-health: SDK half done (#12: local session records, off by default; nothing is sent, the backend has no session-health ingest, see DESIGN.md §8).
+- Phase 4: sessions / release-health: SDK half done, experimental and off by default (#12: eager session registration plus local session records; the backend has no session-health ingest, see DESIGN.md §10).
 - Phase 5: general PII scrubber, rate limits.
 - Phase 6: iOS/Android target builds; Swift/Kotlin language wrappers.
 - CI: ~~cross-platform matrix~~ **done**; loom/miri/fuzz jobs still open — fuzzing is

@@ -151,6 +151,9 @@ fn floor_generation(data_dir: &Path) -> u64 {
         Some(".alive"),
     ));
     floor = floor.max(max_numeric_entry(&data_dir.join("parts"), None));
+    // Session-health records name generations too (a finished or acknowledged
+    // one must never be shadowed by a reused number).
+    floor = floor.max(crate::health::max_generation(data_dir));
     floor
 }
 

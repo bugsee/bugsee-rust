@@ -253,15 +253,17 @@ impl LaunchOptions {
         self
     }
 
-    /// Record how each session ends (clean, errored, crashed, abnormal exit) in
-    /// the data directory, for [`Bugsee::finished_sessions`](crate::Bugsee::finished_sessions).
-    /// Off by default.
+    /// **Experimental.** Release health: register this launch with the backend
+    /// as a session immediately (rather than with the first report), so it
+    /// counts toward crash-free sessions even if the run never uploads
+    /// anything, and keep a local record of how the session ended (clean,
+    /// errored, crashed, abnormal exit) in the data directory. Off by default.
     ///
-    /// **Local only.** The backend has no endpoint for session health yet (it
-    /// derives crash-free rates from session creation and crash issues), so
-    /// nothing is sent. Requires a usable data directory: in memory mode a crash
-    /// could never be seen, so no session is tracked. See DESIGN.md, release
-    /// health.
+    /// The backend has no endpoint for session end/status yet, so the record is
+    /// local only and not exposed as stable API; the registration is best
+    /// effort and never delays or fails launch. In memory mode no record is
+    /// kept (a crash there could never be seen). The behaviour may change when
+    /// a backend contract exists. See DESIGN.md, release health.
     pub fn release_health(mut self, enabled: bool) -> Self {
         self.release_health = enabled;
         self

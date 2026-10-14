@@ -235,6 +235,16 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
                         handled: is_worker,
                         thread: worker_thread,
                     });
+                    // A worker-thread panic is reported and the process lives
+                    // on: its snapshot must not outlast it, or a later SIGKILL
+                    // would be read as this panic having killed the process.
+                    if is_worker {
+                        if let Some(guard) = SNAPSHOT_PATH.try_lock() {
+                            if let Some(path) = current_snapshot_path(&guard) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                    }
                 }
             }
 

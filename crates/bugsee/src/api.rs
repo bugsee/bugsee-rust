@@ -268,24 +268,27 @@ impl Bugsee {
         })
     }
 
-    /// The running session's health record, or `None` when the SDK is not
-    /// launched, release health is off ([`LaunchOptions::release_health`]) or
-    /// the SDK is in memory mode.
-    pub fn session_health() -> Option<bugsee_core::health::SessionRecord> {
-        Self::with_recorder(|r| r.session_health()).flatten()
+    // Release-health diagnostics (#12). Unstable and hidden: there is no backend
+    // contract for session health, so no stable API is promised for it. They
+    // clone a handle out first, so no file I/O runs under the global lock.
+
+    #[doc(hidden)]
+    pub fn __session_health() -> Option<bugsee_core::health::SessionRecord> {
+        Self::handle()?.session_health()
     }
 
-    /// Sessions of this data directory that have ended, oldest first: clean ends
-    /// (`ok` / `errored`) and earlier runs this launch recovered (`crashed` /
-    /// `abnormal`), each exactly once. Take one with
-    /// [`Bugsee::acknowledge_session`]; the newest 256 are kept.
-    pub fn finished_sessions() -> Vec<bugsee_core::health::SessionRecord> {
-        Self::with_recorder(|r| r.finished_sessions()).unwrap_or_default()
+    #[doc(hidden)]
+    pub fn __finished_sessions() -> Vec<bugsee_core::health::SessionRecord> {
+        Self::handle()
+            .map(|h| h.finished_sessions())
+            .unwrap_or_default()
     }
 
-    /// Forget a finished session (by its `generation`) once it has been used.
-    pub fn acknowledge_session(generation: u64) {
-        Self::with_recorder(|r| bugsee_core::health::acknowledge(r.data_dir(), generation));
+    #[doc(hidden)]
+    pub fn __acknowledge_session(generation: u64) {
+        if let Some(h) = Self::handle() {
+            h.acknowledge_session(generation);
+        }
     }
 
     /// Stop the SDK and flush pending work (dropping the recorder joins the worker).

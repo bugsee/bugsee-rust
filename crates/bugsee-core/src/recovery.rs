@@ -240,7 +240,13 @@ pub fn build_report(pending: &PendingSession, timestamp: i64) -> RecoveredReport
         //      shutdown when `Recorder::drop` sees `thread::panicking()`, i.e.
         //      the process was unwinding out of `main` because of this panic.
         // So we report the panic itself rather than a generic abnormal exit.
-        (false, Some(info)) => build_fatal_panic(info, timestamp),
+        //
+        // ...unless the session kept capturing long after the snapshot, in
+        // which case the panic was survived and something else ended it.
+        (false, Some(info)) if panic_is_recent(pending, &info) => {
+            build_fatal_panic(info, timestamp)
+        }
+        (false, Some(_)) => build_abnormal_exit(timestamp),
         (false, None) => build_abnormal_exit(timestamp),
     }
 }
@@ -377,10 +383,33 @@ pub fn discard(data_dir: &Path, pending: &PendingSession) {
 /// [`build_report`] reports as a crash), `Abnormal` when the process just
 /// vanished (SIGKILL, OOM kill, power loss).
 fn dead_status(pending: &PendingSession) -> crate::health::SessionStatus {
-    if pending.minidump.is_some() || pending.crash_info.is_some() || pending.panic_info.is_some() {
+    let lone_panic = pending
+        .panic_info
+        .as_ref()
+        .and_then(|p| PanicInfo::read_from(p))
+        .is_some_and(|info| panic_is_recent(pending, &info));
+    if pending.minidump.is_some() || pending.crash_info.is_some() || lone_panic {
         crate::health::SessionStatus::Crashed
     } else {
         crate::health::SessionStatus::Abnormal
+    }
+}
+
+/// How long after a panic snapshot the session may keep writing and still be
+/// the one the panic killed: unwinding out of `main` and the recorder's final
+/// flush take well under this.
+const PANIC_TAIL_MS: i64 = 10_000;
+
+/// Whether a panic snapshot with no native crash beside it can be what ended
+/// this session. A snapshot is written for every panic and deleted only when a
+/// boundary of ours catches it (or the hook reports a worker-thread panic), so
+/// one left by a panic the app survived, caught by a foreign `catch_unwind`, is
+/// still there when the process is later SIGKILLed. A session that kept
+/// capturing long after the snapshot was not killed by it.
+fn panic_is_recent(pending: &PendingSession, info: &PanicInfo) -> bool {
+    match crate::health::newest_mtime(&pending.parts_dir, 3) {
+        Some(last) => info.timestamp == 0 || last - info.timestamp <= PANIC_TAIL_MS,
+        None => true,
     }
 }
 
@@ -456,6 +485,7 @@ pub fn gc_orphans(data_dir: &Path, current_generation: u64) {
             }
         }
     }
+    crate::health::gc(data_dir, current_generation, alive);
     if let Ok(read) = std::fs::read_dir(&sessions) {
         for entry in read.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -855,6 +885,18 @@ mod tests {
                 crash_info: None,
                 panic_info: panic_info.then(|| dir.join("panic.info")),
             };
+            if panic_info {
+                crate::panic_info::PanicInfo {
+                    reason: "fatal".into(),
+                    file: None,
+                    line: 0,
+                    column: 0,
+                    timestamp: crate::util::epoch_ms(),
+                    frames: Vec::new(),
+                }
+                .write_to(&dir.join("panic.info"))
+                .unwrap();
+            }
             discard(&dir, &pending);
             // A repeat (the same session recovered again) changes nothing.
             discard(&dir, &pending);
@@ -867,6 +909,51 @@ mod tests {
             got,
             vec![(1, SessionStatus::Crashed), (2, SessionStatus::Abnormal)]
         );
+    }
+
+    #[test]
+    fn a_stale_panic_snapshot_does_not_turn_a_later_kill_into_a_crash() {
+        use crate::health::SessionStatus;
+        let dir = tmp();
+        let parts = dir.join("parts").join("1");
+        std::fs::create_dir_all(&parts).unwrap();
+        // A worker-thread panic long ago (its snapshot was never deleted), then
+        // the session kept capturing until it was killed.
+        let snapshot = dir.join("panic.info");
+        PanicInfo {
+            reason: "old".into(),
+            file: None,
+            line: 0,
+            column: 0,
+            timestamp: 1_000,
+            frames: Vec::new(),
+        }
+        .write_to(&snapshot)
+        .unwrap();
+        std::fs::write(parts.join("part"), b"x").unwrap();
+        let pending = PendingSession {
+            generation: 1,
+            parts_dir: parts.clone(),
+            minidump: None,
+            crash_info: None,
+            panic_info: Some(snapshot.clone()),
+        };
+        assert_eq!(dead_status(&pending), SessionStatus::Abnormal);
+        let report = build_report(&pending, 5_000);
+        assert!(String::from_utf8_lossy(&report.crash_json).contains("AppExit"));
+
+        // A fresh snapshot (the panic that killed it) is still a crash.
+        PanicInfo {
+            reason: "fatal".into(),
+            file: None,
+            line: 0,
+            column: 0,
+            timestamp: crate::util::epoch_ms(),
+            frames: Vec::new(),
+        }
+        .write_to(&snapshot)
+        .unwrap();
+        assert_eq!(dead_status(&pending), SessionStatus::Crashed);
     }
 
     #[test]

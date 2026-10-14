@@ -78,6 +78,18 @@ fn run_child(kind: &str, dir: &str) -> ! {
                 .join();
             std::thread::sleep(Duration::from_millis(300));
         }
+        // The panic's snapshot must not outlive it: the process is then killed,
+        // which is an abnormal exit, not the panic's crash. The pause lets the
+        // worker persist the error count before the kill.
+        "thread_panic_then_exit" => {
+            let _ = std::thread::Builder::new()
+                .name("worker".into())
+                .spawn(|| panic!("worker-thread-panic"))
+                .unwrap()
+                .join();
+            std::thread::sleep(Duration::from_millis(1500));
+            std::process::exit(3);
+        }
         "segv" => fault_null(),
         "unwinding_panic" => {
             let _keep = &guard;
@@ -123,6 +135,12 @@ fn cases() -> Vec<Case> {
             min_errors: 1,
         },
         Case {
+            kind: "thread_panic_then_exit",
+            dies: true,
+            status: SessionStatus::Abnormal,
+            min_errors: 1,
+        },
+        Case {
             kind: "segv",
             dies: true,
             status: SessionStatus::Crashed,
@@ -149,7 +167,7 @@ fn relaunch(dir: &Path) -> Vec<SessionRecord> {
     let guard = launch(dir.to_str().unwrap(), true);
     std::thread::sleep(Duration::from_millis(300));
     Bugsee::flush(Duration::from_secs(10));
-    let all = Bugsee::finished_sessions();
+    let all = Bugsee::__finished_sessions();
     drop(guard);
     all
 }

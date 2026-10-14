@@ -8,16 +8,17 @@
 //! Session health: a durable record of how each run of the application ended
 //! (issue #12), the SDK half of release health / crash-free sessions.
 //!
-//! **There is no backend half yet.** The Bugsee backend derives crash-free
-//! sessions itself: it counts one session per `POST /v2/sessions` and one crash
-//! per crash issue (`appserver` `shared/statistics`: `sessions`,
-//! `issues.crashes`; crash-free = `(sessions - crashes) / sessions`), and it has
-//! no endpoint that accepts a session's end, status, duration or error count.
-//! Nothing here is sent anywhere. The records are kept locally, off by default
-//! ([`HealthTracker`] exists only when the host asked for release health), and
-//! are exposed through [`finished`] / [`acknowledge`] so a host can use them
-//! today and a transport can ship them once a contract exists. DESIGN.md
-//! (release health) lists what the backend still has to define.
+//! **Experimental and unstable; there is no backend contract for it.** The
+//! backend derives crash-free sessions itself: it counts one session per
+//! `POST /v2/sessions` and one crash per crash report received (`appserver`
+//! `shared/statistics`: `sessions`, `issues.crashes`; crash-free =
+//! `(sessions - crashes) / sessions`), and it has no endpoint that accepts a
+//! session's end, status, duration or error count. These records are therefore
+//! kept locally and never sent; what release health does send is the session
+//! registration itself, made eagerly at launch (see `runtime`), because a
+//! session the backend never hears of cannot be counted. Off by default.
+//! DESIGN.md (release health) lists what the backend still has to define. This
+//! module is `doc(hidden)` and may change without notice.
 //!
 //! # Lifecycle
 //!
@@ -42,15 +43,28 @@
 //! A finished record is named by its generation and written by whoever holds the
 //! session (the live process at a clean stop, or the process holding
 //! `sessions/<gen>.recover.lock` at recovery), via a temp file and a rename. A
-//! finalizer that finds the record already there only removes the `.live` file,
-//! so a retry after a crash between the two steps cannot flip a status or count
-//! a session twice. Generations are never reused in a data directory.
+//! finalizer that finds the record already there (or its `<gen>.acked`
+//! tombstone, left by [`acknowledge`]) only removes the `.live` file, so a retry
+//! after a crash between the two steps cannot flip a status or count a session
+//! twice. Generations are not reused: the generation floor also reads this
+//! directory, so even a wiped `gen` hint and marker tree cannot hand out a
+//! generation that has a record.
+//!
+//! Limits: records of the legacy and extra recovery directories are not
+//! surfaced (only the primary data directory's are); [`MAX_FINISHED`] prunes the
+//! oldest records even if never acknowledged; an unacknowledged record of a
+//! session recovered right at launch may not be listed until that recovery has
+//! run (it is asynchronous past the launch-path budget); and a server that is
+//! stopped by SIGTERM, `exec`s or calls `_exit` without dropping its guard ends
+//! its session `abnormal`, not `ok`: drop the guard from the termination
+//! handler (see the shutdown contract, #8).
 //!
 //! None of this runs on the crash path: the signal handler and panic hook write
 //! nothing here. The crash is inferred at the next launch from the evidence the
 //! handlers already leave.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,13 +73,11 @@ use crate::model::environment::Environment;
 const HEALTH_DIR: &str = "health";
 /// Newest finished records kept; older ones are pruned when a session finishes.
 pub const MAX_FINISHED: usize = 256;
-/// Error counts are rewritten to disk for the first few errors and then at each
-/// power of two, so an error storm costs a handful of small writes, not one each.
-const EAGER_WRITES: u64 = 8;
 
 /// How a session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SessionStatus {
     /// Ended cleanly with no handled errors.
     Ok,
@@ -81,6 +93,7 @@ pub enum SessionStatus {
 
 /// The durable record of one session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionRecord {
     /// Schema version of this record.
     pub version: u32,
@@ -122,10 +135,22 @@ fn finished_path(data_dir: &Path, generation: u64) -> PathBuf {
     dir(data_dir).join(format!("{generation}.json"))
 }
 
+fn acked_path(data_dir: &Path, generation: u64) -> PathBuf {
+    dir(data_dir).join(format!("{generation}.acked"))
+}
+
+/// The temp file for `path`: its own name plus `.tmp`, so `<gen>.live` and
+/// `<gen>.json` never share one.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// Write `record` atomically (temp file, then rename).
 fn write_record(path: &Path, record: &SessionRecord) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -140,12 +165,18 @@ fn read_record(path: &Path) -> Option<SessionRecord> {
 pub struct HealthTracker {
     data_dir: PathBuf,
     record: SessionRecord,
+    /// Monotonic start, so a clean session's duration survives clock changes.
+    started: Instant,
 }
 
 impl HealthTracker {
     /// Start tracking the session `generation` in `data_dir`. `None` when the
     /// record cannot be written (the session then simply is not tracked).
     pub fn start(data_dir: &Path, generation: u64, env: &Environment) -> Option<HealthTracker> {
+        // An empty path would resolve against the working directory.
+        if data_dir.as_os_str().is_empty() {
+            return None;
+        }
         std::fs::create_dir_all(dir(data_dir)).ok()?;
         let record = SessionRecord {
             version: 1,
@@ -166,20 +197,31 @@ impl HealthTracker {
         Some(HealthTracker {
             data_dir: data_dir.to_path_buf(),
             record,
+            started: Instant::now(),
         })
     }
 
-    /// Count one handled error.
-    pub fn note_error(&mut self) {
-        self.record.errors = self.record.errors.saturating_add(1);
-        self.record.status = SessionStatus::Errored;
-        let n = self.record.errors;
-        if n <= EAGER_WRITES || n.is_power_of_two() {
-            let _ = write_record(
-                &live_path(&self.data_dir, self.record.generation),
-                &self.record,
-            );
+    /// Bring the record up to `errors` handled errors (the process-wide counter,
+    /// which the reporting path bumps without touching the disk) and persist it
+    /// if that changed anything. Called from the worker's tick, never from a
+    /// caller's thread.
+    pub fn sync_errors(&mut self, errors: u64) {
+        if errors == self.record.errors {
+            return;
         }
+        self.record.errors = errors;
+        if errors > 0 {
+            self.record.status = SessionStatus::Errored;
+        }
+        let _ = write_record(
+            &live_path(&self.data_dir, self.record.generation),
+            &self.record,
+        );
+    }
+
+    /// The directory this session's records live in.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// The record as it stands.
@@ -189,11 +231,17 @@ impl HealthTracker {
 
     /// End the session cleanly: publish the finished record, then drop the live
     /// one.
-    pub fn finish_clean(&self) {
-        let now = crate::util::epoch_ms();
+    pub fn finish_clean(&self, errors: u64) {
+        let duration = self.started.elapsed().as_millis() as i64;
         let mut record = self.record.clone();
-        record.ended_at = Some(now);
-        record.duration_ms = Some((now - record.started_at).max(0));
+        record.errors = errors;
+        record.status = if errors > 0 {
+            SessionStatus::Errored
+        } else {
+            SessionStatus::Ok
+        };
+        record.ended_at = Some(record.started_at + duration);
+        record.duration_ms = Some(duration);
         publish(&self.data_dir, record);
     }
 }
@@ -212,13 +260,21 @@ pub fn finalize_dead(
     let Some(mut record) = read_record(&live) else {
         // Unreadable or absent: nothing to report, but do not leave junk.
         let _ = std::fs::remove_file(&live);
-        let _ = std::fs::remove_file(live.with_extension("tmp"));
+        let _ = std::fs::remove_file(tmp_path(&live));
         return;
     };
     record.status = status;
+    // The last sign of life: the newest capture part, or the live record's own
+    // last write (an error count), whichever is later.
+    let live_written = std::fs::metadata(&live)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
     let end = last_activity
-        .unwrap_or(record.started_at)
-        .max(record.started_at);
+        .into_iter()
+        .chain(live_written)
+        .fold(record.started_at, i64::max);
     record.ended_at = Some(end);
     record.duration_ms = Some(end - record.started_at);
     publish(data_dir, record);
@@ -227,12 +283,15 @@ pub fn finalize_dead(
 /// Write the finished record unless one exists, then remove the live one.
 fn publish(data_dir: &Path, record: SessionRecord) {
     let done = finished_path(data_dir, record.generation);
-    if !done.exists() {
+    // Settled already: the host took it (tombstone) or an intact record exists.
+    // An unreadable one (zero-length after a power loss) is rewritten.
+    let settled = acked_path(data_dir, record.generation).exists() || read_record(&done).is_some();
+    if !settled {
         let _ = write_record(&done, &record);
     }
     // Only drop the live record once the finished one is durable: a failure
     // leaves it for the next recovery, which finds the finished one and stops.
-    if done.exists() {
+    if settled || read_record(&done).is_some() {
         let _ = std::fs::remove_file(live_path(data_dir, record.generation));
     }
     prune(data_dir);
@@ -263,6 +322,9 @@ fn finished_generations(data_dir: &Path) -> Vec<u64> {
 /// Finished sessions in `data_dir`, oldest first, that have not been
 /// [`acknowledge`]d.
 pub fn finished(data_dir: &Path) -> Vec<SessionRecord> {
+    if data_dir.as_os_str().is_empty() {
+        return Vec::new();
+    }
     let mut gens = finished_generations(data_dir);
     gens.sort_unstable();
     gens.into_iter()
@@ -271,8 +333,55 @@ pub fn finished(data_dir: &Path) -> Vec<SessionRecord> {
 }
 
 /// Forget a finished session once the host (or a future transport) has taken it.
+/// Leaves a `<gen>.acked` tombstone, so a finalizer that still finds the
+/// session's marker (a recovery racing the acknowledgement) cannot write the
+/// record again and have it counted twice. [`gc`] drops the tombstone once the
+/// marker is gone.
 pub fn acknowledge(data_dir: &Path, generation: u64) {
+    if data_dir.as_os_str().is_empty() {
+        return;
+    }
+    let _ = std::fs::write(acked_path(data_dir, generation), b"");
     let _ = std::fs::remove_file(finished_path(data_dir, generation));
+}
+
+/// Sweep leftovers of generations below `current` that no longer have a liveness
+/// marker (`alive` says whether one does): tombstones, whose job is done, and
+/// `.live` records no recovery will ever finish. Called from
+/// [`crate::recovery::gc_orphans`].
+pub(crate) fn gc(data_dir: &Path, current: u64, alive: impl Fn(u64) -> bool) {
+    let Ok(read) = std::fs::read_dir(dir(data_dir)) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((stem, ext)) = name.split_once('.') else {
+            continue;
+        };
+        let Ok(generation) = stem.parse::<u64>() else {
+            continue;
+        };
+        if generation >= current || alive(generation) {
+            continue;
+        }
+        if matches!(ext, "acked" | "live" | "live.tmp" | "json.tmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The highest generation any record here names, for the generation floor.
+pub(crate) fn max_generation(data_dir: &Path) -> u64 {
+    std::fs::read_dir(dir(data_dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.split('.').next()?.parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The newest modification time (epoch ms) under `dir`, to `depth` levels down.
@@ -282,6 +391,14 @@ pub(crate) fn newest_mtime(dir: &Path, depth: u32) -> Option<i64> {
     let mut newest = None::<i64>;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
+        // Crash evidence is written at the moment of death, not by capture.
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some("panic.info" | "crash.info" | "crash.modules")
+        ) {
+            continue;
+        }
         let mut t = meta
             .modified()
             .ok()
@@ -322,7 +439,7 @@ mod tests {
         let d = tmp();
         let t = HealthTracker::start(&d, 1, &env()).unwrap();
         assert!(live_path(&d, 1).exists());
-        t.finish_clean();
+        t.finish_clean(0);
         assert!(!live_path(&d, 1).exists());
         let all = finished(&d);
         assert_eq!(all.len(), 1);
@@ -337,9 +454,8 @@ mod tests {
     fn handled_errors_make_the_session_errored_not_crashed() {
         let d = tmp();
         let mut t = HealthTracker::start(&d, 1, &env()).unwrap();
-        t.note_error();
-        t.note_error();
-        t.finish_clean();
+        t.sync_errors(2);
+        t.finish_clean(2);
         let r = &finished(&d)[0];
         assert_eq!((r.status, r.errors), (SessionStatus::Errored, 2));
     }
@@ -370,12 +486,63 @@ mod tests {
     fn acknowledged_and_old_records_are_dropped() {
         let d = tmp();
         for g in 1..=(MAX_FINISHED as u64 + 3) {
-            HealthTracker::start(&d, g, &env()).unwrap().finish_clean();
+            HealthTracker::start(&d, g, &env()).unwrap().finish_clean(0);
         }
         let all = finished(&d);
         assert_eq!(all.len(), MAX_FINISHED);
         assert_eq!(all[0].generation, 4);
         acknowledge(&d, 4);
         assert_eq!(finished(&d).len(), MAX_FINISHED - 1);
+    }
+
+    #[test]
+    fn an_acknowledged_session_is_not_counted_again_by_a_late_finalizer() {
+        let d = tmp();
+        let t = HealthTracker::start(&d, 2, &env()).unwrap();
+        t.finish_clean(0);
+        acknowledge(&d, 2);
+        assert!(finished(&d).is_empty());
+        // The marker survived (a recovery racing the acknowledgement): the
+        // finalizer finds the tombstone and writes nothing.
+        let _again = HealthTracker::start(&d, 2, &env());
+        finalize_dead(&d, 2, SessionStatus::Crashed, None);
+        assert!(finished(&d).is_empty());
+        assert!(!live_path(&d, 2).exists());
+        // Once the marker is gone the tombstone is swept.
+        gc(&d, 10, |_| false);
+        assert!(!acked_path(&d, 2).exists());
+    }
+
+    #[test]
+    fn gc_keeps_what_a_live_marker_or_current_generation_still_needs() {
+        let d = tmp();
+        HealthTracker::start(&d, 1, &env()).unwrap();
+        HealthTracker::start(&d, 2, &env()).unwrap();
+        HealthTracker::start(&d, 3, &env()).unwrap();
+        // 1: marker present (a peer); 2: no marker, below current (junk); 3: current.
+        gc(&d, 3, |g| g == 1);
+        assert!(live_path(&d, 1).exists());
+        assert!(!live_path(&d, 2).exists());
+        assert!(live_path(&d, 3).exists());
+    }
+
+    #[test]
+    fn a_zero_length_finished_record_is_rewritten() {
+        let d = tmp();
+        std::fs::create_dir_all(dir(&d)).unwrap();
+        std::fs::write(finished_path(&d, 4), b"").unwrap();
+        HealthTracker::start(&d, 4, &env()).unwrap().finish_clean(0);
+        assert_eq!(finished(&d).len(), 1);
+    }
+
+    #[test]
+    fn records_raise_the_generation_floor_and_temp_files_do_not_collide() {
+        let d = tmp();
+        HealthTracker::start(&d, 7, &env()).unwrap();
+        assert_eq!(max_generation(&d), 7);
+        assert_ne!(tmp_path(&live_path(&d, 7)), tmp_path(&finished_path(&d, 7)));
+        // A wiped hint and marker tree still cannot reuse generation 7.
+        let session = crate::session::Session::begin(&d).unwrap();
+        assert_eq!(session.generation(), 8);
     }
 }
