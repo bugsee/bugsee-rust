@@ -2198,7 +2198,7 @@ fn deliver_queued(
         request_json,
     };
     // Resume at the PUT if a prior attempt created the issue but the PUT failed
-    // (F14): re-POSTing create_issue mints a duplicate issue, or trips 12003 and
+    // (F14): re-POSTing create_issue mints a duplicate issue, or trips the server's dedup and
     // deletes the bundle unuploaded.
     let cached_endpoint = queue::endpoint(report);
     let mut endpoint_out: Option<String> = None;
