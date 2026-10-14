@@ -23,6 +23,7 @@ pub mod crash_flush;
 pub mod errors;
 pub mod fork;
 pub mod model;
+pub mod origin;
 pub mod panic_info;
 pub(crate) mod process;
 pub mod queue;

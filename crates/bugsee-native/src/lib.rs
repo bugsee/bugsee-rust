@@ -7,8 +7,7 @@
 
 //! Native fatal-crash capture.
 //!
-//! Installs a process crash handler (via the `crash-handler` crate) that, on a
-//! fatal signal/exception, writes a tiny **async-signal-safe** crash-info marker
+//! Installs a process crash handler that, on a fatal signal/exception, writes a tiny **async-signal-safe** crash-info marker
 //! next to the current session's capture parts, then lets default handling
 //! terminate the process. The marker is picked up on the next launch by
 //! `bugsee-core`'s recovery path, which builds the thin native `crash.json`.
@@ -41,14 +40,23 @@
 //!   signal that was merely *sent* looks like a fault, so a host that swallows
 //!   one by resetting the default action leaves a marker too (same cleanup).
 //! * **Windows** — reporting happens in the unhandled-exception filter, which
-//!   runs only after every vectored/structured handler declined, so a fault a
-//!   host recovers from never reaches it, whichever was installed first.
+//!   runs only after every structured handler declined, so a fault a host
+//!   recovers from there never reaches it. Known limit of `crash-handler` 0.8:
+//!   after the first event it handles, it removes its vectored handler and
+//!   `SIGABRT` hook for good (heap corruption and CRT abort are then no longer
+//!   seen), and a host's invalid-parameter handler is followed by
+//!   `exit(0)`. The CRT
+//!   `abort()`, invalid-parameter, purecall and heap-corruption paths are hooked
+//!   too. Rust's own `abort()` (and so an aborting panic) and any other
+//!   fast-fail (`int 0x29`) end the process without reaching any in-process
+//!   handler: those are reported from the panic snapshot when one exists, and as
+//!   an abnormal exit otherwise. The full table is in DESIGN.md section 12.
 //!
 //! # Supported platforms
 //!
-//! Linux, Android, macOS and Windows. The handler is built on the
-//! `crash-handler` crate, which has no iOS (or tvOS/watchOS) backend, so on
-//! every other target this crate compiles to a stub whose [`install`] returns
+//! Linux, Android, macOS and Windows. Unix targets use the SDK's own signal
+//! handler; only Windows is built on the `crash-handler` crate. Neither has an
+//! iOS (or tvOS/watchOS) backend, so on every other target this crate compiles to a stub whose [`install`] returns
 //! an `Unsupported` error — the facade treats that as "no native capture"
 //! rather than failing the build, which is what lets the iOS C ABI link at all.
 //! Native crash capture for iOS needs its own backend; it is not provided here.
@@ -81,23 +89,46 @@ mod imp {
     /// MUST match `bugsee_core::recovery::MODULES_NAME`.
     const MODULES_NAME: &str = "crash.modules";
 
-    /// Keeps the native crash handler installed for its lifetime.
+    /// Keeps the in-process crash handler installed for its lifetime.
     #[cfg(windows)]
-    pub struct NativeHandler {
+    pub(crate) struct InProcessGuard {
         _handler: CrashHandler,
     }
 
-    /// Keeps the native crash handler installed for its lifetime (dropping it puts
-    /// the previously installed handlers back).
+    /// Keeps the in-process crash handler installed for its lifetime (dropping it
+    /// puts the previously installed handlers back).
     #[cfg(unix)]
-    pub struct NativeHandler {
+    pub(crate) struct InProcessGuard {
         _private: (),
     }
 
     #[cfg(unix)]
-    impl Drop for NativeHandler {
+    impl Drop for InProcessGuard {
         fn drop(&mut self) {
             posix::uninstall();
+        }
+    }
+
+    impl bugsee_native_api::BackendGuard for InProcessGuard {}
+
+    /// The in-process backend: a signal / Mach-exception / SEH handler written in
+    /// Rust (on top of the `crash-handler` crate on Windows) that writes an
+    /// async-signal-safe marker for next-launch recovery. Needs no helper process
+    /// and no third-party native code, which is why it is the default wherever
+    /// nothing better exists.
+    pub struct InProcessBackend;
+
+    impl bugsee_native_api::CrashBackend for InProcessBackend {
+        fn name(&self) -> &'static str {
+            "in-process"
+        }
+
+        fn install(
+            &self,
+            config: &bugsee_native_api::BackendConfig,
+        ) -> std::io::Result<Box<dyn bugsee_native_api::BackendGuard>> {
+            let guard = install_in_process(config.crash_info_path.clone())?;
+            Ok(Box::new(guard))
         }
     }
 
@@ -136,7 +167,7 @@ mod imp {
 
     /// Install the native crash handler, writing the marker to `crash_info_path` on
     /// a fatal crash. Keep the returned guard alive for the handler to stay active.
-    pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
+    fn install_in_process(crash_info_path: PathBuf) -> std::io::Result<InProcessGuard> {
         #[cfg(unix)]
         install_fork_hook();
         publish_marker_path(&crash_info_path);
@@ -156,7 +187,7 @@ mod imp {
         #[cfg(unix)]
         {
             posix::install()?;
-            Ok(NativeHandler { _private: () })
+            Ok(InProcessGuard { _private: () })
         }
         #[cfg(windows)]
         {
@@ -179,7 +210,7 @@ mod imp {
             })
             .map_err(|e| std::io::Error::other(format!("crash handler attach failed: {e}")))?;
 
-            Ok(NativeHandler { _handler: handler })
+            Ok(InProcessGuard { _handler: handler })
         }
     }
 
@@ -742,6 +773,19 @@ mod imp {
             0x4000_0015 => SIGABRT, // FATAL_APP_EXIT
             0xC000_000D => SIGABRT, // INVALID_PARAMETER
             0xC000_0025 => SIGABRT, // NONCONTINUABLE_EXCEPTION (purecall)
+            // The fast-fail family. A real `__fastfail` (`int 0x29`) and
+            // `RaiseFailFastException` never reach an in-process handler, but the
+            // same codes DO arrive when raised as ordinary exceptions: 0xC0000420
+            // from `__int2c`/`NT_ASSERT`, and third-party `RaiseException` calls
+            // using these codes. They mean "the program gave up" like the above.
+            0xC000_0409 => SIGABRT, // STACK_BUFFER_OVERRUN (fast-fail / `/GS`)
+            0xC000_0602 => SIGABRT, // FAIL_FAST_EXCEPTION
+            0xC000_0420 => SIGABRT, // ASSERTION_FAILURE
+            0xC000_0006 => SIGBUS,  // IN_PAGE_ERROR (a failed mapped-file read)
+            0xC000_0090 | 0xC000_0091 | 0xC000_0093 => SIGFPE, // FLT_INVALID_OPERATION/OVERFLOW/UNDERFLOW
+            0xC000_008F | 0xC000_0092 => SIGFPE, // FLT_INEXACT_RESULT / FLT_STACK_CHECK
+            0xC000_02B4 | 0xC000_02B5 => SIGFPE, // FLT_MULTIPLE_FAULTS / FLT_MULTIPLE_TRAPS
+            0xC000_008D => SIGFPE,               // FLT_DENORMAL_OPERAND
             _ => 0,
         }
     }
@@ -2968,8 +3012,32 @@ mod imp {
                 0x4000_0015,    // FATAL_APP_EXIT
                 0xC000_000D,    // INVALID_PARAMETER
                 0xC000_0025,    // NONCONTINUABLE_EXCEPTION (purecall)
+                0xC000_0409,    // STACK_BUFFER_OVERRUN (fast-fail / `/GS`)
+                0xC000_0602,    // FAIL_FAST_EXCEPTION
+                0xC000_0420,    // ASSERTION_FAILURE
             ] {
                 assert_eq!(exception_to_signal(code as i32), 6, "code {code:#x}");
+            }
+        }
+
+        #[test]
+        fn the_remaining_hardware_faults_keep_their_posix_class() {
+            assert_eq!(
+                exception_to_signal(0xC000_0006u32 as i32),
+                7,
+                "IN_PAGE_ERROR"
+            );
+            for code in [
+                0xC000_0090u32,
+                0xC000_0091,
+                0xC000_0092,
+                0xC000_0093,
+                0xC000_008F,
+                0xC000_008D,
+                0xC000_02B4,
+                0xC000_02B5,
+            ] {
+                assert_eq!(exception_to_signal(code as i32), 8, "code {code:#x}");
             }
         }
 
@@ -3037,23 +3105,23 @@ pub use imp::*;
     target_os = "windows"
 )))]
 mod unsupported {
-    use std::path::PathBuf;
+    use bugsee_native_api::{BackendConfig, BackendGuard, CrashBackend};
 
-    /// Placeholder: there is no native handler on this target.
-    pub struct NativeHandler;
+    /// The backend for a target that has none: installing always fails with
+    /// `Unsupported`, which the facade treats as "no native capture".
+    pub struct InProcessBackend;
 
-    // Matches the real handler's Drop contract, so callers' deliberate
-    // `drop(handler)` is not `clippy::drop_non_drop` on this target.
-    impl Drop for NativeHandler {
-        fn drop(&mut self) {}
-    }
+    impl CrashBackend for InProcessBackend {
+        fn name(&self) -> &'static str {
+            "unsupported"
+        }
 
-    /// Always fails: no native crash handler exists for this target.
-    pub fn install(_crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "native crash capture is not implemented for this target",
-        ))
+        fn install(&self, _config: &BackendConfig) -> std::io::Result<Box<dyn BackendGuard>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "native crash capture is not implemented for this target",
+            ))
+        }
     }
 
     /// No modules are enumerated on an unsupported target.
@@ -3070,3 +3138,114 @@ mod unsupported {
     target_os = "windows"
 )))]
 pub use unsupported::*;
+
+pub use bugsee_native_api::{BackendConfig, BackendGuard, CrashBackend};
+
+use std::path::PathBuf;
+
+/// Keeps the native crash handler installed for its lifetime.
+pub struct NativeHandler {
+    _guard: Box<dyn BackendGuard>,
+}
+
+/// The backend used when none is chosen explicitly.
+///
+/// Today that is the in-process Rust handler everywhere it exists (and a stub
+/// that reports `Unsupported` elsewhere). This is the one place a platform's
+/// default changes when it gains a better engine — PLCrashReporter on Apple
+/// mobile, Crashpad on Android.
+pub fn default_backend() -> Box<dyn CrashBackend> {
+    Box::new(InProcessBackend)
+}
+
+/// Install the default backend, writing the marker to `crash_info_path` on a
+/// fatal crash. Keep the returned guard alive for the handler to stay active.
+pub fn install(crash_info_path: PathBuf) -> std::io::Result<NativeHandler> {
+    install_with(&*default_backend(), BackendConfig::new(crash_info_path))
+}
+
+/// Install a specific backend. This is what lets a host (or a test) pick an
+/// engine other than the platform default.
+pub fn install_with(
+    backend: &dyn CrashBackend,
+    config: BackendConfig,
+) -> std::io::Result<NativeHandler> {
+    Ok(NativeHandler {
+        _guard: backend.install(&config)?,
+    })
+}
+
+#[cfg(test)]
+mod backend_plumbing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct Recorded(Arc<AtomicBool>);
+    impl BackendGuard for Recorded {}
+    impl Drop for Recorded {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct Fake {
+        dropped: Arc<AtomicBool>,
+        seen: std::sync::Mutex<Option<PathBuf>>,
+    }
+    impl CrashBackend for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn install(&self, config: &BackendConfig) -> std::io::Result<Box<dyn BackendGuard>> {
+            *self.seen.lock().unwrap() = Some(config.crash_info_path.clone());
+            Ok(Box::new(Recorded(self.dropped.clone())))
+        }
+    }
+
+    struct Refusing;
+    impl CrashBackend for Refusing {
+        fn name(&self) -> &'static str {
+            "refusing"
+        }
+        fn install(&self, _: &BackendConfig) -> std::io::Result<Box<dyn BackendGuard>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    #[test]
+    fn a_chosen_backend_gets_the_session_config_and_is_uninstalled_on_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let fake = Fake {
+            dropped: dropped.clone(),
+            seen: Default::default(),
+        };
+        let handler = install_with(&fake, BackendConfig::new("/tmp/sess/crash.info")).unwrap();
+        assert_eq!(
+            fake.seen.lock().unwrap().as_deref(),
+            Some(std::path::Path::new("/tmp/sess/crash.info"))
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "installed while held");
+        drop(handler);
+        assert!(dropped.load(Ordering::SeqCst), "dropping uninstalls");
+    }
+
+    #[test]
+    fn a_backend_that_refuses_surfaces_its_error_rather_than_a_handler() {
+        let err = install_with(&Refusing, BackendConfig::new("/tmp/x"))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn the_session_dir_is_the_markers_parent() {
+        let c = BackendConfig::new("/data/gen-3/crash.info");
+        assert_eq!(c.session_dir(), Some(std::path::Path::new("/data/gen-3")));
+    }
+
+    #[test]
+    fn the_default_backend_is_named() {
+        assert!(!default_backend().name().is_empty());
+    }
+}
