@@ -433,6 +433,7 @@ fn a_failed_put_retries_at_the_put_and_does_not_mint_a_duplicate_issue() {
     );
 }
 
+#[cfg(unix)]
 /// Lay down what a previous run left behind: a queued report nobody delivered and
 /// a session that died (marker left, owner gone).
 fn seed_leftovers(dir: &Path) {
@@ -470,6 +471,7 @@ fn seed_leftovers(dir: &Path) {
     std::fs::write(dir.join("gen"), "1").unwrap();
 }
 
+#[cfg(unix)]
 fn wait_for_bundles(transport: &MockTransport, n: usize) -> usize {
     let start = std::time::Instant::now();
     while transport.uploaded_bundles.lock().unwrap().len() < n
