@@ -214,6 +214,8 @@ const STEMS: &[&str] = &[
     "xsrf",
     "bearer",
     "jwt",
+    // OAuth 1.0a `oauth_verifier` and PKCE `code_verifier`.
+    "verifier",
 ];
 
 /// Names matched only exactly (too ambiguous to match as substrings).
@@ -241,7 +243,7 @@ const TEXT_STRONG: &[&str] = &[
     "bearer",
     "sessionid",
     "sessiontoken",
-    // OAuth 1.0a verifier/PIN: structured matching redacts these via `auth`.
+    // OAuth 1.0a verifier/PIN and PKCE `code_verifier` (kept in step with `STEMS`).
     "verifier",
     "oauthpin",
 ];
@@ -1835,6 +1837,7 @@ mod tests {
             "oauth_verifier=[redacted]&x=1"
         );
         assert_eq!(s("oauth_pin=1234"), "oauth_pin=[redacted]");
+        assert_eq!(s("code_verifier=abcXYZ123"), "code_verifier=[redacted]");
         assert_eq!(s("pin=1234 otp=654321"), "pin=[redacted] otp=[redacted]");
         assert_eq!(s(r#"{"otp": "654321"}"#), r#"{"otp": "[redacted]"}"#);
         assert_eq!(
@@ -2146,6 +2149,7 @@ mod tests {
             "authorization",
             "oauth",
             "oauth_verifier",
+            "code_verifier",
             "oauth_pin",
             "oauth_signature",
             "oauth_token",

@@ -441,6 +441,7 @@ mod tests {
         assert!(!s.contains("zzz") && !s.contains("yyy"), "{s}");
         assert!(!is_sensitive_header("authorization_endpoint"));
         assert!(is_sensitive_header("oauth_client_secret"));
+        assert!(is_sensitive_header("code_verifier"));
         let url = reqwest::Url::parse(
             "https://idp.example.com/cb?oauth_verifier=vvv&auth_url=u&oauth_pin=1234",
         )
