@@ -1152,18 +1152,15 @@ fn wait_for_launch_pass(shared: &Shared) {
     }
 }
 
-/// Directory entries the launch-path pass reads before giving up on finding more.
-const LAUNCH_SCAN_CAP: usize = 4096;
-
 /// The launch-path recovery pass (issue #10): turn the newest crashed sessions
 /// into durable queue entries BEFORE `launch` returns, so a host that dies again
 /// within milliseconds (a crash loop under a supervisor) cannot outrun the report
 /// of the crash before it. Only the queueing is synchronous; upload stays on the
 /// uploader thread.
 ///
-/// Bounded three ways: at most `max_sessions` are recovered, the scan reads at
-/// most [`LAUNCH_SCAN_CAP`] directory entries, and no new session is started once
-/// `budget` has elapsed. The budget is checked between sessions, so one session
+/// Bounded: at most `max_sessions` (plus as many already-attempted ones, so a
+/// session that faults in recovery still reaches `MAX_RECOVERY_ATTEMPTS`) are
+/// recovered, and no new session is started once `budget` has elapsed. The budget is checked between sessions, so one session
 /// can overrun it; the newest session is always attempted whatever the budget,
 /// since it is the one a crash loop is about to make unreachable. Newest first:
 /// the latest crash is the one most likely to be on the build now running, and
@@ -1174,12 +1171,7 @@ const LAUNCH_SCAN_CAP: usize = 4096;
 fn run_launch_recovery(shared: &Shared, plan: &LaunchPlan) {
     let started = Instant::now();
     let mut claimed = 0;
-    for pending in recovery::find_pending_bounded(
-        &plan.dir,
-        plan.generation,
-        LAUNCH_SCAN_CAP,
-        plan.max_sessions,
-    ) {
+    for pending in recovery::find_pending_bounded(&plan.dir, plan.generation, plan.max_sessions) {
         if claimed > 0 && started.elapsed() >= plan.budget {
             break;
         }
@@ -1219,8 +1211,15 @@ fn recover_one(
             queue::Admission::Admit => {}
             // A crash loop reports the same crash on every start: the first one
             // is already queued, and another copy adds nothing the server keeps.
-            queue::Admission::Duplicate | queue::Admission::Full => {
+            queue::Admission::Duplicate => {
                 recovery::discard(data_dir, pending);
+                return;
+            }
+            // A unique crash the queue has no room for on the launch path:
+            // keep its evidence and leave it to the worker's pass, which does not
+            // cap, rather than destroy it.
+            queue::Admission::Full => {
+                shared.launch_attempted.lock().remove(&pending.generation);
                 return;
             }
         }
