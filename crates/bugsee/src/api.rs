@@ -143,6 +143,8 @@ impl Bugsee {
         config.on_report_dropped = options.on_report_dropped;
         config.before_breadcrumb = options.before_breadcrumb;
         config.sample_rate = options.sample_rate;
+        config.scrub = options.scrub.clone();
+        config.rate_limit = options.rate_limit.clone();
         config.launch_recovery_budget = options.launch_recovery_budget;
         config.release_health = options.release_health;
         config.app_identity = bugsee_core::model::environment::AppIdentity {
@@ -587,6 +589,11 @@ impl Bugsee {
         operation: impl Into<String>,
     ) -> crate::perf::Transaction {
         crate::perf::Transaction::start(name.into(), operation.into())
+    }
+
+    /// Reports the rate limiter has suppressed since launch (`0` before launch).
+    pub fn suppressed_reports() -> u64 {
+        Self::with_recorder(|r| r.suppressed_reports()).unwrap_or(0)
     }
 
     /// Block until pending work drains, or `timeout` elapses.

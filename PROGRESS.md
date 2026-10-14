@@ -35,8 +35,33 @@ in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-struct
 | 2 — Handled errors + caught panics | ✅ | `catch_unwind` guards, panic snapshot, error/cause chains. Follow-ups: `tracing` Layer + `log` adapter done. Subsystem quarantine still open. |
 | 3 — Fatal + next-launch + correlation | ✅ (core) | Native handler, session generations + liveness markers, next-launch recovery, panic↔SIGABRT correlation, client-side native dedup signature from frame offsets. **New:** Windows native capture — SEH/VEH handler, PE CodeView module map, marker + frame capture — so all three desktop platforms report fatal crashes. In-flight events are now flushed at crash (bounded 50 ms, signal-safe wake of the capture worker; #13). Open: full out-of-process minidump. |
 | 4 — Integrations & APM | ✅ (core) | APM transactions/spans, sysinfo telemetry, reqwest network capture. **New:** the environment is actually populated — OS version, kernel, memory, disk, locale, and app identity (`package_id`/`version`/`build`) via `LaunchOptions::app_version`. Open: sessions / release-health. |
-| 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. **New:** `on_report_dropped` — delivery failure is observable at last; `flush()` alone never could distinguish delivered from discarded. Open: general PII scrubber, rate limits. |
+| 5 — Hardening | ✅ (core) | Durable retry queue (backoff, retry cap, blacklist), `before_send`/`before_breadcrumb`, event sampling. **New:** `on_report_dropped` — delivery failure is observable at last; `flush()` alone never could distinguish delivered from discarded. **New:** general PII scrubber (`bugsee_core::scrub`, on by default, `disable_scrubbing()`) and token-bucket rate limiting (`bugsee_core::ratelimit`, on by default, `disable_rate_limiting()`, `DropReason::RateLimited`). |
 | 6 — Mobile/FFI | ✅ (core) | `bugsee-ffi` C ABI (`include/bugsee.h`). Open: actual iOS/Android target builds + Swift/Kotlin wrappers. |
+
+## Behaviour change: PII scrubbing and rate limiting are ON by default (issue #11)
+
+There is no CHANGELOG file in this repo, so this is the migration note. Upgrading
+changes what leaves the process:
+
+- **Scrubbing (default on).** Every report is scrubbed at assembly, after
+  `before_send`: capture channels, `crash.json`, summary/description/labels/
+  attributes, `request.json` (environment) and the session-registration
+  environment. Emails, known token shapes, PEM private keys, URL passwords,
+  `password=`-style values, card numbers and home-directory user names become
+  markers (`[email]`, `[token]`, `[redacted]`, `[card]`, `[user]`). The reporter's
+  `email` identity and the dedup `signatures` are never touched; attachments and
+  minidumps are opaque and not scrubbed. Tune with `LaunchOptions::scrub(...)`
+  (`allow`/`deny`/`sensitive_keys`), disable with `disable_scrubbing()`.
+- **Rate limiting (default on).** Non-fatal errors: per signature burst 5, +1/10 s;
+  global burst 60, +1/s. Crashes bypass those and use a crash floor (burst 20,
+  +1/6 s, never below 1); manual bug reports are exempt. Drops surface as
+  `DropReason::RateLimited` and as the `bugsee.reports_suppressed` attribute on
+  the next admitted non-crash report; `Recorder::suppressed_reports()` gives the
+  running total. Tune with `LaunchOptions::rate_limit(...)`, disable with
+  `disable_rate_limiting()`.
+- Apps that relied on raw values appearing in reports (an email in a log line, a
+  token-looking attribute) must opt out or add `allow` entries.
+- `bugsee-ffi` does not expose these options yet (follow-up); it gets the defaults.
 
 ## Recent work — the symbol pipeline, end to end (`f224188`, `3e2f9bf`, `51f4dc7`)
 
@@ -540,7 +565,6 @@ Rust and are worth evaluating before building one.
 - Phase 2: subsystem quarantine (auto-disable a repeatedly-faulting integration).
 - Phase 3: full out-of-process minidump (desktop) — see the backend note below, which is the same machinery.
 - Phase 4: sessions / release-health: SDK half done, experimental and off by default (#12: eager session registration plus local session records; the backend has no session-health ingest, see DESIGN.md §10).
-- Phase 5: general PII scrubber, rate limits.
 - Phase 6: iOS/Android target builds; Swift/Kotlin language wrappers.
 - CI: ~~cross-platform matrix~~ **done**; loom/miri/fuzz jobs still open — fuzzing is
   newly justified now that `pe_debug_id` parses headers of arbitrary third-party

@@ -123,6 +123,12 @@ pub enum DropReason {
     /// full, so it was dropped rather than queued. Only seen with an unusable
     /// data directory.
     StorageUnavailable,
+    /// Suppressed by the [`RateLimiter`](crate::ratelimit::RateLimiter) before
+    /// it was assembled (a noisy error loop). Fires once per suppressed report
+    /// from the capture worker thread, so keep the hook cheap. The running
+    /// count is attached to the next admitted non-crash report as the
+    /// `bugsee.reports_suppressed` attribute.
+    RateLimited,
 }
 
 /// Called when a report is abandoned. See [`DropReason`].
@@ -174,6 +180,10 @@ pub struct RecorderConfig {
     /// Fraction of non-fatal (`error`) reports to keep, in `[0, 1]`. Crashes are
     /// never sampled out.
     pub sample_rate: f64,
+    /// PII scrubber applied to every report at assembly. On by default.
+    pub scrub: crate::scrub::ScrubConfig,
+    /// Report-volume limits applied before the durable queue. On by default.
+    pub rate_limit: crate::ratelimit::RateLimitConfig,
     /// Max in-flight capture entries before new ones are dropped (back-pressure).
     pub max_queued_entries: usize,
     /// `Some(reason)` skips the disk entirely and runs in [`StorageMode::Memory`].
@@ -220,6 +230,8 @@ impl RecorderConfig {
             on_report_dropped: None,
             before_breadcrumb: None,
             sample_rate: 1.0,
+            scrub: Default::default(),
+            rate_limit: Default::default(),
             max_queued_entries: DEFAULT_MAX_QUEUED,
             memory_only: None,
             legacy_data_dir: None,
@@ -261,6 +273,8 @@ struct Shared {
     on_report_dropped: Option<OnReportDropped>,
     before_breadcrumb: Option<BeforeBreadcrumb>,
     sample_rate: f64,
+    scrubber: Option<crate::scrub::Scrubber>,
+    limiter: crate::ratelimit::RateLimiter,
     /// In-flight capture entries queued to the worker (back-pressure counter).
     queued: AtomicUsize,
     max_queued: usize,
@@ -338,8 +352,10 @@ impl ForkLockable for Shared {
         self.launch_plan.fork_lock();
         self.launch_attempted.fork_lock();
         self.health.fork_lock();
+        self.limiter.fork_lock();
     }
     fn fork_unlock(&self) {
+        self.limiter.fork_unlock();
         self.health.fork_unlock();
         self.launch_attempted.fork_unlock();
         self.launch_plan.fork_unlock();
@@ -425,7 +441,19 @@ impl Recorder {
             &config.host_facts,
             &config.app_identity,
         );
-        let environment_json = serde_json::to_vec(&env).unwrap_or_default();
+        let scrubber = config
+            .scrub
+            .enabled
+            .then(|| crate::scrub::Scrubber::new(config.scrub.clone()));
+        // The session-registration body carries the environment too (paths,
+        // host facts), so it is scrubbed like every report's request.json.
+        let mut environment_json = serde_json::to_vec(&env).unwrap_or_default();
+        if let Some(clean) = scrubber
+            .as_ref()
+            .and_then(|s| s.scrub_json_bytes(&environment_json))
+        {
+            environment_json = clean;
+        }
         let shared = Arc::new(Shared {
             scope: ForkLock::new(Scope::default()),
             env,
@@ -437,6 +465,8 @@ impl Recorder {
             on_report_dropped: config.on_report_dropped,
             before_breadcrumb: config.before_breadcrumb,
             sample_rate: config.sample_rate,
+            scrubber,
+            limiter: crate::ratelimit::RateLimiter::new(config.rate_limit),
             queued: AtomicUsize::new(0),
             max_queued: config.max_queued_entries.max(1),
             report_queued: AtomicUsize::new(0),
@@ -787,6 +817,11 @@ impl Recorder {
     /// should not install the native handler.
     pub fn storage_mode(&self) -> StorageMode {
         self.storage
+    }
+
+    /// Reports suppressed by the rate limiter since launch.
+    pub fn suppressed_reports(&self) -> u64 {
+        self.shared.limiter.suppressed_total()
     }
 
     /// Whether a disk write has failed since launch (disk full, permission
@@ -1490,7 +1525,9 @@ fn recover_one(
     }
 
     let window = TimeWindow { start, end };
-    let assembled = reporting::assemble_with_extras(
+    // Scrubbed here, once: the recovered crash's capture channels, crash.json and
+    // metadata all pass through `assemble_docs`, whichever way it is delivered.
+    let assembled = reporting::assemble_scrubbed(
         &pending.parts_dir,
         window,
         &built.meta,
@@ -1499,6 +1536,7 @@ fn recover_one(
         &built.extra_files,
         &shared.app_token,
         end,
+        shared.scrubber.as_ref(),
     );
     // A full or read-only directory cannot take the queue entry; deliver from
     // memory instead of losing the crash for this launch. The evidence stays on
@@ -1782,15 +1820,20 @@ fn deliver_snapshot(
             return false; // handle's Drop reclaims the snapshot dir
         }
     }
+    let Some(carried) = admit(shared, &mut meta) else {
+        return false;
+    };
     // The snapshot dir is reclaimed by `handle`'s Drop on return (any path).
-    let assembled = reporting::assemble(
+    let assembled = reporting::assemble_scrubbed(
         &handle.dir,
         handle.window,
         &meta,
         &shared.env,
         None,
+        &[],
         &shared.app_token,
         handle.window.end,
+        shared.scrubber.as_ref(),
     )
     // The snapshot became unreadable (disk gone): still send what we know.
     .or_else(|_| {
@@ -1799,7 +1842,10 @@ fn deliver_snapshot(
     });
     match assembled {
         Ok(assembled) => persist_or_hold(shared, data_dir, assembled),
-        Err(_) => false,
+        Err(_) => {
+            shared.limiter.restore_suppressed(carried);
+            false
+        }
     }
 }
 
@@ -1835,6 +1881,7 @@ fn assemble_in_memory(
         &[],
         &shared.app_token,
         window.end,
+        shared.scrubber.as_ref(),
     )
 }
 
@@ -1869,6 +1916,31 @@ fn hold_in_memory(shared: &Shared, report: AssembledReport) {
     }
 }
 
+/// Apply the rate limiter. On admission, folds the count of reports suppressed
+/// since the last admitted non-crash one into `meta` (so the backend can see
+/// volume was cut) and returns that count, which the caller must hand back via
+/// `limiter.restore_suppressed` if the report then fails to assemble. `None`
+/// means the report was suppressed.
+fn admit(shared: &Shared, meta: &mut ReportMeta) -> Option<u64> {
+    use crate::ratelimit::Decision;
+    let sig = meta.signatures.first().map_or("", String::as_str);
+    match shared.limiter.check(meta.issue_type, sig) {
+        Decision::Allow { suppressed_before } => {
+            if suppressed_before > 0 {
+                meta.attrs.insert(
+                    "bugsee.reports_suppressed".into(),
+                    Value::from(suppressed_before),
+                );
+            }
+            Some(suppressed_before)
+        }
+        Decision::Deny => {
+            notify_dropped(shared, DropReason::RateLimited);
+            None
+        }
+    }
+}
+
 fn process_report(
     store: Option<&mut PartStore>,
     shared: &Shared,
@@ -1895,11 +1967,21 @@ fn process_report(
         return Ok(());
     }
 
-    // Suppress reports the server blacklisted (the too-many-similar verdict), from the
-    // in-memory set (the only one with no usable disk) or the on-disk one.
-    if mem_blacklisted(shared, &meta.signatures)
-        || data_dir.is_some_and(|dir| queue::any_blacklisted(dir, &meta.signatures))
-    {
+    // Suppress reports the server blacklisted (the too-many-similar verdict). Order
+    // matters for a storm: the in-memory set is a lock + hash, so it goes first;
+    // the rate limiter comes next (also lock + hash), so a flood of denied
+    // reports never touches the disk; only the reports the limiter ADMITS pay
+    // for the on-disk `.blacklist` read (which, unlike the in-memory set, also
+    // sees blacklistings written by sibling processes sharing the directory).
+    if mem_blacklisted(shared, &meta.signatures) {
+        return Ok(());
+    }
+    let Some(carried) = admit(shared, &mut meta) else {
+        return Ok(());
+    };
+    if data_dir.is_some_and(|dir| queue::any_blacklisted(dir, &meta.signatures)) {
+        // Dropped after all: hand the suppressed-count summary back.
+        shared.limiter.restore_suppressed(carried);
         return Ok(());
     }
 
@@ -1925,7 +2007,13 @@ fn process_report(
             if has_disk {
                 shared.degraded.store(true, Ordering::Relaxed);
             }
-            assemble_in_memory(shared, &meta, window, crash_json)?
+            match assemble_in_memory(shared, &meta, window, crash_json) {
+                Ok(assembled) => assembled,
+                Err(e) => {
+                    shared.limiter.restore_suppressed(carried);
+                    return Err(e);
+                }
+            }
         }
     };
 
@@ -1961,14 +2049,16 @@ fn assemble_from_disk(
     store
         .snapshot_into(&handle.dir, window.start, window.end)
         .ok()?;
-    reporting::assemble(
+    reporting::assemble_scrubbed(
         &handle.dir,
         window,
         meta,
         &shared.env,
         crash_json,
+        &[],
         &shared.app_token,
         window.end,
+        shared.scrubber.as_ref(),
     )
     .ok()
 }

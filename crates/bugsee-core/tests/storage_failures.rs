@@ -226,7 +226,7 @@ fn legacy_directory_leftovers_are_delivered_once_and_cleaned_up() {
         &Default::default(),
     );
     let window = TimeWindow { start: 0, end: 1 };
-    let stranded = assemble_docs(Vec::new(), window, &meta, &env, None, &[], "T", 1).unwrap();
+    let stranded = assemble_docs(Vec::new(), window, &meta, &env, None, &[], "T", 1, None).unwrap();
     bugsee_core::queue::enqueue(&legacy, &stranded).unwrap();
 
     // ...and a session of that build that died (marker left behind, owner gone).
@@ -456,6 +456,7 @@ fn seed_leftovers(dir: &Path) {
         &[],
         "T",
         1,
+        None,
     )
     .unwrap();
     bugsee_core::queue::enqueue(dir, &queued).unwrap();
@@ -764,6 +765,7 @@ fn terminal_verdicts_on_an_undeletable_queue_are_not_resent() {
             &[],
             "T",
             1,
+            None,
         )
         .unwrap();
         bugsee_core::queue::enqueue(&data, &queued).unwrap();
@@ -881,6 +883,7 @@ fn a_stop_during_a_flush_skips_disk_uploads_so_memory_gets_its_last_attempt() {
             &[],
             "T",
             1,
+            None,
         )
         .unwrap();
         bugsee_core::queue::enqueue(&data, &docs).unwrap();

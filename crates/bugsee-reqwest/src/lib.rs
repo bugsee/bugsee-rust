@@ -175,44 +175,14 @@ fn error_entry(id: &str, method: &str, url: &str, error: String) -> NetworkEntry
 /// Whether a key (query parameter, form field, or JSON object key) names a value
 /// that must be redacted. Used by URL, form-body, and recursive JSON redaction.
 ///
-/// Matching normalizes away case and separators so `accessToken`, `access_token`,
-/// and `access-token` all collapse to the same stem, then applies a substring
-/// heuristic (like [`is_sensitive_header`]) rather than exact equality — exact
-/// matching silently leaked common shapes like `accessToken`/`authorization`.
+/// Delegates to `bugsee_core::scrub::is_sensitive_key`, the single credential-key
+/// matcher shared with the general PII scrubber: normalised (case and separators
+/// ignored) substring match over a credential stem list, plus exact matches for
+/// the short ambiguous names `key`/`sig`/`pin`/`otp`.
 fn is_sensitive_param(name: &str) -> bool {
-    // Lowercase and drop non-alphanumerics: accessToken/access_token/access-token
-    // → "accesstoken"; x-api-key → "xapikey".
-    let n: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-
-    // Short, ambiguous tokens matched exactly to avoid over-redacting words that
-    // merely contain them (e.g. "keyword", "monkey", "design").
-    if matches!(n.as_str(), "key" | "sig" | "pin" | "otp") {
-        return true;
-    }
-    // Credential-bearing stems; substring so compounds are covered
-    // (clientSecret, refreshToken, x-session-id, csrfToken, …).
-    const STEMS: &[&str] = &[
-        "password",
-        "passwd",
-        "passphrase",
-        "pwd",
-        "secret",
-        "token",
-        "apikey",
-        "auth",
-        "session",
-        "cookie",
-        "credential",
-        "signature",
-        "csrf",
-        "xsrf",
-        "bearer",
-    ];
-    STEMS.iter().any(|stem| n.contains(stem))
+    // One matcher for the whole SDK: the PII scrubber uses the same function, so
+    // a key redacted here is redacted everywhere (and vice versa).
+    bugsee::core::scrub::is_sensitive_key(name)
 }
 
 /// Header names whose values are redacted. Delegates to the SAME normalized
@@ -436,6 +406,53 @@ fn redact_json(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benign_token_like_names_are_not_redacted() {
+        let url = reqwest::Url::parse(
+            "https://api.example.com/v1?token_endpoint=a&cancellation_token=b&token_ttl=9&token=zzz",
+        )
+        .unwrap();
+        let s = sanitize_url(&url);
+        assert!(
+            s.contains("token_endpoint=a") && s.contains("cancellation_token=b"),
+            "{s}"
+        );
+        assert!(s.contains("token_ttl=9") && !s.contains("zzz"), "{s}");
+        assert!(!is_sensitive_header("WWW-Authenticate"));
+        assert!(!is_sensitive_header("token_url"));
+        // Public OIDC/OAuth metadata stays readable; credentials do not.
+        let url = reqwest::Url::parse(
+            "https://idp.example.com/cb?authorization_endpoint=a&oauth_client_id=b\
+             &token_endpoint_auth_method=c&client_id=d&redirect_uri=e&oauth_token=zzz\
+             &oauth_client_secret=yyy",
+        )
+        .unwrap();
+        let s = sanitize_url(&url);
+        for keep in [
+            "authorization_endpoint=a",
+            "oauth_client_id=b",
+            "token_endpoint_auth_method=c",
+            "client_id=d",
+            "redirect_uri=e",
+        ] {
+            assert!(s.contains(keep), "{keep} in {s}");
+        }
+        assert!(!s.contains("zzz") && !s.contains("yyy"), "{s}");
+        assert!(!is_sensitive_header("authorization_endpoint"));
+        assert!(is_sensitive_header("oauth_client_secret"));
+        assert!(is_sensitive_header("code_verifier"));
+        let url = reqwest::Url::parse(
+            "https://idp.example.com/cb?oauth_verifier=vvv&auth_url=u&oauth_pin=1234",
+        )
+        .unwrap();
+        let s = sanitize_url(&url);
+        assert!(
+            s.contains("auth_url=u") && !s.contains("vvv") && !s.contains("1234"),
+            "{s}"
+        );
+        assert!(is_sensitive_header("Authorization"));
+    }
 
     #[test]
     fn redacts_sensitive_query_params() {

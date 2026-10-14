@@ -134,6 +134,7 @@ fn launch_degrades_through_the_resolution_order() {
             &[],
             "TOKEN_A",
             1,
+            None,
         )
         .unwrap();
         bugsee::core::queue::enqueue(&ro, &queued).unwrap();
