@@ -190,7 +190,7 @@ pub fn next_attempt(report: &QueuedReport) -> i64 {
 /// The cached presigned upload endpoint for a report, if a prior attempt created
 /// the issue but the PUT failed transiently. A retry resumes at the PUT (step 3)
 /// instead of re-POSTing `create_issue` (which would mint a duplicate issue, or
-/// trip server dedup `12003` and drop the bundle without ever uploading it).
+/// trip server dedup and drop the bundle without ever uploading it).
 pub fn endpoint(report: &QueuedReport) -> Option<String> {
     std::fs::read_to_string(report.endpoint_path())
         .ok()
@@ -272,7 +272,7 @@ fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Persist crash signatures the server told us to stop sending (`12004`).
+/// Persist crash signatures the server told us to stop sending (the too-many-similar verdict).
 ///
 /// Appends only the not-yet-present signatures, each on its own line, under
 /// `O_APPEND`. Appending (rather than read-modify-rewrite of the whole set) is

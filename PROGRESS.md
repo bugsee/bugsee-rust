@@ -183,7 +183,7 @@ were pre-verified by inspection against `crash-handler` 0.6.3 + `libc`).
   60-retry cap while offline — forced attempts are decoupled from the counter, so
   a still-deliverable crash bundle can't be deleted in ~1.3 s. Retry now **resumes
   at the presigned PUT** via a persisted `.endpoint` sidecar instead of re-POSTing
-  `create_issue` (no duplicate issues / no `12003`-drop of an un-uploaded bundle).
+  `create_issue` (no duplicate issues / no duplicate-verdict drop of an un-uploaded bundle).
 - **PII (high):** failed-request network entries scrub the URL out of reqwest's
   error `Display` (was leaking full credential-bearing URLs); header redaction is
   unified onto the normalized param matcher (`signature`/`csrf`/`api_key` no
@@ -287,8 +287,8 @@ The defects, in the order they blocked things:
    application errors with `ok:false` and **HTTP 200**, but the transport only
    inspected the envelope for 4xx/5xx. The error degraded to "no endpoint in
    response", the report was dropped, and the server's explanation was thrown
-   away. The known codes `12003`/`12004` were reachable only on a 4xx too — so
-   `12004` skipped the signature blacklist entirely.
+   away. The known duplicate and too-many-similar verdicts were reachable only on a 4xx too — so
+   the latter skipped the signature blacklist entirely.
 3. **Nothing could observe a dropped report** (`1b2a456`). `flush()` returns
    "the queue is empty", and the queue drains on success *and* on permanent
    failure alike — so it returned `true` while the server accepted nothing.
