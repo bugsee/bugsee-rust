@@ -25,7 +25,7 @@ In-process capture is already shipped on Linux, macOS, Windows and Android (**[V
 
 **Goals**
 - Reliable fatal-crash reports for stack overflow, heap corruption, and (Windows) fast-fail/`abort()` where the in-process path cannot.
-- A crash artifact (minidump) that the server already symbolicates **[V]** (DESIGN §15: worker `crash/rust.py` handles the thin native variant "plus the generic minidump processor when a dump was harvested"; PDB support exists).
+- A crash artifact (minidump) that the backend already symbolicates **[V]** (DESIGN §15: the backend handles the thin native variant plus its generic minidump processing when a dump was harvested; PDB support exists).
 - Fully opt-in; zero behaviour change and zero extra process for users who do not enable it.
 - Graceful degradation: any failure to start or reach the monitor falls back to the in-process backend and never fails `launch`.
 - **No change to the wire format, to the meaning of `crash.info`/`crash.minidump` (native crash), or to the report-precedence rules** (native > lone panic > abnormal exit). Next-launch recovery **does** change, in three bounded ways (section 5.4): a new `crash.exit` marker that only enriches the abnormal-exit report, a launch-time bounded wait on a monitor lock plus a `crash.done` completeness check, and (later) preference for a persisted crash-time context. Old SDK versions ignore the new files.
@@ -70,7 +70,7 @@ Crates from EmbarkStudios (`crash-handler` **[V]** MIT OR Apache-2.0, `crash-con
 - Mitigation: wrap behind our own `OopEngine` trait inside `bugsee-monitor`; do not expose its types publicly.
 
 ### B. Crashpad as the out-of-process engine
-Apache-2.0 **[U]**; handler is a separate executable (`crashpad_handler`) **[U]**; supports Windows, macOS, Linux, Android **[U]**; Windows has a `crashpad_wer.dll` WER module for fast-fail/unusual crashes **[U]**. Per #4, Bugsee's Android SDK already vendors Crashpad, so there is in-house experience and a possible single engine across Android + desktop.
+Apache-2.0 **[U]**; handler is a separate executable (`crashpad_handler`) **[U]**; supports Windows, macOS, Linux, Android **[U]**; Windows has a `crashpad_wer.dll` WER module for fast-fail/unusual crashes **[U]**. Per #4, Crashpad is the planned Android engine, so there is a possible single engine across Android + desktop.
 - Pros: most battle-tested; WER module on Windows; same engine as Android (one place for fixes).
 - Cons: C++ build (GN/ninja or CMake wrapper) inside a Rust workspace; a mandatory separate executable to locate and ship (re-exec trick unavailable **[U]**); its own database and upload format (we would use it only to produce dumps, fighting its design); large third-party attack and licence surface; `-sys` + wrapper crate pair per #4's structure.
 - Not rejected: it is the right choice **if** maintainers decide one engine for Android and desktop (decision D2).
@@ -292,7 +292,7 @@ Extend the existing subprocess harness (**[V]** `crates/bugsee-native/tests/cras
 | Recovering host | runtime that recovers SIGSEGV hundreds/sec | no dump per recovered fault (a1564ae regression guard) |
 | Contract | recovery fed a monitor-produced directory | thin native variant identical in shape to in-process |
 
-Plus: a Windows real-hardware run for PDB round trip like PROGRESS.md did for in-process **[V]**; Docker + Yama matrix for Linux; a size/startup benchmark of re-exec mode; the full bundle fed to the worker ingest once that cross-repo E2E exists (DESIGN §13 planned).
+Plus: a Windows real-hardware run for PDB round trip like PROGRESS.md did for in-process **[V]**; Docker + Yama matrix for Linux; a size/startup benchmark of re-exec mode; the full bundle fed to the ingestion pipeline once an end-to-end staging check exists (DESIGN §13 planned).
 
 ---
 
