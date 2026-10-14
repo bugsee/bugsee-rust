@@ -87,7 +87,11 @@ fn child_entry() {
                 held.push(queue::try_claim(&q).expect("claim queue item"));
             }
             for p in recovery::find_pending(&dir, u64::MAX) {
-                held.push(recovery::claim_pending(&dir, &p).expect("claim session"));
+                held.push(
+                    recovery::claim_pending(&dir, &p)
+                        .expect("claim session")
+                        .expect("a real claim"),
+                );
             }
             // Signal readiness through the filesystem: libtest owns stdout.
             std::fs::write(dir.join("READY.tmp"), held.len().to_string()).unwrap();

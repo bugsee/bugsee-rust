@@ -353,10 +353,17 @@ pub fn bump_attempts(data_dir: &Path, pending: &PendingSession) -> u32 {
 
 /// Claim a pending session for recovery, so that of several processes sharing the
 /// data directory exactly one recovers it. The claim lives beside the liveness
-/// marker and is released when the returned guard drops. `None` if a peer holds
-/// it or has already recovered the session.
-pub fn claim_pending(data_dir: &Path, pending: &PendingSession) -> Option<crate::claim::Claim> {
-    let claim = crate::claim::try_claim(
+/// marker and is released when the returned guard drops.
+///
+/// Lenient (see [`crate::claim::try_claim_lenient`]): a full or read-only
+/// directory cannot take a claim file, and that is exactly when a stranded crash
+/// most needs recovering. `None` if a peer holds the claim or has already
+/// recovered the session; `Some(None)` means proceed without a claim.
+pub fn claim_pending(
+    data_dir: &Path,
+    pending: &PendingSession,
+) -> Option<Option<crate::claim::Claim>> {
+    let claim = crate::claim::try_claim_lenient(
         &data_dir
             .join("sessions")
             .join(format!("{}.recover.lock", pending.generation)),

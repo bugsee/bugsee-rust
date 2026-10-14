@@ -112,5 +112,62 @@ fn launch_degrades_through_the_resolution_order() {
     );
     drop(guard);
 
+    // 5. A requested directory that cannot take new files but already holds a
+    //    queued report (a full or read-only volume): memory mode, yet the
+    //    report a previous run left there is still delivered.
+    {
+        use bugsee::core::model::report::TimeWindow;
+        use std::os::unix::fs::PermissionsExt;
+
+        let ro = s.join("ro-volume");
+        let env = bugsee::core::model::environment::Environment::detect_with(
+            "t",
+            &Default::default(),
+            &Default::default(),
+        );
+        let queued = bugsee::core::reporting::assemble_docs(
+            Vec::new(),
+            TimeWindow { start: 0, end: 1 },
+            &bugsee::core::reporting::manual_upload_meta(),
+            &env,
+            None,
+            &[],
+            "TOKEN_A",
+            1,
+        )
+        .unwrap();
+        bugsee::core::queue::enqueue(&ro, &queued).unwrap();
+        for d in [ro.join("queue"), ro.clone()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        if std::fs::write(ro.join("probe"), b"x").is_err() {
+            let transport = Arc::new(MockTransport::default());
+            let guard = Bugsee::launch_with(
+                LaunchOptions::new("TOKEN_A")
+                    .data_dir(&ro)
+                    .with_transport(transport.clone()),
+            )
+            .expect("launch");
+            let status = Bugsee::storage_status().expect("status");
+            assert_eq!(status.mode, StorageMode::Memory);
+            assert!(status.explicit_rejected.is_some());
+            let start = std::time::Instant::now();
+            while transport.uploaded_bundles.lock().unwrap().is_empty()
+                && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                transport.uploaded_bundles.lock().unwrap().len(),
+                1,
+                "the stranded report must be delivered"
+            );
+            drop(guard);
+        }
+        for d in [ro.join("queue"), ro.clone()] {
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&s);
 }

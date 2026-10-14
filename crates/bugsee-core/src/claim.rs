@@ -93,6 +93,20 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
     }
 }
 
+/// Like [`try_claim`] for a directory that may be full or read-only, where the
+/// lock file cannot be created but the work (recover a crash, deliver a queued
+/// report) is still worth doing: `Some(None)` means "no claim could be made,
+/// proceed unclaimed". The cost is that two processes sharing such a directory
+/// may both do the work, and the backend deduplicates. `None` means another
+/// process (or thread) holds the claim.
+pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
+    match acquire(path) {
+        Acquire::Got(claim) => Some(Some(claim)),
+        Acquire::Unavailable => Some(None),
+        Acquire::Held => None,
+    }
+}
+
 /// Whether the lock file at `path` is held by a live process.
 pub(crate) enum Probe {
     Held,
