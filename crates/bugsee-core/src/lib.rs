@@ -35,6 +35,8 @@ pub mod session;
 pub mod signature;
 pub mod transport;
 pub mod util;
+#[cfg(windows)]
+mod win32;
 
 pub use model::{
     entry::{
