@@ -215,6 +215,11 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
             // emit the same panic twice.
             let worker_thread = worker_thread_name();
             let will_be_caught = guard_active();
+            // A main-thread panic nothing will catch is the process's last act under
+            // `panic = "abort"` (and usually under unwind too): drain the capture
+            // worker so the events emitted just before it are on disk. Bounded and
+            // best effort; a no-op when the SDK has no disk pipeline.
+            let likely_fatal = !will_be_caught && worker_thread.is_none();
             if !will_be_caught
                 && (worker_thread.is_some() || REPORT_FROM_HOOK.load(Ordering::SeqCst))
             {
@@ -247,6 +252,10 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
                     frames,
                 });
             });
+            if likely_fatal {
+                let _ =
+                    bugsee_core::crash_flush::flush_in_flight(std::time::Duration::from_millis(50));
+            }
             // Preserve prior hook behavior (default abort message, other SDKs).
             previous(info);
         }));

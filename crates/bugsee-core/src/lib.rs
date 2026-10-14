@@ -19,6 +19,7 @@
 pub mod bundle;
 pub mod capture;
 pub mod claim;
+pub mod crash_flush;
 pub mod errors;
 pub mod fork;
 pub mod model;

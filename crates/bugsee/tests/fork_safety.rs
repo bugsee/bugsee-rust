@@ -64,7 +64,12 @@ impl Transport for FileTransport {
     fn upload_bundle(&self, _: &str, zip: &[u8]) -> Result<(), TransportError> {
         let n = self.n.fetch_add(1, Ordering::SeqCst);
         let name = format!("{}-{n}.zip", std::process::id());
-        std::fs::write(self.dir.join(name), zip)
+        // Write-then-rename: a process killed mid-upload (a crashing worker now
+        // lingers briefly to flush in-flight events, so one can die with an upload
+        // under way) must not leave a half-written `.zip` for the test to read.
+        let tmp = self.dir.join(format!(".{name}.part"));
+        std::fs::write(&tmp, zip)
+            .and_then(|()| std::fs::rename(&tmp, self.dir.join(name)))
             .map_err(|e| TransportError::Transient(e.to_string()))
     }
 }

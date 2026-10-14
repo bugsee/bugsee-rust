@@ -43,5 +43,11 @@ name = "crash_e2e_matrix"
 harness = false
 required-features = ["native"]
 
+# Dies for real after a burst of events; needs its own `main`, like the above.
+[[test]]
+name = "crash_inflight"
+harness = false
+required-features = ["native"]
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

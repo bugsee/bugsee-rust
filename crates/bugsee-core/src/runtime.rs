@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::capture::{export, PartStore, WindowCaps};
+use crate::crash_flush::CrashFlush;
 use crate::fork::{ForkLock, ForkLockable};
 use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
@@ -314,6 +315,9 @@ pub struct Recorder {
     backoff_base: Duration,
     worker: Option<JoinHandle<()>>,
     uploader: Option<JoinHandle<()>>,
+    /// Lets a crash handler ask the worker to drain in-flight entries
+    /// ([`crate::crash_flush`]). `None` in memory mode (nothing to flush to).
+    crash_flush: Option<CrashFlush>,
 }
 
 /// The two pipeline threads and the channels that feed them.
@@ -322,6 +326,7 @@ struct Pipeline {
     upload_tx: Sender<UploadMsg>,
     worker: JoinHandle<()>,
     uploader: JoinHandle<()>,
+    crash_flush: Option<CrashFlush>,
 }
 
 impl Recorder {
@@ -415,6 +420,7 @@ impl Recorder {
             backoff_base: config.upload_backoff_base,
             worker: Some(pipeline.worker),
             uploader: Some(pipeline.uploader),
+            crash_flush: pipeline.crash_flush,
         })
     }
 
@@ -444,6 +450,9 @@ impl Recorder {
         // running anything.
         std::mem::forget(self.worker.take());
         std::mem::forget(self.uploader.take());
+        // Likewise the parent's crash-flush helper thread (and its wake handle,
+        // which the parent still uses).
+        std::mem::forget(self.crash_flush.take());
 
         // Entries queued to the dead worker will never be processed, so the
         // back-pressure counters they incremented would stay high forever and
@@ -496,6 +505,7 @@ impl Recorder {
         std::mem::forget(std::mem::replace(&mut self.upload_tx, pipeline.upload_tx));
         self.worker = Some(pipeline.worker);
         self.uploader = Some(pipeline.uploader);
+        self.crash_flush = pipeline.crash_flush;
         Ok(())
     }
 
@@ -622,6 +632,8 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        // Stop answering crash handlers before the worker goes away.
+        drop(self.crash_flush.take());
         // Signal both threads; JOIN only if they acknowledge within the timeout.
         // A thread wedged in a host callback with no timeout is DETACHED (its
         // JoinHandle dropped un-joined) rather than hanging the stopping thread
@@ -857,6 +869,7 @@ fn spawn_pipeline(
     let worker_shared = Arc::clone(shared);
     let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_upload_tx = upload_tx.clone();
+    let crash_flush = store.is_some().then(|| install_crash_flush(&tx)).flatten();
 
     let worker = std::thread::Builder::new()
         .name("bugsee-capture".into())
@@ -906,7 +919,23 @@ fn spawn_pipeline(
         upload_tx,
         worker,
         uploader,
+        crash_flush,
     })
+}
+
+/// How long the helper waits for the worker to acknowledge a crash-time flush.
+/// The crash handler gives up on its own, sooner; this only bounds the helper.
+const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Register this pipeline as the process's crash-time flush target. A failure
+/// (no pipe/event available) just forgoes the best-effort flush.
+fn install_crash_flush(tx: &Sender<Msg>) -> Option<CrashFlush> {
+    let tx = tx.clone();
+    CrashFlush::install(move || {
+        let (ack, done) = channel();
+        tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(CRASH_FLUSH_ACK_TIMEOUT).is_ok()
+    })
+    .ok()
 }
 
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
