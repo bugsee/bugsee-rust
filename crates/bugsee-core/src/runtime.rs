@@ -1560,7 +1560,9 @@ fn drain_all(
 /// is set so backing-off reports are retried immediately. Returns whether any
 /// report was attempted (used to pace `drain_until_empty`).
 fn drain(shared: &Shared, data_dir: Option<&Path>, backoff_base: Duration, force: bool) -> bool {
-    let attempted = drain_memory(shared, backoff_base, force, true, None, true);
+    // Not `honor_stop`: the scheduled pass behaves as before #8, and the
+    // stop-time drain relies on it having had its one attempt.
+    let attempted = drain_memory(shared, backoff_base, force, true, None, false);
     match data_dir {
         Some(dir) => drain_disk(shared, dir, backoff_base, force) | attempted,
         None => attempted,
@@ -1716,8 +1718,7 @@ fn notify_dropped(shared: &Shared, reason: DropReason) {
 /// to pick it and to settle it, never across the network), so the queue length is
 /// the true backlog and [`MAX_MEMORY_REPORTS`] holds. Stops at `deadline`, like
 /// the disk loop in [`drain_until_empty`]. With `honor_stop`, also stops as soon
-/// as the recorder is being stopped (only the stop-time drain itself passes
-/// `false`).
+/// as the recorder is being stopped (only an explicit flush passes `true`).
 fn drain_memory(
     shared: &Shared,
     backoff_base: Duration,
