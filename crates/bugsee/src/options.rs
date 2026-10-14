@@ -386,8 +386,16 @@ pub(crate) fn resolve_data_dir(
     let legacy = temp.join("bugsee").join(&token);
     // Also with no usable directory: leftovers there are exactly what a launch
     // that cannot write anywhere new should still deliver.
-    let chosen = found.as_ref().map(|(_, dir)| dir.as_path());
-    let legacy_dir = legacy_is_adoptable(&legacy, chosen).then_some(legacy);
+    // It must not be a directory we already use or recover from (on Windows the
+    // temp fallback IS the legacy location): a second recovery of the same
+    // session in one launch would deliver it twice and burn its attempt cap.
+    let others: Vec<&Path> = found
+        .as_ref()
+        .map(|(_, dir)| dir.as_path())
+        .into_iter()
+        .chain(recovery_dirs.iter().map(PathBuf::as_path))
+        .collect();
+    let legacy_dir = legacy_is_adoptable(&legacy, &others).then_some(legacy);
     match found {
         Some((source, dir)) => DataDirResolution {
             dir: Some(dir),
@@ -515,7 +523,7 @@ fn owned_by_us(_meta: &std::fs::Metadata) -> bool {
 /// would let someone else's tree, or our own live data directory, be processed
 /// (recovering our live session as a crash). Paths are compared canonicalised,
 /// not as strings, so another spelling of our own directory is rejected too.
-fn legacy_is_adoptable(legacy: &Path, chosen: Option<&Path>) -> bool {
+fn legacy_is_adoptable(legacy: &Path, others: &[&Path]) -> bool {
     let Some(parent) = legacy.parent() else {
         return false;
     };
@@ -525,11 +533,10 @@ fn legacy_is_adoptable(legacy: &Path, chosen: Option<&Path>) -> bool {
     let Ok(legacy) = legacy.canonicalize() else {
         return false;
     };
-    match chosen {
-        // No live directory of ours to collide with.
-        None => true,
-        Some(chosen) => chosen.canonicalize().is_ok_and(|c| c != legacy),
-    }
+    // An unresolvable path cannot be shown distinct, so it counts as a collision.
+    others
+        .iter()
+        .all(|other| other.canonicalize().is_ok_and(|c| c != legacy))
 }
 
 /// Prove a file can be created in `dir`. `create_new` with an unpredictable name
@@ -916,6 +923,60 @@ mod tests {
         assert!(r.dir.is_none());
         assert_eq!(r.recovery_dirs, vec![tree.clone()]);
         let _ = std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// Platform-agnostic: wherever the temp fallback coincides with the legacy
+    /// location (Windows), an unwritable existing tree there must be offered for
+    /// recovery once, as a recovery dir or as the legacy dir, never both.
+    #[test]
+    fn an_unwritable_temp_tree_is_recovered_from_exactly_once() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        // Make BOTH the private-named tree and the legacy tree exist; on unix
+        // they differ, on Windows they are the same directory.
+        for tree in [
+            tmp.join(private_temp_name()).join("tok"),
+            tmp.join("bugsee").join("tok"),
+        ] {
+            std::fs::create_dir_all(&tree).unwrap();
+        }
+        // Block writes everywhere: no home, and the writability probe cannot
+        // create files because the trees are read-only (unix) -- elsewhere the
+        // dirs simply win, which is fine: the invariant below still holds.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for tree in [
+                tmp.join(private_temp_name()).join("tok"),
+                tmp.join("bugsee").join("tok"),
+            ] {
+                std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o500)).unwrap();
+            }
+        }
+        let r = resolve_data_dir(None, "tok", &env_of(&[]), &|| tmp.clone());
+        let mut all: Vec<PathBuf> = r.recovery_dirs.clone();
+        all.extend(r.legacy_dir.clone());
+        all.extend(r.dir.clone());
+        let canon: Vec<PathBuf> = all.iter().filter_map(|p| p.canonicalize().ok()).collect();
+        let mut unique = canon.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            canon.len(),
+            unique.len(),
+            "one directory must not be in two roles: {all:?}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for tree in [
+                tmp.join(private_temp_name()).join("tok"),
+                tmp.join("bugsee").join("tok"),
+            ] {
+                let _ = std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o755));
+            }
+        }
         let _ = std::fs::remove_dir_all(&s);
     }
 

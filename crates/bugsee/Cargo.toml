@@ -29,10 +29,10 @@ default = ["net", "panic", "native", "telemetry"]
 net = ["dep:ureq"]
 # Global Rust panic observer + catch_unwind boundary guards.
 panic = ["dep:bugsee-panic"]
-# Native fatal-crash handler (signal/Mach exception) + next-launch recovery.
+# Native fatal-crash handler (POSIX signal / Windows SEH) + next-launch recovery.
 native = ["dep:bugsee-native"]
 # System/process telemetry sampling (traces.system) via sysinfo.
-telemetry = ["dep:sysinfo"]
+telemetry = ["dep:sysinfo", "dep:libc"]
 
 # The crash matrix needs the REAL main thread: an uncaught panic must unwind out
 # of `main`, and the panic observer treats any other thread as "a thread died",
@@ -42,6 +42,11 @@ telemetry = ["dep:sysinfo"]
 name = "crash_e2e_matrix"
 harness = false
 required-features = ["native"]
+
+# Local UTC offset and the hardware model are libc calls on unix; `libc` is
+# already in the tree via `bugsee-core` / `bugsee-native`, so this adds nothing.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

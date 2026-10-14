@@ -12,13 +12,14 @@ built in **Bugsee mobile-SDK style**, producing **backend-compatible report bund
 that ingest into the existing appserver/viewer unchanged. Design + decision log live
 in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-structure`.
 
-## Crates (8)
+## Crates (9)
 
 | Crate | Role |
 |---|---|
 | `bugsee-core` | Pure-`std` capture/persistence/export engine; recovery; queue; signatures. One contained `unsafe` (`kill(pid,0)` liveness probe, unix). |
 | `bugsee-panic` | Chained global panic observer + `catch_unwind` boundary guards. |
-| `bugsee-native` | Native fatal-crash handler (POSIX signal / Mach exception / Windows SEH) → allocation-free marker + frame capture + code-id-bearing module map (Mach-O `LC_UUID`, GNU build-id, PE CodeView) for next-launch recovery. |
+| `bugsee-native-api` | Dependency-free contract for native fatal-crash backends (`CrashBackend`, `BackendGuard`, `BackendConfig`). Backend crates — in-process, and planned PLCrashReporter (Apple mobile) and Crashpad (Android) — depend on this, not on the SDK or each other. |
+| `bugsee-native` | Native fatal-crash handler (POSIX signal on Linux/Android/macOS, SEH via `crash-handler` on Windows) → allocation-free marker + frame capture + code-id-bearing module map (Mach-O `LC_UUID`, GNU build-id, PE CodeView) for next-launch recovery. |
 | `bugsee` | Public facade + default `ureq` HTTP transport + APM. |
 | `bugsee-reqwest` | `reqwest` network-capture middleware (sanitized). |
 | `bugsee-tracing` | `tracing` `Layer`. |
@@ -223,7 +224,7 @@ and build/MSRV. Fixed (all validated):
   `mach_to_signal` unknown → UNKNOWN; `StackBuf::dec` `i64::MIN`-safe; `report_caught`
   blocking-lock snapshot cleanup; `0x00`-delimited signature hashing.
 - **Native crash dedup signature (new capability):** crash handler captures the crashing
-  thread's frame PCs async-signal-safely (Apple: `thread_get_state` + fault-safe
+  thread's frame PCs async-signal-safely (Apple: `ucontext` pc/fp + fault-safe
   `mach_vm_read_overwrite` FP-walk; Linux/Android: `backtrace::trace_unsynchronized`);
   module map snapshotted at install (`crash.modules`); recovery computes
   `native_signature` from ASLR-invariant `pc − base` offsets → local blacklist can now
@@ -426,14 +427,19 @@ can fix.
    browser SDK is also the remaining producer exposed to the
    `platform.jailbreak` class of bug — the appserver fix protects it now, but its
    `EnvironmentPlatform` is still `{type, os, locale}`.
-3. **Two environment fields remain unpopulated**, both needing a decision rather
-   than effort. `utc_offset`: the `time` crate refuses a local offset in a
-   multithreaded process (an SDK always is one), so it needs `localtime_r`/Win32
-   and a small `unsafe` — which belongs in the host crate, not core.
-   `hardware.model`: no `sysinfo` API, per-platform work, and on desktop it
-   yields a mainboard string worth little until Phase 6 puts this SDK on mobile.
-   Windows `locale` is likewise unset — `GetUserDefaultLocaleName` needs a
-   binding or a crate, and this SDK still takes no new dependencies.
+3. **Environment fields `utc_offset`, `hardware.model` and Windows `locale` are
+   now populated** (#16), in `crates/bugsee/src/hostinfo.rs` — the one place in
+   the host crate that calls the OS, so the `unsafe` stays out of core. No new
+   dependencies: `libc` (already in the tree) on unix, hand-declared
+   `kernel32`/`advapi32` calls on Windows. `utc_offset` is `localtime_r`
+   `tm_gmtoff` / `GetTimeZoneInformation` (the `time` crate refuses a local
+   offset in a multithreaded process). `hardware.model` is `sysctl hw.model` on
+   macOS/iOS, DMI `product_name` then the device-tree `model` on Linux, and the
+   SMBIOS `SystemProductName` registry value on Windows; firmware placeholders
+   ("To Be Filled By O.E.M.") are reported as absent, and Android reports none.
+   Windows `locale` falls back to the first preferred UI language (`GetUserPreferredUILanguages`, then `GetUserDefaultLocaleName`) when the POSIX
+   variables are unset. Windows code is type-checked and clippy-clean but its
+   tests have not been run on real hardware.
 
 ### Decided against
 
@@ -479,8 +485,26 @@ can fix.
 3. **Cross-instance queue/recovery exclusivity.** Multiple processes sharing a data dir can
    double-deliver a recovered/queued report. A lock-file fix risks a *permanent block* if
    the holder dies, so it needs real design (the server already dedups).
-4. **`crash-handler` crate resolves a private Apple libproc symbol** (App-Store sensitivity).
-   Third-party; track upstream / consider a fork or a different backend.
+4. ~~**`crash-handler` crate resolves a private Apple libproc symbol** (App-Store sensitivity).~~
+   **RESOLVED (#15).** The symbol is `proc_get_wakemon_params`, `dlsym`'d from libproc in
+   `crash-handler` 0.8 `src/mac/state.rs` (no public header; used to lift the wakeups
+   resource limit before handling `EXC_RESOURCE`). It was reachable on macOS whenever
+   `crash-handler`'s Mach backend was installed. Chosen option: our own handler — macOS
+   already uses the SDK's POSIX signal handler plus the Apple frame-capture code, and
+   `crash-handler` is a Windows-only dependency (#20), so no Mach-exception backend, fork
+   or upstream change was needed. Verified: `nm -u` of a release `libbugsee_ffi.dylib`
+   shows only public `libproc.h` imports (`proc_listallpids`/`proc_pidinfo`/
+   `proc_pidpath`/`proc_pid_rusage`, from `sysinfo` via the `telemetry` feature, which is
+   a default feature and always on in `bugsee-ffi`) and no `_dlsym` import. CI enforces
+   this on the release `libbugsee_ffi.dylib` (macOS job); `tests/macos_no_private_api.rs`
+   additionally scans the `bugsee-native` test binary. Privacy manifest: this crate ships
+   no `PrivacyInfo.xcprivacy`. Apple's required-reason API enforcement applies to
+   iOS/iPadOS/tvOS/visionOS/watchOS submissions; for macOS a manifest is optional, but an
+   app that adds one should declare the categories the SDK can touch: file timestamp
+   (`stat`), disk space (volume capacity keys, and `getfsstat`, whose `statfs` result
+   carries free space — not named in Apple's list, so declare it conservatively), and
+   system boot time (`mach_absolute_time`/uptime/`sysctl`, via `telemetry`). Based on
+   reading the code and Apple's docs, not a real submission.
 5. **Dependency-spec dedup** (LOW): centralize `zip`/`backtrace` in `[workspace.dependencies]`.
 
 ### Architecture to revisit — crash-handling backend
