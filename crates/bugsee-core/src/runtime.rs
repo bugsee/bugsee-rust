@@ -179,6 +179,10 @@ pub struct RecorderConfig {
     /// crashed sessions and deliver its queue. For a host layer that moved its
     /// default location and must not strand reports left at the old one.
     pub legacy_data_dir: Option<PathBuf>,
+    /// More existing directories to recover from and drain once, like
+    /// `legacy_data_dir`: trusted trees that could not take new files (a full or
+    /// read-only default) even though a later default was writable.
+    pub extra_data_dirs: Vec<PathBuf>,
 }
 
 impl RecorderConfig {
@@ -201,6 +205,7 @@ impl RecorderConfig {
             max_queued_entries: DEFAULT_MAX_QUEUED,
             memory_only: None,
             legacy_data_dir: None,
+            extra_data_dirs: Vec::new(),
         }
     }
 }
@@ -419,7 +424,11 @@ impl Recorder {
             config.upload_backoff_base,
             config.sampler,
             true,
-            config.legacy_data_dir,
+            config
+                .legacy_data_dir
+                .into_iter()
+                .chain(config.extra_data_dirs)
+                .collect(),
         )?;
 
         Ok(Recorder {
@@ -509,7 +518,7 @@ impl Recorder {
             self.backoff_base,
             sampler,
             false,
-            None,
+            Vec::new(),
         )?;
 
         // The parent's session is still the parent's: leave its marker alone.
@@ -862,16 +871,16 @@ fn spawn_pipeline(
     backoff_base: Duration,
     sampler: Option<Box<dyn TelemetrySampler>>,
     fresh_launch: bool,
-    legacy_data_dir: Option<PathBuf>,
+    legacy_data_dirs: Vec<PathBuf>,
 ) -> std::io::Result<Pipeline> {
     // Uploader thread: drains the durable queue with retry.
     let (upload_tx, upload_rx) = channel();
     let uploader_shared = Arc::clone(shared);
     let uploader_data_dir = drain_dir.map(Path::to_path_buf);
-    let uploader_legacy = legacy_data_dir.clone();
+    let uploader_legacy = legacy_data_dirs.clone();
     // Set once the worker has finished recovering the legacy directory, so the
     // uploader does not retire it while recovery is still about to fill its queue.
-    let legacy_ready = Arc::new(AtomicBool::new(legacy_data_dir.is_none()));
+    let legacy_ready = Arc::new(AtomicBool::new(legacy_data_dirs.is_empty()));
     let uploader_ready = Arc::clone(&legacy_ready);
     let uploader = std::thread::Builder::new()
         .name("bugsee-uploader".into())
@@ -909,6 +918,14 @@ fn spawn_pipeline(
                 if let (true, Some(dir)) = (fresh_launch, &worker_drain_dir) {
                     queue::gc_orphans(dir);
                 }
+                // With no writable disk the in-memory set is the only blacklist
+                // `process_report` consults, so seed it from what is on disk.
+                if let Some(dir) = &worker_drain_dir {
+                    let known = queue::blacklisted_signatures(dir);
+                    if !known.is_empty() {
+                        worker_shared.mem_blacklist.lock().extend(known);
+                    }
+                }
                 // A fork child recovers too. A prefork master recovers only at ITS
                 // launch, and its own generation is the lowest, so it can never
                 // recover a worker that died later; the next worker started from
@@ -919,7 +936,7 @@ fn spawn_pipeline(
                 }
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
-                if let Some(dir) = &legacy_data_dir {
+                for dir in &legacy_data_dirs {
                     queue::gc_orphans(dir);
                     run_recovery(&worker_shared, dir, u64::MAX);
                 }
@@ -1434,39 +1451,27 @@ fn uploader_loop(
     rx: Receiver<UploadMsg>,
     shared: Arc<Shared>,
     data_dir: Option<PathBuf>,
-    legacy_data_dir: Option<PathBuf>,
+    legacy_data_dirs: Vec<PathBuf>,
     legacy_ready: Arc<AtomicBool>,
     backoff_base: Duration,
     fresh_launch: bool,
 ) {
     let poll = Duration::from_secs(5);
-    let mut legacy = legacy_data_dir;
+    let mut legacy = legacy_data_dirs;
     // A fresh launch retries any queued report immediately (force), ignoring
     // backoff scheduled by the prior session. A fork child skips this: the
     // parent's uploader is already working the shared queue. Guarded so a
     // panicking Transport impl can't kill the uploader.
     if fresh_launch {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drain_all(
-                &shared,
-                data_dir.as_deref(),
-                legacy.as_deref(),
-                backoff_base,
-                true,
-            )
+            drain_all(&shared, data_dir.as_deref(), &legacy, backoff_base, true)
         }));
     }
     loop {
         match rx.recv_timeout(poll) {
             Ok(UploadMsg::Wake) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain_all(
-                        &shared,
-                        data_dir.as_deref(),
-                        legacy.as_deref(),
-                        backoff_base,
-                        false,
-                    )
+                    drain_all(&shared, data_dir.as_deref(), &legacy, backoff_base, false)
                 }));
             }
             Ok(UploadMsg::Drain { deadline, ack }) => {
@@ -1474,7 +1479,7 @@ fn uploader_loop(
                     let dirs: Vec<&Path> = data_dir
                         .as_deref()
                         .into_iter()
-                        .chain(legacy.as_deref())
+                        .chain(legacy.iter().map(PathBuf::as_path))
                         .collect();
                     drain_until_empty(&shared, &dirs, backoff_base, deadline)
                 }))
@@ -1501,13 +1506,7 @@ fn uploader_loop(
             }
             Err(RecvTimeoutError::Timeout) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain_all(
-                        &shared,
-                        data_dir.as_deref(),
-                        legacy.as_deref(),
-                        backoff_base,
-                        false,
-                    )
+                    drain_all(&shared, data_dir.as_deref(), &legacy, backoff_base, false)
                 }));
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1529,31 +1528,26 @@ fn pending_reports(shared: &Shared, dir: &Path) -> Vec<queue::QueuedReport> {
 
 /// Stop polling the legacy directory once recovery has run (it runs once per
 /// launch, so nothing new can appear) and its queue is empty.
-fn retire_legacy(shared: &Shared, legacy: &mut Option<PathBuf>, ready: &AtomicBool) {
+fn retire_legacy(shared: &Shared, legacy: &mut Vec<PathBuf>, ready: &AtomicBool) {
     if !ready.load(Ordering::SeqCst) {
         return;
     }
-    if legacy
-        .as_deref()
-        .is_some_and(|dir| pending_reports(shared, dir).is_empty())
-    {
-        *legacy = None;
-    }
+    legacy.retain(|dir| !pending_reports(shared, dir).is_empty());
 }
 
 /// [`drain`] the data directory, then the legacy one a launch was asked to adopt.
 fn drain_all(
     shared: &Shared,
     data_dir: Option<&Path>,
-    legacy: Option<&Path>,
+    legacy: &[PathBuf],
     backoff_base: Duration,
     force: bool,
 ) -> bool {
-    let attempted = drain(shared, data_dir, backoff_base, force);
-    match legacy {
-        Some(dir) => drain_disk(shared, dir, backoff_base, force) | attempted,
-        None => attempted,
+    let mut attempted = drain(shared, data_dir, backoff_base, force);
+    for dir in legacy {
+        attempted |= drain_disk(shared, dir, backoff_base, force);
     }
+    attempted
 }
 
 /// Attempt delivery of every due queued report once. On the flush path `force`
