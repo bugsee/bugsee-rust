@@ -35,6 +35,17 @@ pub enum BugseeStatus {
     Timeout = 5,
 }
 
+/// Log level for [`bugsee_log`]: errors.
+pub const BUGSEE_LEVEL_ERROR: i32 = 1;
+/// Log level for [`bugsee_log`]: warnings.
+pub const BUGSEE_LEVEL_WARNING: i32 = 2;
+/// Log level for [`bugsee_log`]: informational messages.
+pub const BUGSEE_LEVEL_INFO: i32 = 3;
+/// Log level for [`bugsee_log`]: debugging output.
+pub const BUGSEE_LEVEL_DEBUG: i32 = 4;
+/// Log level for [`bugsee_log`]: verbose output.
+pub const BUGSEE_LEVEL_VERBOSE: i32 = 5;
+
 /// Copy a C string into an owned `String` (UTF-8), or `None` if null / not valid
 /// UTF-8. Returning an owned value avoids any borrow outliving the C pointer.
 ///
@@ -49,6 +60,22 @@ unsafe fn cstr(ptr: *const c_char) -> Option<String> {
         .to_str()
         .ok()
         .map(str::to_owned)
+}
+
+/// Read an *optional* string argument: `Ok(None)` for NULL, `Ok(Some(_))` for
+/// valid UTF-8, `Err(())` for invalid UTF-8 (callers map that to
+/// `InvalidArgument` rather than silently using the default).
+///
+/// # Safety
+/// Same as [`cstr`].
+unsafe fn cstr_opt(ptr: *const c_char) -> Result<Option<String>, ()> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map(|s| Some(s.to_owned()))
+        .map_err(|_| ())
 }
 
 /// Run `f` inside a panic boundary, mapping a contained panic to `Panic`.
@@ -87,7 +114,10 @@ pub unsafe extern "C" fn bugsee_launch_with_endpoint(
             return BugseeStatus::InvalidArgument;
         };
         let mut options = LaunchOptions::new(token);
-        if let Some(ep) = unsafe { cstr(endpoint) } {
+        let Ok(endpoint) = (unsafe { cstr_opt(endpoint) }) else {
+            return BugseeStatus::InvalidArgument;
+        };
+        if let Some(ep) = endpoint {
             options = options.endpoint(ep);
         }
         launch_with_options(options)
@@ -185,7 +215,10 @@ pub unsafe extern "C" fn bugsee_event_with_params(
         let Some(name) = (unsafe { cstr(name) }) else {
             return BugseeStatus::InvalidArgument;
         };
-        let params = match unsafe { cstr(params_json) } {
+        let Ok(params_json) = (unsafe { cstr_opt(params_json) }) else {
+            return BugseeStatus::InvalidArgument;
+        };
+        let params = match params_json {
             Some(json) => match serde_json::from_str::<Map<String, Value>>(&json) {
                 Ok(m) => m,
                 Err(_) => return BugseeStatus::InvalidArgument,
@@ -268,8 +301,12 @@ pub unsafe extern "C" fn bugsee_capture_exception(
     reason: *const c_char,
 ) -> BugseeStatus {
     guarded(|| {
-        let name = unsafe { cstr(name) }.unwrap_or_else(|| "Exception".to_string());
-        let reason = unsafe { cstr(reason) }.unwrap_or_default();
+        let (Ok(name), Ok(reason)) = (unsafe { cstr_opt(name) }, unsafe { cstr_opt(reason) })
+        else {
+            return BugseeStatus::InvalidArgument;
+        };
+        let name = name.unwrap_or_else(|| "Exception".to_string());
+        let reason = reason.unwrap_or_default();
         Bugsee::capture_message(LogLevel::Error, format!("{name}: {reason}"));
         BugseeStatus::Ok
     })
@@ -303,10 +340,10 @@ pub extern "C" fn bugsee_flush(timeout_ms: u32) -> BugseeStatus {
 
 fn level_from_int(level: i32) -> LogLevel {
     match level {
-        1 => LogLevel::Error,
-        2 => LogLevel::Warning,
-        3 => LogLevel::Info,
-        4 => LogLevel::Debug,
+        BUGSEE_LEVEL_ERROR => LogLevel::Error,
+        BUGSEE_LEVEL_WARNING => LogLevel::Warning,
+        BUGSEE_LEVEL_INFO => LogLevel::Info,
+        BUGSEE_LEVEL_DEBUG => LogLevel::Debug,
         _ => LogLevel::Verbose,
     }
 }
@@ -336,5 +373,38 @@ mod tests {
         assert_eq!(status, BugseeStatus::InvalidArgument);
         let status = unsafe { bugsee_event(std::ptr::null()) };
         assert_eq!(status, BugseeStatus::InvalidArgument);
+    }
+
+    #[test]
+    fn invalid_utf8_on_optional_args_is_rejected() {
+        let bad = c"\xff\xfe".as_ptr();
+        let ok = c"x".as_ptr();
+        unsafe {
+            assert_eq!(
+                bugsee_launch_with_endpoint(ok, bad),
+                BugseeStatus::InvalidArgument
+            );
+            assert_eq!(
+                bugsee_event_with_params(ok, bad),
+                BugseeStatus::InvalidArgument
+            );
+            assert_eq!(
+                bugsee_capture_exception(bad, ok),
+                BugseeStatus::InvalidArgument
+            );
+            assert_eq!(
+                bugsee_capture_exception(ok, bad),
+                BugseeStatus::InvalidArgument
+            );
+            // NULL stays legal on optional args.
+            assert_eq!(
+                bugsee_capture_exception(std::ptr::null(), std::ptr::null()),
+                BugseeStatus::Ok
+            );
+            assert_eq!(
+                bugsee_event_with_params(ok, std::ptr::null()),
+                BugseeStatus::Ok
+            );
+        }
     }
 }

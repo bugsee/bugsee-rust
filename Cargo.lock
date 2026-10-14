@@ -167,6 +167,7 @@ dependencies = [
 name = "bugsee-core"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "getrandom 0.2.17",
  "libc",
  "proptest",
@@ -201,11 +202,16 @@ version = "0.1.0"
 dependencies = [
  "backtrace",
  "bugsee-core",
+ "bugsee-native-api",
  "crash-handler",
  "libc",
  "mach2 0.4.3",
  "symbolic-debuginfo",
 ]
+
+[[package]]
+name = "bugsee-native-api"
+version = "0.1.0"
 
 [[package]]
 name = "bugsee-panic"

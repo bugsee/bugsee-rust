@@ -215,7 +215,7 @@ pub fn manual_upload_meta() -> ReportMeta {
         signatures: Vec::new(),
         source: Source {
             trigger: TriggerType::CodeUpload,
-            origin: None,
+            origin: crate::origin::capture_origin(),
         },
         attrs: Map::new(),
         attachments: Vec::new(),

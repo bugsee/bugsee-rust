@@ -13,6 +13,9 @@ use bugsee_core::model::crash::{is_internal_frame, Frame, FrameData};
 /// Capture the current call stack as `crash.json` frames, resolving symbols.
 pub fn capture() -> Vec<Frame> {
     let mut frames = Vec::new();
+    // So a concurrent fork() waits this walk out instead of handing the child
+    // a locked `backtrace` mutex (see `bugsee_core::fork::lock_backtrace`).
+    let _walk = bugsee_core::fork::lock_backtrace();
     let bt = backtrace::Backtrace::new();
     for frame in bt.frames() {
         for symbol in frame.symbols() {
