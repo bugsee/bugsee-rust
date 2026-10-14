@@ -39,6 +39,8 @@ pub struct LaunchOptions {
     pub(crate) before_send: Option<BeforeSend>,
     pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
     pub(crate) sample_rate: f64,
+    pub(crate) scrub: bugsee_core::scrub::ScrubConfig,
+    pub(crate) rate_limit: bugsee_core::ratelimit::RateLimitConfig,
 }
 
 impl LaunchOptions {
@@ -63,7 +65,46 @@ impl LaunchOptions {
             before_send: None,
             before_breadcrumb: None,
             sample_rate: 1.0,
+            scrub: Default::default(),
+            rate_limit: Default::default(),
         }
+    }
+
+    /// Configure the PII / secret scrubber that runs over every report (capture
+    /// channels, crash data, summary/description/attributes, environment) just
+    /// before it is queued, after `before_send`. **On by default**: emails,
+    /// well-known token shapes, `password=`-style values, card-like numbers and
+    /// home-directory user names are replaced with markers such as `[email]`.
+    /// Use the config's `allow` / `deny` / `sensitive_keys` to tune it.
+    /// Attachments and native minidumps are opaque and not scrubbed.
+    pub fn scrub(mut self, config: bugsee_core::scrub::ScrubConfig) -> Self {
+        self.scrub = config;
+        self
+    }
+
+    /// Turn the PII scrubber off entirely. Reports then carry exactly what was
+    /// captured; make sure your own `before_send` redacts what must not leave.
+    pub fn disable_scrubbing(mut self) -> Self {
+        self.scrub = bugsee_core::scrub::ScrubConfig::disabled();
+        self
+    }
+
+    /// Configure report rate limiting (token buckets applied before the durable
+    /// queue). **On by default**: non-fatal errors are limited per signature
+    /// (burst 5, +1/10 s) and globally (burst 60, +1/s); crashes are never
+    /// limited by those and draw from a small crash floor (burst 20); manual
+    /// bug reports are exempt. Suppressed reports surface via
+    /// `on_report_dropped(DropReason::RateLimited)` and are counted in the
+    /// `bugsee.reports_suppressed` attribute of the next report sent.
+    pub fn rate_limit(mut self, config: bugsee_core::ratelimit::RateLimitConfig) -> Self {
+        self.rate_limit = config;
+        self
+    }
+
+    /// Turn report rate limiting off entirely.
+    pub fn disable_rate_limiting(mut self) -> Self {
+        self.rate_limit = bugsee_core::ratelimit::RateLimitConfig::disabled();
+        self
     }
 
     /// Fraction of non-fatal (`error`) reports to keep, in `[0.0, 1.0]`. Crashes

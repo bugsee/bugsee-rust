@@ -18,6 +18,7 @@ use crate::capture::{export_report, ChannelDocument};
 use crate::model::enums::{IssueType, Severity};
 use crate::model::environment::Environment;
 use crate::model::report::{FileDescriptor, IssueRequest, Manifest, Source, TimeWindow};
+use crate::scrub::Scrubber;
 use crate::util::{iso8601_ms, random_hex};
 
 /// A user attachment carried by a report.
@@ -99,6 +100,33 @@ pub fn assemble_with_extras(
     app_token: &str,
     created_on_ms: i64,
 ) -> std::io::Result<AssembledReport> {
+    assemble_scrubbed(
+        report_dir,
+        window,
+        meta,
+        env,
+        crash_json,
+        extra_files,
+        app_token,
+        created_on_ms,
+        None,
+    )
+}
+
+/// [`assemble_with_extras`] with the PII `scrubber` applied (see
+/// [`assemble_docs`]).
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_scrubbed(
+    report_dir: &Path,
+    window: TimeWindow,
+    meta: &ReportMeta,
+    env: &Environment,
+    crash_json: Option<Vec<u8>>,
+    extra_files: &[ExtraFile],
+    app_token: &str,
+    created_on_ms: i64,
+    scrubber: Option<&Scrubber>,
+) -> std::io::Result<AssembledReport> {
     let docs = export_report(report_dir, window.start, window.end)?;
     assemble_docs(
         docs,
@@ -109,6 +137,7 @@ pub fn assemble_with_extras(
         extra_files,
         app_token,
         created_on_ms,
+        scrubber,
     )
 }
 
@@ -116,6 +145,13 @@ pub fn assemble_with_extras(
 /// instead of a snapshot directory. With an empty `docs` it builds a bundle that
 /// needs no file system at all: the in-memory delivery path used when the data
 /// directory is unusable (read-only, full, gone).
+///
+/// This is the single choke point every delivery path (disk, in-memory,
+/// recovery) goes through, so the PII `scrubber` is applied here: each capture
+/// channel, `crash.json`, the metadata (summary, description, labels,
+/// attributes) and `request.json` (environment). Attachments and `extra_files`
+/// are opaque binary and untouched; so are the reporter's own `email` and the
+/// dedup `signatures`.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_docs(
     docs: Vec<ChannelDocument>,
@@ -126,11 +162,24 @@ pub fn assemble_docs(
     extra_files: &[ExtraFile],
     app_token: &str,
     created_on_ms: i64,
+    scrubber: Option<&Scrubber>,
 ) -> std::io::Result<AssembledReport> {
+    let scrubber = scrubber.filter(|s| s.is_enabled());
+    let scrubbed_meta;
+    let meta = match scrubber {
+        Some(s) => {
+            scrubbed_meta = s.scrub_meta(meta);
+            &scrubbed_meta
+        }
+        None => meta,
+    };
     let mut files: Vec<FileDescriptor> = Vec::new();
     let mut entries: Vec<BundleEntry> = Vec::new();
 
-    for doc in docs {
+    for mut doc in docs {
+        if let Some(clean) = scrubber.and_then(|s| s.scrub_envelope(&doc.bytes)) {
+            doc.bytes = clean;
+        }
         let filename = format!("{}.{}.json", random_hex(8), doc.channel);
         // The manifest `type` is the SHARED base type per the cross-SDK contract
         // (`events.user`/`events.system` → `events`, `traces.user`/`traces.system`
@@ -144,7 +193,10 @@ pub fn assemble_docs(
         entries.push(BundleEntry::new(filename, doc.bytes));
     }
 
-    if let Some(bytes) = crash_json {
+    if let Some(mut bytes) = crash_json {
+        if let Some(clean) = scrubber.and_then(|s| s.scrub_json_bytes(&bytes)) {
+            bytes = clean;
+        }
         files.push(FileDescriptor::capture("crash.json", "crash"));
         entries.push(BundleEntry::new("crash.json", bytes));
     }
@@ -185,7 +237,20 @@ pub fn assemble_docs(
         created_on: iso8601_ms(created_on_ms),
         environment: env.clone(),
     };
-    let request_json = serde_json::to_vec(&request)?;
+    let mut request_json = serde_json::to_vec(&request)?;
+    if let Some(s) = scrubber {
+        // The environment (paths, host names) is scrubbed; the reporter's own
+        // `email` is an identity they supplied on purpose and is kept.
+        if let Ok(mut v) = serde_json::to_value(&request) {
+            let email = v.as_object_mut().and_then(|m| m.remove("email"));
+            if s.scrub_value(&mut v) {
+                if let (Some(m), Some(e)) = (v.as_object_mut(), email) {
+                    m.insert("email".into(), e);
+                }
+                request_json = serde_json::to_vec(&v)?;
+            }
+        }
+    }
 
     entries.push(BundleEntry::new(".apptoken", app_token.as_bytes().to_vec()));
     entries.push(BundleEntry::new("request.json", request_json.clone()));

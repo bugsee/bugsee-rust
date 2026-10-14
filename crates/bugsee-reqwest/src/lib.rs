@@ -175,44 +175,14 @@ fn error_entry(id: &str, method: &str, url: &str, error: String) -> NetworkEntry
 /// Whether a key (query parameter, form field, or JSON object key) names a value
 /// that must be redacted. Used by URL, form-body, and recursive JSON redaction.
 ///
-/// Matching normalizes away case and separators so `accessToken`, `access_token`,
-/// and `access-token` all collapse to the same stem, then applies a substring
-/// heuristic (like [`is_sensitive_header`]) rather than exact equality — exact
-/// matching silently leaked common shapes like `accessToken`/`authorization`.
+/// Delegates to `bugsee_core::scrub::is_sensitive_key`, the single credential-key
+/// matcher shared with the general PII scrubber: normalised (case and separators
+/// ignored) substring match over a credential stem list, plus exact matches for
+/// the short ambiguous names `key`/`sig`/`pin`/`otp`.
 fn is_sensitive_param(name: &str) -> bool {
-    // Lowercase and drop non-alphanumerics: accessToken/access_token/access-token
-    // → "accesstoken"; x-api-key → "xapikey".
-    let n: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-
-    // Short, ambiguous tokens matched exactly to avoid over-redacting words that
-    // merely contain them (e.g. "keyword", "monkey", "design").
-    if matches!(n.as_str(), "key" | "sig" | "pin" | "otp") {
-        return true;
-    }
-    // Credential-bearing stems; substring so compounds are covered
-    // (clientSecret, refreshToken, x-session-id, csrfToken, …).
-    const STEMS: &[&str] = &[
-        "password",
-        "passwd",
-        "passphrase",
-        "pwd",
-        "secret",
-        "token",
-        "apikey",
-        "auth",
-        "session",
-        "cookie",
-        "credential",
-        "signature",
-        "csrf",
-        "xsrf",
-        "bearer",
-    ];
-    STEMS.iter().any(|stem| n.contains(stem))
+    // One matcher for the whole SDK: the PII scrubber uses the same function, so
+    // a key redacted here is redacted everywhere (and vice versa).
+    bugsee::core::scrub::is_sensitive_key(name)
 }
 
 /// Header names whose values are redacted. Delegates to the SAME normalized

@@ -226,7 +226,7 @@ fn legacy_directory_leftovers_are_delivered_once_and_cleaned_up() {
         &Default::default(),
     );
     let window = TimeWindow { start: 0, end: 1 };
-    let stranded = assemble_docs(Vec::new(), window, &meta, &env, None, &[], "T", 1).unwrap();
+    let stranded = assemble_docs(Vec::new(), window, &meta, &env, None, &[], "T", 1, None).unwrap();
     bugsee_core::queue::enqueue(&legacy, &stranded).unwrap();
 
     // ...and a session of that build that died (marker left behind, owner gone).
