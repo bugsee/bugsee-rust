@@ -23,8 +23,9 @@ use bugsee_core::util::epoch_ms;
 use bugsee_core::{Recorder, RecorderConfig};
 use serde_json::{Map, Value};
 
-use crate::options::LaunchOptions;
+use crate::options::{DataDirResolution, DataDirSource, LaunchOptions, StorageStatus};
 use crate::report::Report;
+use bugsee_core::runtime::StorageMode;
 
 // A `Mutex` (not `RwLock`) because `mpsc::Sender` inside `Recorder` is `Send`
 // but not `Sync`; the lock is held only long enough to enqueue.
@@ -43,6 +44,15 @@ struct ReviveInfo {
     system_telemetry: bool,
 }
 static REVIVE_INFO: ForkMutex<Option<ReviveInfo>> = ForkMutex::new(|| None);
+
+/// How the current launch resolved its data directory, for `storage_status`.
+struct Resolved {
+    dir: Option<std::path::PathBuf>,
+    source: DataDirSource,
+    skipped: Vec<String>,
+    explicit_rejected: Option<String>,
+}
+static RESOLUTION: ForkMutex<Option<Resolved>> = ForkMutex::new(|| None);
 
 /// The fork epoch this process last reconciled with.
 static SEEN_FORK_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -71,8 +81,36 @@ impl Bugsee {
     pub fn launch_with(options: LaunchOptions) -> io::Result<LaunchGuard> {
         bugsee_core::fork::install_fork_hook();
         check_fork();
-        let data_dir = options.resolved_data_dir();
-        std::fs::create_dir_all(&data_dir)?;
+        // No writable directory is not an error: the recorder runs in memory so
+        // handled errors still go out (see `DataDirSource`).
+        let DataDirResolution {
+            dir,
+            source,
+            skipped,
+            explicit_rejected,
+            recovery_dirs,
+            legacy_dir,
+        } = options.resolve_data_dir();
+        let memory_only = dir.is_none().then(|| {
+            explicit_rejected
+                .clone()
+                .or_else(|| (!skipped.is_empty()).then(|| skipped.join("; ")))
+                .unwrap_or_else(|| "no usable data directory".to_string())
+        });
+        // In memory mode no new file is written there, but an existing directory
+        // is still drained and recovered from; with none, an empty path.
+        let data_dir = dir.unwrap_or_default();
+        if memory_only.is_none() && !skipped.is_empty() {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            bugsee_core::util::warn_once(
+                &WARNED,
+                &format!(
+                    "default data directory unusable ({}); using {}",
+                    skipped.join("; "),
+                    data_dir.display()
+                ),
+            );
+        }
 
         let transport = match options.transport.clone() {
             Some(t) => t,
@@ -94,6 +132,9 @@ impl Bugsee {
         };
 
         let mut config = RecorderConfig::new(data_dir, options.app_token.clone());
+        config.memory_only = memory_only;
+        config.legacy_data_dir = legacy_dir;
+        config.extra_data_dirs = recovery_dirs;
         config.caps = options.caps();
         config.rotate_interval = options.rotate_interval;
         config.before_send = options.before_send;
@@ -121,6 +162,19 @@ impl Bugsee {
         }
 
         let recorder = Recorder::launch(config, transport)?;
+        // Nothing can be recovered without a disk, so crash markers and panic
+        // snapshots have nowhere to go.
+        let persistent = recorder.storage_mode() == StorageMode::Disk;
+        let resolved = Resolved {
+            dir: persistent.then(|| recorder.data_dir().to_path_buf()),
+            source: if persistent {
+                source
+            } else {
+                DataDirSource::None
+            },
+            skipped,
+            explicit_rejected,
+        };
 
         #[cfg(feature = "panic")]
         let panic_info_path = recorder.panic_info_path();
@@ -128,7 +182,7 @@ impl Bugsee {
         // Install the native crash handler pointing at this generation's marker.
         // Replace under a brief lock, then drop the OLD handler outside it.
         #[cfg(feature = "native")]
-        if options.native_crash_capture {
+        if options.native_crash_capture && persistent {
             if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
                 let old = NATIVE.lock().replace(handler);
                 drop(old);
@@ -147,7 +201,13 @@ impl Bugsee {
         // `Recorder::drop` joins the worker/uploader threads (blocking up to a few
         // seconds), and doing that under the global lock would stall every
         // concurrent capture call — the same hazard `stop()` guards against.
-        let old = RECORDER.lock().replace(recorder);
+        // The resolution is published under the same lock as the recorder, so
+        // `storage_status` never pairs one launch's recorder with another's.
+        let old = {
+            let mut slot = RECORDER.lock();
+            *RESOLUTION.lock() = Some(resolved);
+            slot.replace(recorder)
+        };
         drop(old);
         PAUSED.store(false, Ordering::SeqCst);
         *REVIVE_INFO.lock() = Some(ReviveInfo {
@@ -161,12 +221,41 @@ impl Bugsee {
             // SIGABRT on the next launch — and so an uncaught UNWINDING panic is
             // recovered as a fatal panic (the marker is kept because
             // `Recorder::drop` sees `thread::panicking()`).
-            bugsee_panic::set_snapshot_path(panic_info_path);
+            if persistent {
+                bugsee_panic::set_snapshot_path(panic_info_path);
+            } else {
+                bugsee_panic::clear_snapshot_path();
+            }
             // Opt-in: report immediately from the hook instead of via recovery.
             bugsee_panic::set_report_from_hook(options.report_panics_from_hook);
         }
 
         Ok(LaunchGuard { _private: () })
+    }
+
+    /// Where the SDK is keeping its state, or `None` before `launch`.
+    ///
+    /// Use it to confirm a deployment is set up for crash recovery: it needs
+    /// [`StorageStatus::crash_recovery_available`], and on a container a data
+    /// directory on a volume rather than ephemeral storage
+    /// ([`StorageStatus::may_be_ephemeral`]).
+    pub fn storage_status() -> Option<StorageStatus> {
+        check_fork();
+        // Both locks, always in this order (as in `launch_with`), so the pair is
+        // one launch's.
+        let recorder = RECORDER.lock();
+        let recorder = recorder.as_ref()?;
+        let resolved = RESOLUTION.lock();
+        let resolved = resolved.as_ref()?;
+        Some(StorageStatus {
+            mode: recorder.storage_mode(),
+            data_dir: resolved.dir.clone(),
+            source: resolved.source,
+            skipped: resolved.skipped.clone(),
+            explicit_rejected: resolved.explicit_rejected.clone(),
+            reason: recorder.storage_reason().map(String::from),
+            degraded: recorder.is_degraded(),
+        })
     }
 
     /// Stop the SDK and flush pending work (dropping the recorder joins the worker).
@@ -497,14 +586,33 @@ fn revive_after_fork(epoch: u64) {
     #[cfg(feature = "native")]
     if old_native.is_some() {
         drop(old_native);
-        if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
-            *NATIVE.lock() = Some(handler);
+        // A child that fell back to memory has nowhere to keep a crash marker.
+        if recorder.storage_mode() == StorageMode::Disk {
+            if let Ok(handler) = bugsee_native::install(recorder.crash_info_path()) {
+                *NATIVE.lock() = Some(handler);
+            }
         }
     }
     #[cfg(feature = "panic")]
-    bugsee_panic::set_snapshot_path(recorder.panic_info_path());
+    if recorder.storage_mode() == StorageMode::Disk {
+        bugsee_panic::set_snapshot_path(recorder.panic_info_path());
+    } else {
+        // The inherited path points into the PARENT's live session; a panic here
+        // must not write its snapshot there.
+        bugsee_panic::clear_snapshot_path();
+    }
 
-    *RECORDER.lock() = Some(recorder);
+    // Lock order RECORDER -> RESOLUTION, as in `launch_with`/`storage_status`.
+    {
+        let mut slot = RECORDER.lock();
+        if recorder.storage_mode() == StorageMode::Memory {
+            if let Some(resolved) = RESOLUTION.lock().as_mut() {
+                resolved.dir = None;
+                resolved.source = DataDirSource::None;
+            }
+        }
+        *slot = Some(recorder);
+    }
     *failures = 0;
     SEEN_FORK_EPOCH.store(epoch, Ordering::SeqCst);
 }

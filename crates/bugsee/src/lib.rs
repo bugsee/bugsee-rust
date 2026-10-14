@@ -69,7 +69,7 @@ macro_rules! app_package_id {
 }
 
 pub use api::{Bugsee, LaunchGuard, ResultExt};
-pub use options::LaunchOptions;
+pub use options::{DataDirSource, LaunchOptions, StorageStatus, DATA_DIR_ENV};
 pub use perf::{Span, Transaction};
 pub use report::Report;
 
@@ -86,5 +86,5 @@ pub use bugsee_core::model::enums::{
 };
 pub use bugsee_core::model::perf::Status;
 pub use bugsee_core::reporting::{Attachment, ReportMeta};
-pub use bugsee_core::runtime::DropReason;
+pub use bugsee_core::runtime::{DropReason, StorageMode};
 pub use bugsee_core::transport::{Transport, TransportError};

@@ -14,7 +14,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use crate::bundle::{bundle_filename, write_bundle, BundleEntry};
-use crate::capture::export_report;
+use crate::capture::{export_report, ChannelDocument};
 use crate::model::enums::{IssueType, Severity};
 use crate::model::environment::Environment;
 use crate::model::report::{FileDescriptor, IssueRequest, Manifest, Source, TimeWindow};
@@ -54,6 +54,7 @@ pub struct ExtraFile {
 }
 
 /// A finished, ready-to-deliver report.
+#[derive(Clone)]
 pub struct AssembledReport {
     /// `<random20>.bundle.zip` file name.
     pub bundle_name: String,
@@ -99,7 +100,33 @@ pub fn assemble_with_extras(
     created_on_ms: i64,
 ) -> std::io::Result<AssembledReport> {
     let docs = export_report(report_dir, window.start, window.end)?;
+    assemble_docs(
+        docs,
+        window,
+        meta,
+        env,
+        crash_json,
+        extra_files,
+        app_token,
+        created_on_ms,
+    )
+}
 
+/// Like [`assemble_with_extras`] but from already-exported capture `docs`
+/// instead of a snapshot directory. With an empty `docs` it builds a bundle that
+/// needs no file system at all: the in-memory delivery path used when the data
+/// directory is unusable (read-only, full, gone).
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_docs(
+    docs: Vec<ChannelDocument>,
+    window: TimeWindow,
+    meta: &ReportMeta,
+    env: &Environment,
+    crash_json: Option<Vec<u8>>,
+    extra_files: &[ExtraFile],
+    app_token: &str,
+    created_on_ms: i64,
+) -> std::io::Result<AssembledReport> {
     let mut files: Vec<FileDescriptor> = Vec::new();
     let mut entries: Vec<BundleEntry> = Vec::new();
 

@@ -38,8 +38,35 @@ impl Drop for Claim {
 }
 
 /// Try to claim `path`. `None` if another live process (or another thread of this
-/// one) holds it.
+/// one) holds it, or if the claim file cannot be created at all.
 pub fn try_claim(path: &Path) -> Option<Claim> {
+    match claim_state(path) {
+        ClaimState::Held(claim) => Some(claim),
+        ClaimState::Taken | ClaimState::Unavailable => None,
+    }
+}
+
+/// Like [`try_claim`] for a directory that may be full or read-only, where the
+/// claim file cannot be created but the work (recover a crash, deliver a queued
+/// report) is still worth doing: `Some(None)` means "no claim could be made,
+/// proceed unclaimed". The cost is that two processes sharing such a directory
+/// may both do the work, and the backend deduplicates. `None` means another
+/// process holds the claim.
+pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
+    match claim_state(path) {
+        ClaimState::Held(claim) => Some(Some(claim)),
+        ClaimState::Unavailable => Some(None),
+        ClaimState::Taken => None,
+    }
+}
+
+enum ClaimState {
+    Held(Claim),
+    Taken,
+    Unavailable,
+}
+
+fn claim_state(path: &Path) -> ClaimState {
     for _ in 0..2 {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -48,25 +75,32 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
         {
             Ok(mut file) => {
                 let _ = write!(file, "{}", std::process::id());
-                return Some(Claim {
+                return ClaimState::Held(Claim {
                     path: path.to_path_buf(),
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !is_stale(path) {
-                    return None;
+                    return ClaimState::Taken;
                 }
                 // Take over a claim whose owner is gone, then retry the create.
                 // Losing the race to another taker just means `create_new` fails
                 // again and we report the claim as held.
-                let _ = std::fs::remove_file(path);
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    // Someone else took it over first: retry the create.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // A read-only or full volume will not let us clear it, so no
+                    // claim can ever be made here: not "held by someone else".
+                    Err(_) => return ClaimState::Unavailable,
+                }
             }
             // Directory missing / unwritable: nothing can be claimed, and the
             // caller's own I/O will fail more usefully than we can here.
-            Err(_) => return None,
+            Err(_) => return ClaimState::Unavailable,
         }
     }
-    None
+    ClaimState::Taken
 }
 
 fn is_stale(path: &Path) -> bool {
@@ -121,6 +155,25 @@ mod tests {
         assert!(try_claim(&path).is_none());
         #[cfg(not(unix))]
         assert!(try_claim(&path).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_claim_that_cannot_be_removed_is_unavailable_not_taken() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let path = dir.join("x.claim");
+        std::fs::write(&path, "4294967290").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(dir.join("nonexistent-probe")).is_ok()
+            || std::fs::write(dir.join("probe"), b"x").is_ok()
+        {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            return; // permission bits not enforced (root)
+        }
+        // Proceed unclaimed instead of skipping the work as "held elsewhere".
+        assert!(matches!(try_claim_lenient(&path), Some(None)));
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     }
 
     #[test]

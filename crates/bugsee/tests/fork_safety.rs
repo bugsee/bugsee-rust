@@ -518,3 +518,143 @@ fn a_panic_in_the_child_before_touching_the_sdk_does_not_write_into_the_parents_
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// A child that cannot open its own session falls back to memory. It must then
+/// stop pointing the panic observer into the PARENT's live session, and its
+/// storage status must say it has no directory.
+#[test]
+fn a_child_that_falls_back_to_memory_does_not_write_into_the_parents_session() {
+    let _serial = serial();
+    let data = scratch("data");
+    let out = scratch("out");
+    let guard = Bugsee::launch_with(
+        LaunchOptions::new("APP_TOKEN")
+            .data_dir(&data)
+            .native_crash_capture(false)
+            .with_transport(FileTransport::new(&out)),
+    )
+    .expect("launch");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Make a NEW session impossible (the child's `Session::begin` needs
+    // `sessions/` to be a directory) while the parent's parts stay writable.
+    let sessions = data.join("sessions");
+    let parked = data.join("sessions.parked");
+    std::fs::rename(&sessions, &parked).unwrap();
+    std::fs::write(&sessions, b"not a directory").unwrap();
+
+    let child = fork_child(|| {
+        Bugsee::capture_message(LogLevel::Warning, "child-starting"); // revives
+        let Some(status) = Bugsee::storage_status() else {
+            return 2;
+        };
+        if status.mode != bugsee::StorageMode::Memory || status.data_dir.is_some() {
+            return 3;
+        }
+        let _ = std::thread::spawn(|| panic!("child-panic-in-memory-mode")).join();
+        0
+    });
+    assert!(exited_with(
+        wait_with_deadline(child, Duration::from_secs(30)),
+        0
+    ));
+
+    let stray: Vec<_> = std::fs::read_dir(data.join("parts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join("panic.info"))
+        .filter(|p| p.exists())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the child wrote its panic into its parent's session: {stray:?}"
+    );
+    // The parent is untouched.
+    let parent = Bugsee::storage_status().expect("status");
+    assert_eq!(parent.mode, bugsee::StorageMode::Disk);
+
+    let _ = std::fs::remove_file(&sessions);
+    let _ = std::fs::rename(&parked, &sessions);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Fails transiently until `allow` exists, then behaves like [`FileTransport`].
+struct AllowTransport {
+    allow: PathBuf,
+    inner: Arc<FileTransport>,
+}
+
+impl Transport for AllowTransport {
+    fn register_session(&self, a: &str, b: &[u8]) -> Result<String, TransportError> {
+        self.inner.register_session(a, b)
+    }
+    fn create_issue(&self, a: &str, b: Option<&str>, c: &[u8]) -> Result<String, TransportError> {
+        if self.allow.exists() {
+            self.inner.create_issue(a, b, c)
+        } else {
+            Err(TransportError::Transient("offline".into()))
+        }
+    }
+    fn upload_bundle(&self, e: &str, zip: &[u8]) -> Result<(), TransportError> {
+        self.inner.upload_bundle(e, zip)
+    }
+}
+
+#[test]
+fn a_child_in_memory_mode_does_not_resend_the_parents_unsent_reports() {
+    let _serial = serial();
+    let root = scratch("mem");
+    let out = root.join("out");
+    let allow = root.join("allow");
+    // A directory that can never be created: the SDK runs in memory.
+    let blocker = root.join("blocker");
+    std::fs::write(&blocker, b"x").unwrap();
+    let guard = Bugsee::launch_with(
+        LaunchOptions::new("APP_TOKEN")
+            .data_dir(blocker.join("data"))
+            .native_crash_capture(false)
+            .with_transport(Arc::new(AllowTransport {
+                allow: allow.clone(),
+                inner: FileTransport::new(&out),
+            })),
+    )
+    .expect("launch");
+
+    // Offline: the parent's report stays in its in-memory backlog.
+    Bugsee::capture_message(LogLevel::Error, "parent-held-report");
+    // (A sleep, not a timed-out `flush`: a main thread that has just waited on a
+    // timed channel recv carries its parker state across `fork` and on macOS
+    // libdispatch traps the child.)
+    std::thread::sleep(Duration::from_millis(500));
+
+    let child = fork_child(|| {
+        Bugsee::capture_message(LogLevel::Error, "child-report");
+        std::fs::write(&allow, b"1").unwrap();
+        let ok = Bugsee::flush(Duration::from_secs(10));
+        i32::from(!ok)
+    });
+    assert!(exited_with(
+        wait_with_deadline(child, Duration::from_secs(30)),
+        0
+    ));
+    assert!(Bugsee::flush(Duration::from_secs(10)));
+
+    let reports = delivered(&out);
+    assert_eq!(
+        mentions(&reports, "child-report"),
+        1,
+        "{}",
+        summarize(&reports)
+    );
+    assert_eq!(
+        mentions(&reports, "parent-held-report"),
+        1,
+        "the child must not resend the parent's backlog: {}",
+        summarize(&reports)
+    );
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&root);
+}
