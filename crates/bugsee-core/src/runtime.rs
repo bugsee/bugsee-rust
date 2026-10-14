@@ -471,6 +471,9 @@ impl Recorder {
         &mut self,
         sampler: Option<Box<dyn TelemetrySampler>>,
     ) -> std::io::Result<()> {
+        // The registry of held claims is the parent's, and may be mid-update.
+        crate::claim::reset_after_fork();
+
         // The parent's threads are not ours to join; drop their handles without
         // running anything.
         std::mem::forget(self.worker.take());
@@ -698,6 +701,13 @@ impl Drop for Recorder {
             if let Some(session) = &self.session {
                 session.end();
             }
+        } else if !(worker_acked && uploader_acked) {
+            // A detached thread may still be writing this session's data: keep
+            // the liveness lock until the process exits so no peer recovers (and
+            // deletes) the session underneath it.
+            if let Some(session) = &mut self.session {
+                session.keep_lock_until_exit();
+            }
         }
     }
 }
@@ -910,6 +920,9 @@ fn spawn_pipeline(
     let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_drain_dir = drain_dir.map(Path::to_path_buf);
     let marker = data_dir.map(|d| Session::marker_path(d, generation));
+    // Recovery can run long (a host `before_send`, many sessions); it keeps this
+    // session's heartbeat going meanwhile, as the worker loop is not yet running.
+    let beat_marker = marker.clone();
     let worker_upload_tx = upload_tx.clone();
 
     let worker = std::thread::Builder::new()
@@ -940,7 +953,7 @@ fn spawn_pipeline(
                 // it must, or that crash waits for the master to restart. Claims
                 // keep siblings from recovering the same session twice.
                 if let Some(dir) = &worker_drain_dir {
-                    run_recovery(&worker_shared, dir, generation);
+                    run_recovery(&worker_shared, dir, generation, beat_marker.as_deref());
                 }
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
@@ -950,7 +963,7 @@ fn spawn_pipeline(
                         worker_shared.mem_blacklist.lock().extend(known);
                     }
                     queue::gc_orphans(dir);
-                    run_recovery(&worker_shared, dir, u64::MAX);
+                    run_recovery(&worker_shared, dir, u64::MAX, beat_marker.as_deref());
                 }
             }));
             legacy_ready.store(true, Ordering::SeqCst);
@@ -979,8 +992,20 @@ fn spawn_pipeline(
 /// Recover any prior generation that ended abnormally, queueing it for delivery.
 /// The crashed session's state is discarded ONLY after the report is durably
 /// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
-fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
+fn run_recovery(
+    shared: &Shared,
+    data_dir: &Path,
+    current_generation: u64,
+    heartbeat_of: Option<&Path>,
+) {
+    let beat = || {
+        if let Some(marker) = heartbeat_of {
+            touch_heartbeat(marker);
+        }
+    };
+    beat();
     for pending in recovery::find_pending(data_dir, current_generation) {
+        beat();
         // Several processes share this directory (a prefork master and its
         // workers, above all): exactly one recovers a given session.
         let Some(_claim) = recovery::claim_pending(data_dir, &pending) else {
@@ -1095,8 +1120,11 @@ fn worker_loop(
     // sampled (F17). Instead we recv with a timeout bounded by the next rotation
     // deadline and run the tick whenever that deadline passes, message or not.
     let mut next_rotate = Instant::now() + rotate_interval;
+    let mut next_heartbeat = Instant::now() + HEARTBEAT_EVERY;
     loop {
-        let timeout = next_rotate.saturating_duration_since(Instant::now());
+        let timeout = next_rotate
+            .saturating_duration_since(Instant::now())
+            .min(HEARTBEAT_EVERY);
         match rx.recv_timeout(timeout) {
             Ok(Msg::Capture(entry)) => {
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
@@ -1176,11 +1204,30 @@ fn worker_loop(
         // elapsed — via a message OR a timeout — so steady traffic can't starve it.
         if Instant::now() >= next_rotate {
             rotate_tick(store.as_mut(), &shared, &mut sampler);
-            if let Some(marker) = &marker {
-                ensure_marker(&shared, marker);
-            }
             next_rotate = Instant::now() + rotate_interval;
         }
+        // Independent of the rotation interval (which a host may set large).
+        if Instant::now() >= next_heartbeat {
+            if let Some(marker) = &marker {
+                ensure_marker(&shared, marker);
+                touch_heartbeat(marker);
+            }
+            next_heartbeat = Instant::now() + HEARTBEAT_EVERY;
+        }
+    }
+}
+
+/// How often the worker checks the liveness marker and, for a session that could
+/// not take a file lock, touches its heartbeat file.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
+
+/// Touch this session's heartbeat file, if it keeps one (see
+/// `recovery::heartbeat_path`). Never creates it: a session with a kernel lock has
+/// none, and one that has ended must not leave one behind.
+fn touch_heartbeat(marker: &Path) {
+    let beat = recovery::heartbeat_path(marker);
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&beat) {
+        let _ = file.set_modified(std::time::SystemTime::now());
     }
 }
 
