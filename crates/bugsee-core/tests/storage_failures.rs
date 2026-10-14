@@ -765,6 +765,7 @@ fn terminal_verdicts_on_an_undeletable_queue_are_not_resent() {
             &[],
             "T",
             1,
+            None,
         )
         .unwrap();
         bugsee_core::queue::enqueue(&data, &queued).unwrap();
