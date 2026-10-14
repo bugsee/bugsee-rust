@@ -1147,8 +1147,12 @@ fn spawn_pipeline(
 }
 
 /// How long the helper waits for the worker to acknowledge a crash-time flush.
-/// The crash handler gives up on its own, sooner; this only bounds the helper.
-const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+/// The crash handler gives up on its own, far sooner (its budget); this only
+/// bounds how long a permanently wedged worker can occupy the helper. It must
+/// outlast any legitimate drain (the queue is capped), or a slow-but-healthy
+/// worker would make the helper report failure for a request whose budget was
+/// longer than this.
+const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Register this pipeline as the process's crash-time flush target. A failure
 /// (no pipe/event available) just forgoes the best-effort flush.
