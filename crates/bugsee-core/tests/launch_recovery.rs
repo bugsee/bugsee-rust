@@ -207,10 +207,9 @@ fn a_full_queue_defers_a_unique_crash_to_the_worker_instead_of_discarding_it() {
     let rec =
         Recorder::launch(config(&dir, Duration::from_millis(500)), Arc::new(Offline)).unwrap();
     rec.recover_on_launch_path();
-    // Not queued by the launch pass, and its evidence is still on disk.
-    assert_eq!(queue::list_pending(&dir).len(), queue::MAX_QUEUED_REPORTS);
-    assert!(dir.join("sessions").join("1.alive").exists());
-
+    // The launch pass refused it (the worker may already be queueing it, so
+    // only the outcome is asserted): it ends up queued, not discarded, and
+    // without having used up its recovery attempts.
     let deadline = Instant::now() + Duration::from_secs(10);
     while queue::list_pending(&dir).len() <= queue::MAX_QUEUED_REPORTS {
         assert!(Instant::now() < deadline, "the worker never recovered it");

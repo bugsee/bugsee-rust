@@ -1251,6 +1251,9 @@ fn recover_one(
             // cap, rather than destroy it.
             queue::Admission::Full => {
                 shared.launch_attempted.lock().remove(&pending.generation);
+                // Not a failed attempt: a supervisor crash loop would otherwise
+                // burn the session's attempts on queue refusals and abandon it.
+                recovery::undo_attempt(data_dir, pending);
                 return;
             }
         }
