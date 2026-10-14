@@ -338,6 +338,18 @@ fn a_dying_process_recovers_nothing_and_leaves_the_session_pending() {
     assert!(dir.0.join("sessions/1.alive").exists(), "still pending");
     drop(r1);
 
+    // The worker reached its loop at once (no scan/GC ahead of it), so a flush
+    // request is answered promptly and what was queued is on disk.
+    let r1 = Recorder::launch(RecorderConfig::new(&dir.0, "TOKEN"), transport.clone()).unwrap();
+    for i in 0..200 {
+        r1.capture(event(i));
+    }
+    let t = Instant::now();
+    assert!(flush_in_flight(Duration::from_secs(2)));
+    assert!(t.elapsed() < Duration::from_millis(500));
+    assert_eq!(records_on_disk(&dir.0), 200);
+    drop(r1);
+
     bugsee_core::crash_flush::reset_dying_for_test();
     let r2 = Recorder::launch(RecorderConfig::new(&dir.0, "TOKEN"), transport.clone()).unwrap();
     r2.recover_on_launch_path();

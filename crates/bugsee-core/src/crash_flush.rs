@@ -237,7 +237,8 @@ fn serve_request() {
         Some(flush) => {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| flush())).unwrap_or(false)
         }
-        // Nothing registered: nothing is queued anywhere that we could drain.
+        // Nothing registered: no recorder is accepting entries (a recorder stays
+        // registered until its worker has stopped), so there is nothing to drain.
         None => true,
     };
     if ok {
@@ -445,6 +446,8 @@ mod imp {
         }
     }
 
+    /// `(counter, frequency)`; integer math only downstream (no floating point
+    /// in an exception filter).
     fn now_ticks() -> (i64, i64) {
         let (mut t, mut f) = (0i64, 1i64);
         // SAFETY: valid out-pointers; both calls cannot fail on supported Windows.
@@ -463,18 +466,19 @@ mod imp {
         }
         let ticket = REQUESTED.fetch_add(1, Ordering::AcqRel) + 1;
         let (start, freq) = now_ticks();
-        let budget_ticks = (budget.as_secs_f64() * freq as f64) as i64;
+        let budget_ms = budget.as_millis().min(i64::MAX as u128 / freq as u128 / 2) as i64;
         // SAFETY: SetEvent/WaitForSingleObject take no locks we could be holding.
         unsafe { SetEvent(wake) };
         while ACKED.load(Ordering::Acquire) < ticket {
             let (now, _) = now_ticks();
-            let left = budget_ticks - (now - start);
-            if left <= 0 {
+            let elapsed_ms = (now - start).saturating_mul(1000) / freq;
+            let left_ms = budget_ms - elapsed_ms;
+            if left_ms <= 0 {
                 return false;
             }
             // Wake on the helper's ack; the slice cap covers another waiter having
             // consumed the (auto-reset) signal.
-            let ms = ((left as f64 / freq as f64 * 1000.0).ceil() as u32).clamp(1, 5);
+            let ms = left_ms.clamp(1, 5) as u32;
             // SAFETY: as above.
             unsafe { WaitForSingleObject(ack, ms) };
         }

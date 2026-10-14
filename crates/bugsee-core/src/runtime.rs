@@ -749,8 +749,6 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        // Stop answering crash handlers before the worker goes away.
-        drop(self.crash_flush.take());
         // A worker still holding its recovery for the launch-path pass must not
         // make the stop below time out.
         self.shared.launch_done.store(true, Ordering::SeqCst);
@@ -766,6 +764,9 @@ impl Drop for Recorder {
                 let _ = handle.join();
             }
         }
+        // Only now stop answering crash handlers: until the worker has acked
+        // `Stop` it can still hold queued entries a crash flush must wait for.
+        drop(self.crash_flush.take());
         let (utx, urx) = channel();
         let uploader_acked = self.upload_tx.send(UploadMsg::Stop(utx)).is_ok()
             && urx.recv_timeout(Duration::from_secs(2)).is_ok();
@@ -1069,6 +1070,9 @@ fn spawn_pipeline(
                 // Best effort, once: sessions a previous default location left
                 // behind. No generation of ours lives there, so none is skipped.
                 for dir in &legacy_data_dirs {
+                    if crate::crash_flush::is_dying() {
+                        break;
+                    }
                     queue::gc_orphans(dir);
                     run_recovery(&worker_shared, dir, u64::MAX, false);
                 }
@@ -1119,14 +1123,24 @@ fn install_crash_flush(tx: &Sender<Msg>) -> Option<CrashFlush> {
 /// With `skip_launch_pass`, generations the launch-path pass already claimed are
 /// left alone.
 fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64, skip_launch_pass: bool) {
+    // A dying process starts no scan or GC a kill cannot finish: the worker must
+    // reach its loop to answer the crash handler's in-flight flush (crash_flush).
+    if crate::crash_flush::is_dying() {
+        return;
+    }
     for pending in recovery::find_pending(data_dir, current_generation) {
+        if crate::crash_flush::is_dying() {
+            return;
+        }
         if skip_launch_pass && shared.launch_attempted.lock().contains(&pending.generation) {
             continue;
         }
         recover_claimed(shared, data_dir, &pending, false);
     }
     // Reap parts/attempts left by cleanly-exited or already-recovered generations.
-    recovery::gc_orphans(data_dir, current_generation);
+    if !crate::crash_flush::is_dying() {
+        recovery::gc_orphans(data_dir, current_generation);
+    }
 }
 
 /// Claim one pending session and recover it. Returns whether this process won the
