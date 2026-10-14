@@ -11,7 +11,9 @@
 //! and after stop.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bugsee_core::errors::{self, Cause};
@@ -340,9 +342,13 @@ impl Bugsee {
     ///   Signals covered: `SIGTERM`, `SIGINT`. A `fork` child inherits the
     ///   handler but not its thread; it terminates by default as usual, and
     ///   calling this again in the child re-arms it there.
-    /// - **Windows.** A console control handler that flushes (and, for close,
-    ///   logoff and shutdown, which end the process regardless, also stops)
-    ///   then returns `FALSE` so the next handler still runs. Windows gives
+    /// - **Windows.** A console control handler that runs [`Bugsee::shutdown`]
+    ///   (flush, then a clean stop) for Ctrl+C, Ctrl+Break, close, logoff and
+    ///   shutdown, then returns `FALSE` so the next handler still runs. Windows
+    ///   cannot tell it whether that next handler will end the process, so a
+    ///   host that handles Ctrl+C itself and keeps running must register its
+    ///   handler **after** this call (handlers run last-registered first, so
+    ///   its swallowing the event means ours never runs). Windows gives
     ///   close/logoff/shutdown handlers only a few seconds: use a short
     ///   `timeout`. A service-control stop is not a console event and is not
     ///   covered; call [`Bugsee::shutdown`] from your stop handler.
@@ -580,10 +586,12 @@ impl Bugsee {
 }
 
 /// Exit-time flush timeout in milliseconds, `0` when not requested.
+#[cfg(unix)]
 static EXIT_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
 /// The process that registered the `atexit` handler. A `fork` child inherits
 /// the registration, and running `shutdown` there would revive the SDK in a
 /// process that may be mid-`fork`-and-`exec`; the child must do its own stop.
+#[cfg(unix)]
 static EXIT_FLUSH_PID: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(unix)]

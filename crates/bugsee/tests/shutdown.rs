@@ -175,6 +175,15 @@ fn child_entry() {
         "sigterm_host_handler" => {
             set_action(libc::SIGTERM, host_handler as *const () as usize, 0);
         }
+        "sigterm_oneshot_handler" => {
+            // A host's one-shot handler: it must run for THIS signal and not be
+            // turned into a kill by the SDK's own default-disposition logic.
+            set_action(
+                libc::SIGTERM,
+                host_handler as *const () as usize,
+                libc::SA_RESETHAND,
+            );
+        }
         "sigterm_siginfo_handler" => {
             set_action(
                 libc::SIGTERM,
@@ -239,7 +248,10 @@ fn child_entry() {
             std::thread::sleep(Duration::from_secs(60));
             std::process::exit(3); // the signal should have ended us
         }
-        "sigterm_host_handler" | "sigterm_siginfo_handler" | "sigterm_late_handler" => {
+        "sigterm_host_handler"
+        | "sigterm_siginfo_handler"
+        | "sigterm_oneshot_handler"
+        | "sigterm_late_handler" => {
             ready();
             exit_via_host(guard)
         }
@@ -525,8 +537,12 @@ fn sigterm_with_the_hook_delivers_when_the_backend_is_up() {
 
 #[test]
 fn a_hosts_own_handler_still_runs_and_decides() {
-    // Plain handler, and an SA_SIGINFO one (which must get a real siginfo).
-    for kind in ["sigterm_host_handler", "sigterm_siginfo_handler"] {
+    // Plain, SA_SIGINFO (must get a real siginfo) and one-shot SA_RESETHAND.
+    for kind in [
+        "sigterm_host_handler",
+        "sigterm_siginfo_handler",
+        "sigterm_oneshot_handler",
+    ] {
         let (out, pending, abnormal) = run_case(kind, FAIL, &[libc::SIGTERM]);
         assert!(
             out.dir.join("host-handler-ran").exists(),

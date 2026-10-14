@@ -37,10 +37,10 @@
 //! A console control handler. Windows runs it on a thread of its own, so it
 //! flushes in place, then returns `FALSE` so the next handler (the host's, or
 //! the default) still runs. Close, logoff and shutdown also stop the SDK, as
-//! the process ends regardless. Ctrl+C and Ctrl+Break only flush: with no host
-//! handler the default one ends the process without a clean stop, so the next
-//! launch reports an abnormal exit (an earlier handler may instead swallow the
-//! event and keep running, which a stop here would wrongly cut short).
+//! the process ends regardless. Ctrl+C and Ctrl+Break do the same: Windows
+//! cannot say whether a later handler will end the process, so a host that
+//! swallows the event and keeps running must register its handler AFTER the
+//! SDK's (it then runs first, and our handler never sees a swallowed event).
 
 use std::io;
 use std::time::Duration;
@@ -77,6 +77,12 @@ mod imp {
         flags: AtomicI32::new(0),
     };
     static SLOTS: [Slot; 2] = [SLOT; 2];
+
+    /// Set in the pipe byte when the handler found "default disposition, ours in
+    /// force" and so wants the watcher to terminate after flushing. Decided in
+    /// the handler, BEFORE a host `SA_RESETHAND` handler has been emulated away,
+    /// so the one signal that handler was meant for is not turned into a kill.
+    const TERMINATE: u8 = 0x80;
 
     /// Write end of the self-pipe; `-1` until installed.
     static PIPE_W: AtomicI32 = AtomicI32::new(-1);
@@ -127,12 +133,22 @@ mod imp {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
     unsafe fn errno_location() -> *mut c_int {
         unsafe { libc::__errno_location() }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd"))]
     unsafe fn errno_location() -> *mut c_int {
+        unsafe { libc::__errno() }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    unsafe fn errno_location() -> *mut c_int {
+        // Apple, FreeBSD, DragonFly.
         unsafe { libc::__error() }
     }
 
@@ -147,10 +163,12 @@ mod imp {
             let slot = &SLOTS[idx];
             let prev = slot.handler.load(Ordering::SeqCst);
             let prev_default = prev == libc::SIG_DFL;
+            let mut terminate = false;
             let owner = OWNER_PID.load(Ordering::Acquire) == libc::getpid() as u32;
             let live = owner && WATCHER_ALIVE.load(Ordering::SeqCst);
 
             if prev_default && current_is_ours(sig) {
+                terminate = true;
                 // Nobody to flush (a fork child, or the watcher is gone), or a
                 // second signal while the first is still being served: behave
                 // as if we were not installed.
@@ -161,7 +179,7 @@ mod imp {
             if live {
                 let fd = PIPE_W.load(Ordering::Acquire);
                 if fd >= 0 {
-                    let byte = sig as u8;
+                    let byte = sig as u8 | if terminate { TERMINATE } else { 0 };
                     // A full pipe means wake-ups are already pending: ignore.
                     libc::write(fd, (&byte as *const u8).cast(), 1);
                 }
@@ -210,11 +228,12 @@ mod imp {
                 }
                 return;
             }
-            let sig = byte as c_int;
-            let Some(idx) = index(sig) else { continue };
+            let sig = (byte & !TERMINATE) as c_int;
+            if index(sig).is_none() {
+                continue;
+            }
             let timeout = Duration::from_millis(TIMEOUT_MS.load(Ordering::Relaxed));
-            let prev_default = SLOTS[idx].handler.load(Ordering::SeqCst) == libc::SIG_DFL;
-            if prev_default && current_is_ours(sig) {
+            if byte & TERMINATE != 0 && current_is_ours(sig) {
                 // The process is about to end because of this signal: finish
                 // cleanly, then let it end the way it would have.
                 let _ = std::panic::catch_unwind(|| Bugsee::shutdown(timeout));
@@ -355,10 +374,6 @@ mod imp {
 
     use crate::Bugsee;
 
-    const CTRL_CLOSE_EVENT: u32 = 2;
-    const CTRL_LOGOFF_EVENT: u32 = 5;
-    const CTRL_SHUTDOWN_EVENT: u32 = 6;
-
     type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
 
     #[link(name = "kernel32")]
@@ -373,19 +388,12 @@ mod imp {
     /// Runs on a thread Windows creates for the event, so blocking is fine.
     unsafe extern "system" fn on_event(kind: u32) -> i32 {
         let timeout = Duration::from_millis(TIMEOUT_MS.load(Ordering::Relaxed));
-        let _ = std::panic::catch_unwind(|| match kind {
-            // Windows ends the process once the handlers return, whatever they
-            // answer: this exit is deliberate, so finish cleanly.
-            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
-                Bugsee::shutdown(timeout);
-            }
-            // Ctrl+C / Ctrl+Break: a handler registered before ours may swallow
-            // it and keep running, so only flush. The host ends the session by
-            // dropping the launch guard.
-            _ => {
-                Bugsee::flush(timeout);
-            }
-        });
+        // Every event is treated as deliberate: close, logoff and shutdown end
+        // the process whatever the handlers answer, and for Ctrl+C / Ctrl+Break
+        // the default routine that follows ours does too. A host that swallows
+        // them registers after us (see `install_termination_flush`).
+        let _ = kind;
+        let _ = std::panic::catch_unwind(|| Bugsee::shutdown(timeout));
         // FALSE: pass the event on to the next handler (the host's, or the
         // default one). We never swallow it.
         0
