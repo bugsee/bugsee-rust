@@ -50,22 +50,25 @@ struct Sym {
 /// info). `None` when it cannot be determined with confidence — a stripped
 /// build, or a caller that is not Rust code (an FFI host).
 pub fn capture_origin() -> Option<String> {
-    // Walking the stack takes the `backtrace` crate's process-wide lock, like
-    // `capture_error`'s capture does: do not call this from a fork child that
-    // forked while another thread was capturing. Only code uploads pay for it.
+    // The `backtrace` crate's process-wide mutex does not survive `fork()`;
+    // this registered lock makes a fork wait out the walk (see `lock_backtrace`).
+    // Only code uploads pay for it.
+    let _walk = crate::fork::lock_backtrace();
     let mut syms: Vec<Sym> = Vec::new();
     let mut frames = 0;
     let mut result = None;
     backtrace::trace(|frame| {
         // Resolve one frame at a time and stop as soon as the answer is known;
         // symbolizing the whole stack costs milliseconds.
+        let mut resolved = Vec::new();
         backtrace::resolve_frame(frame, |symbol| {
-            syms.push(Sym {
+            resolved.push(Sym {
                 name: symbol.name().map(display_name),
                 file: symbol.filename().map(|p| p.to_string_lossy().into_owned()),
                 line: symbol.lineno(),
             });
         });
+        push_frame(&mut syms, resolved);
         frames += 1;
         match scan(&syms) {
             Scan::Done(origin) => {
@@ -76,6 +79,17 @@ pub fn capture_origin() -> Option<String> {
         }
     });
     result
+}
+
+/// Append one physical frame's symbols. `resolve_frame` may call back zero times
+/// when it cannot symbolize; that frame still exists, so record it as unknown
+/// rather than dropping it (which would make its caller look adjacent to the SDK).
+fn push_frame(syms: &mut Vec<Sym>, resolved: Vec<Sym>) {
+    if resolved.is_empty() {
+        syms.push(Sym::default());
+    } else {
+        syms.extend(resolved);
+    }
 }
 
 /// Rendered without the rustc hash suffix (`{:#}`), both mangling schemes.
@@ -117,10 +131,14 @@ fn scan(syms: &[Sym]) -> Scan {
 }
 
 fn is_sdk_frame(sym: &Sym) -> bool {
-    sym.name
-        .as_deref()
-        .is_some_and(|n| is_internal_frame(n) && !is_std_runtime(n))
-        || sym.file.as_deref().is_some_and(in_sdk_dir)
+    match sym.name.as_deref() {
+        // A qualified symbol is authoritative: an app crate whose sources sit in
+        // a directory merely named like an SDK crate is still the app.
+        Some(n) if n.contains("::") => is_internal_frame(n) && !is_std_runtime(n),
+        // Unqualified (`line-tables-only`) or unresolved names: fall back to the
+        // source path.
+        _ => sym.file.as_deref().is_some_and(in_sdk_dir),
+    }
 }
 
 /// std/core/alloc and compiler shims: internal to the toolchain, not the SDK.
@@ -218,6 +236,30 @@ mod tests {
             origin(&syms).as_deref(),
             Some("my_app::checkout::submit:42")
         );
+    }
+
+    #[test]
+    fn app_under_an_sdk_named_directory_is_still_the_caller() {
+        // Crate `my_app` checked out at /home/me/bugsee/: the qualified symbol wins.
+        let syms = [
+            sym("bugsee::api::Bugsee::upload", None, None),
+            sym("my_app::run", Some("/home/me/bugsee/src/main.rs"), Some(12)),
+        ];
+        assert_eq!(origin(&syms).as_deref(), Some("my_app::run:12"));
+    }
+
+    #[test]
+    fn a_frame_that_failed_to_resolve_is_kept_as_unknown() {
+        // `resolve_frame` calls back zero times for it; the parent must not be
+        // promoted to the caller.
+        let mut syms = vec![sym("bugsee::api::Bugsee::upload", None, None)];
+        push_frame(&mut syms, Vec::new());
+        push_frame(
+            &mut syms,
+            vec![sym("app::parent", Some("/a/p.rs"), Some(1))],
+        );
+        assert_eq!(syms.len(), 3);
+        assert_eq!(origin(&syms), None);
     }
 
     #[test]
