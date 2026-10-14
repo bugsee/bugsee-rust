@@ -178,7 +178,10 @@ fn session_is_crashed(data_dir: &Path, generation: u64, marker: &Path, self_pid:
             crate::claim::Probe::Free => {
                 return !(marker_is_empty(marker) && marker_is_fresh(marker));
             }
-            crate::claim::Probe::Unknown => {}
+            // No lock file after all (it vanished since `exists`, e.g. a session
+            // without kernel locks removing it), or the filesystem cannot say:
+            // that is not evidence of death. Use the heartbeat / pid.
+            crate::claim::Probe::Vanished | crate::claim::Probe::Unknown => {}
         }
     }
     legacy_marker_is_dead(marker, self_pid)
@@ -996,6 +999,26 @@ mod tests {
             .unwrap();
         drop(f);
         assert_eq!(gens(&dir), vec![1], "quiet heartbeat: crashed");
+    }
+
+    #[test]
+    fn a_lock_file_that_vanishes_under_the_scan_is_not_evidence_of_a_crash() {
+        // A lock-less session unlinks its `<gen>.lock` before it writes its
+        // heartbeat; a peer that saw the file must fall back to the beat.
+        let dir = tmp();
+        let m = marker(&dir, 1, "4294967290");
+        let lock = Session::lock_path(&dir, 1);
+        std::fs::write(&lock, "").unwrap();
+        std::fs::write(heartbeat_path(&m), "").unwrap();
+        let lock2 = lock.clone();
+        crate::claim::BEFORE_PROBE_OPEN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = std::fs::remove_file(&lock2);
+            }));
+        });
+        let found = gens(&dir);
+        crate::claim::BEFORE_PROBE_OPEN.with(|h| *h.borrow_mut() = None);
+        assert!(found.is_empty(), "fresh heartbeat: the session is alive");
     }
 
     #[test]
