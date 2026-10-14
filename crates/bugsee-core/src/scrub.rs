@@ -241,6 +241,9 @@ const TEXT_STRONG: &[&str] = &[
     "bearer",
     "sessionid",
     "sessiontoken",
+    // OAuth 1.0a verifier/PIN: structured matching redacts these via `auth`.
+    "verifier",
+    "oauthpin",
 ];
 
 /// Free-text names that are also ordinary words; see the module docs.
@@ -516,6 +519,8 @@ enum KeyClass {
     Cookie,
     /// A key the host listed in `sensitive_keys`: always redacted.
     Explicit,
+    /// `pin` / `otp`: short numeric codes, redacted after `=` or a quoted key.
+    Pin,
 }
 
 impl Scrubber {
@@ -935,6 +940,8 @@ impl Scrubber {
                 KeyClass::Explicit
             } else if TEXT_STRONG.iter().any(|k| n.ends_with(k.as_bytes())) {
                 KeyClass::Strong
+            } else if n == b"pin" || n == b"otp" {
+                KeyClass::Pin
             } else if EXACT.iter().any(|k| n == k.as_bytes())
                 || TEXT_AMBIGUOUS_SUFFIX
                     .iter()
@@ -1242,6 +1249,13 @@ impl Scrubber {
                 let secretish =
                     ve - vs >= 8 && head.iter().any(u8::is_ascii_digit) && !head.contains(&b':');
                 if !(sep == b'=' || quoted_key) || !secretish {
+                    continue;
+                }
+            } else if class == KeyClass::Pin {
+                // 4-10 digits; `pin=home` or "otp: sent" are prose.
+                let v = &b[vs..ve];
+                let codeish = (4..=10).contains(&v.len()) && v.iter().all(u8::is_ascii_digit);
+                if !(sep == b'=' || quoted_key) || !codeish {
                     continue;
                 }
             } else if class == KeyClass::Strong
@@ -1815,6 +1829,18 @@ mod tests {
         // Ambiguous names need `=`/quoted key and a secret-looking value.
         assert_eq!(s("session=abcd1234efgh"), "session=[redacted]");
         assert_eq!(s("key=short"), "key=short");
+        // OAuth 1.0a verifier/PIN and short OTP/PIN codes in free text.
+        assert_eq!(
+            s("oauth_verifier=abcXYZ&x=1"),
+            "oauth_verifier=[redacted]&x=1"
+        );
+        assert_eq!(s("oauth_pin=1234"), "oauth_pin=[redacted]");
+        assert_eq!(s("pin=1234 otp=654321"), "pin=[redacted] otp=[redacted]");
+        assert_eq!(s(r#"{"otp": "654321"}"#), r#"{"otp": "[redacted]"}"#);
+        assert_eq!(
+            s("pin=home otp: sent spinner=12"),
+            "pin=home otp: sent spinner=12"
+        );
         assert_eq!(s("auth: failed for user"), "auth: failed for user");
     }
 
