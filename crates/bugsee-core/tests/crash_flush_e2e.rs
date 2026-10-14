@@ -311,6 +311,41 @@ fn a_crash_flush_raises_the_dying_flag_and_blocks_new_claims() {
     drop(cf);
 }
 
+/// A crash while the launch pass / worker recovery runs: a dying process must
+/// recover nothing (a kill would strand the claim), and the session stays pending
+/// for the next launch.
+#[test]
+fn a_dying_process_recovers_nothing_and_leaves_the_session_pending() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new();
+    std::fs::write(dir.0.join("gen"), "1").unwrap();
+    let part = dir.0.join("parts/1/0");
+    std::fs::create_dir_all(&part).unwrap();
+    let payload = br#"{"timestamp":100,"level":1,"source":2,"message":"x"}"#;
+    let mut bytes = Vec::new();
+    bugsee_core::capture::record::frame(100, payload, &mut bytes);
+    std::fs::write(part.join("log.part"), &bytes).unwrap();
+    std::fs::create_dir_all(dir.0.join("sessions")).unwrap();
+    std::fs::write(dir.0.join("sessions/1.alive"), "0").unwrap();
+
+    bugsee_core::crash_flush::flush_for_crash(Duration::from_millis(10));
+    assert!(bugsee_core::crash_flush::is_dying());
+    let transport = Arc::new(MockTransport::default());
+    let r1 = Recorder::launch(RecorderConfig::new(&dir.0, "TOKEN"), transport.clone()).unwrap();
+    r1.recover_on_launch_path();
+    assert!(r1.flush(Duration::from_secs(5)));
+    assert!(transport.uploaded_bundles.lock().unwrap().is_empty());
+    assert!(dir.0.join("sessions/1.alive").exists(), "still pending");
+    drop(r1);
+
+    bugsee_core::crash_flush::reset_dying_for_test();
+    let r2 = Recorder::launch(RecorderConfig::new(&dir.0, "TOKEN"), transport.clone()).unwrap();
+    r2.recover_on_launch_path();
+    assert!(r2.flush(Duration::from_secs(5)));
+    assert_eq!(transport.uploaded_bundles.lock().unwrap().len(), 1);
+    drop(r2);
+}
+
 /// A `fork()` child has none of the parent's threads: it must not wait on the
 /// parent's helper, and must get its own once it registers.
 #[cfg(unix)]
