@@ -151,7 +151,7 @@ mod imp {
 
     /// macOS: `hw.model` is the model identifier ("MacBookPro18,3"). Every other
     /// Apple OS: `hw.model` is the *board* id ("D63AP"), and the product
-    /// identifier ("iPhone14,2") is `hw.machine`, the same value iOS SDKs read
+    /// identifier ("iPhone14,2") is `hw.machine`, the same value iOS apps read
     /// from `utsname.machine`. In the simulator `hw.machine` is the host's
     /// architecture, so the simulated device's identifier is taken from
     /// `SIMULATOR_MODEL_IDENTIFIER` first.
