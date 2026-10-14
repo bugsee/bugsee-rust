@@ -156,7 +156,7 @@ Behaviour (verified in `crates/bugsee/src/api.rs`) vs. what the header says
   bundle), including the server's dedupe/blacklist semantics. A host should not
   have to reimplement that.
 - **Direction:** split the shipped `HttpTransport` into (a) the protocol layer
-  (session, issue, presigned PUT, `12003`/`12004`/`401`/`429` handling — stays
+  (session, issue, presigned PUT, duplicate/too-many-similar/`401`/`429` handling — stays
   in the core) and (b) a one-method HTTP primitive: `send(method, url, headers,
   body) -> {status, headers, body}`. The FFI exposes only (b) as a callback
   with a `user_data` pointer; the core keeps ownership of **queueing, ordering,

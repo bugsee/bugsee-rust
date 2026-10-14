@@ -1318,8 +1318,12 @@ fn spawn_pipeline(
 }
 
 /// How long the helper waits for the worker to acknowledge a crash-time flush.
-/// The crash handler gives up on its own, sooner; this only bounds the helper.
-const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+/// The crash handler gives up on its own, far sooner (its budget); this only
+/// bounds how long a permanently wedged worker can occupy the helper. It must
+/// outlast any legitimate drain (the queue is capped), or a slow-but-healthy
+/// worker would make the helper report failure for a request whose budget was
+/// longer than this.
+const CRASH_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Register this pipeline as the process's crash-time flush target. A failure
 /// (no pipe/event available) just forgoes the best-effort flush.
@@ -1963,7 +1967,7 @@ fn process_report(
         return Ok(());
     }
 
-    // Suppress reports the server blacklisted (12004 TooManySimilar). Order
+    // Suppress reports the server blacklisted (the too-many-similar verdict). Order
     // matters for a storm: the in-memory set is a lock + hash, so it goes first;
     // the rate limiter comes next (also lock + hash), so a flood of denied
     // reports never touches the disk; only the reports the limiter ADMITS pay
@@ -2064,7 +2068,7 @@ const EAGER_RETRY: Duration = Duration::from_secs(30);
 
 /// Register the backend session now, once: a no-op when a token is already held
 /// (an earlier attempt, or a delivery, got one), so there is exactly one
-/// `POST /v2/sessions` per launch that is online. Never fails the caller: errors
+/// session registration per launch that is online. Never fails the caller: errors
 /// are dropped and the lazy path in [`transport::deliver`] registers later. The
 /// lock is not held across the network call.
 fn register_eagerly(shared: &Shared) {
