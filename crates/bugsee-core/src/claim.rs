@@ -38,8 +38,35 @@ impl Drop for Claim {
 }
 
 /// Try to claim `path`. `None` if another live process (or another thread of this
-/// one) holds it.
+/// one) holds it, or if the claim file cannot be created at all.
 pub fn try_claim(path: &Path) -> Option<Claim> {
+    match claim_state(path) {
+        ClaimState::Held(claim) => Some(claim),
+        ClaimState::Taken | ClaimState::Unavailable => None,
+    }
+}
+
+/// Like [`try_claim`] for a directory that may be full or read-only, where the
+/// claim file cannot be created but the work (recover a crash, deliver a queued
+/// report) is still worth doing: `Some(None)` means "no claim could be made,
+/// proceed unclaimed". The cost is that two processes sharing such a directory
+/// may both do the work, and the backend deduplicates. `None` means another
+/// process holds the claim.
+pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
+    match claim_state(path) {
+        ClaimState::Held(claim) => Some(Some(claim)),
+        ClaimState::Unavailable => Some(None),
+        ClaimState::Taken => None,
+    }
+}
+
+enum ClaimState {
+    Held(Claim),
+    Taken,
+    Unavailable,
+}
+
+fn claim_state(path: &Path) -> ClaimState {
     for _ in 0..2 {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -48,13 +75,13 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
         {
             Ok(mut file) => {
                 let _ = write!(file, "{}", std::process::id());
-                return Some(Claim {
+                return ClaimState::Held(Claim {
                     path: path.to_path_buf(),
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !is_stale(path) {
-                    return None;
+                    return ClaimState::Taken;
                 }
                 // Take over a claim whose owner is gone, then retry the create.
                 // Losing the race to another taker just means `create_new` fails
@@ -63,10 +90,10 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
             }
             // Directory missing / unwritable: nothing can be claimed, and the
             // caller's own I/O will fail more usefully than we can here.
-            Err(_) => return None,
+            Err(_) => return ClaimState::Unavailable,
         }
     }
-    None
+    ClaimState::Taken
 }
 
 fn is_stale(path: &Path) -> bool {
