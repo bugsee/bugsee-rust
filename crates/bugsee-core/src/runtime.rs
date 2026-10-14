@@ -1017,7 +1017,10 @@ fn recover_one(shared: &Shared, data_dir: &Path, pending: &recovery::PendingSess
         Some(hook) => hook(&mut built.meta),
         None => true,
     };
-    if !keep || queue::any_blacklisted(data_dir, &built.meta.signatures) {
+    if !keep
+        || mem_blacklisted(shared, &built.meta.signatures)
+        || queue::any_blacklisted(data_dir, &built.meta.signatures)
+    {
         recovery::discard(data_dir, pending);
         return;
     }
@@ -1525,6 +1528,17 @@ fn uploader_loop(
     }
 }
 
+/// Retire a queued report whose work is over (delivered, or abandoned for any
+/// reason). If the directory will not let us delete it (read-only or full), it is
+/// remembered so no later drain selects it again: otherwise a terminal verdict on
+/// such a directory would be re-sent every 20 ms of a flush and every poll.
+fn retire_queued(shared: &Shared, report: &queue::QueuedReport) {
+    queue::remove(report);
+    if report.bundle.exists() {
+        shared.delivered_stuck.lock().insert(report.bundle.clone());
+    }
+}
+
 /// Queued reports in `dir` still awaiting delivery: everything on disk except
 /// bundles already delivered whose deletion failed.
 fn pending_reports(shared: &Shared, dir: &Path) -> Vec<queue::QueuedReport> {
@@ -1646,13 +1660,7 @@ fn deliver_queued(
         cached_endpoint.as_deref(),
         &mut endpoint_out,
     ) {
-        Ok(()) => {
-            queue::remove(report);
-            if report.bundle.exists() {
-                // Delivered, but the directory will not let us delete it.
-                shared.delivered_stuck.lock().insert(report.bundle.clone());
-            }
-        }
+        Ok(()) => retire_queued(shared, report),
         // A transient failure OR a still-expired session are both retryable.
         Err(TransportError::Transient(_)) | Err(TransportError::SessionExpired) => {
             // Persist the presigned endpoint if the failure left one to resume
@@ -1664,7 +1672,7 @@ fn deliver_queued(
             if count_failure {
                 let n = retry + 1;
                 if n >= UPLOAD_RETRY_CAP {
-                    queue::remove(report);
+                    retire_queued(shared, report);
                     notify_dropped(shared, DropReason::RetriesExhausted);
                 } else {
                     queue::set_meta(report, n, now + backoff_delay(n, backoff_base));
@@ -1683,12 +1691,12 @@ fn deliver_queued(
             };
             queue::blacklist_add(data_dir, &sigs);
             shared.mem_blacklist.lock().extend(sigs);
-            queue::remove(report);
+            retire_queued(shared, report);
             notify_dropped(shared, DropReason::TooManySimilar);
         }
         // Duplicate / permanent — abandon the report.
         Err(e) => {
-            queue::remove(report);
+            retire_queued(shared, report);
             notify_dropped(shared, drop_reason_for(e));
         }
     }
