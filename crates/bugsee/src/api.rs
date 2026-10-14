@@ -520,7 +520,13 @@ impl Bugsee {
 
     /// Trigger an immediate `code_upload` report.
     pub fn upload() {
-        Self::with_recorder(|r| r.report(manual_upload_meta(), None));
+        if !Self::is_launched() {
+            return;
+        }
+        // Built BEFORE taking the global lock: capturing the origin walks and
+        // symbolizes the stack, milliseconds that must not stall other threads.
+        let meta = manual_upload_meta();
+        Self::with_recorder(|r| r.report(meta, None));
     }
 
     /// Trigger an immediate report with explicit metadata.

@@ -15,6 +15,7 @@ serde_repr = { workspace = true }
 zip = { version = "2", default-features = false, features = ["zstd"] }
 getrandom = "0.2"
 sha1 = "0.10.7"
+backtrace = "0.3"
 
 # Unix only: a single contained `kill(pid, 0)` liveness probe used by recovery to
 # avoid resurrecting a still-running shared-data-dir peer's session as a "crash".
