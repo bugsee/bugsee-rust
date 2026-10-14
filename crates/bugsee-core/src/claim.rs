@@ -40,6 +40,10 @@ impl Drop for Claim {
 /// Try to claim `path`. `None` if another live process (or another thread of this
 /// one) holds it, or if the claim file cannot be created at all.
 pub fn try_claim(path: &Path) -> Option<Claim> {
+    // A dying process must not start work a kill would leave half-claimed.
+    if crate::crash_flush::is_dying() {
+        return None;
+    }
     match claim_state(path) {
         ClaimState::Held(claim) => Some(claim),
         ClaimState::Taken | ClaimState::Unavailable => None,
@@ -53,6 +57,9 @@ pub fn try_claim(path: &Path) -> Option<Claim> {
 /// may both do the work, and the backend deduplicates. `None` means another
 /// process holds the claim.
 pub fn try_claim_lenient(path: &Path) -> Option<Option<Claim>> {
+    if crate::crash_flush::is_dying() {
+        return None;
+    }
     match claim_state(path) {
         ClaimState::Held(claim) => Some(Some(claim)),
         ClaimState::Unavailable => Some(None),

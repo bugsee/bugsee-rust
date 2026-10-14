@@ -135,48 +135,92 @@ fn a_stuck_worker_costs_only_the_budget() {
     drop(recorder);
 }
 
+/// A flush target that only counts its calls.
+fn counter() -> (Arc<AtomicUsize>, impl Fn() -> bool + Send + Sync + 'static) {
+    let n = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&n);
+    (n, move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        true
+    })
+}
+
 #[test]
-fn dropping_the_recorder_deregisters() {
+fn dropping_the_recorder_stops_flushing_into_it() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new();
+    let (calls, f) = counter();
+    let _sentinel = CrashFlush::install(f).unwrap();
     let recorder = Recorder::launch(
         RecorderConfig::new(&dir.0, "TOKEN"),
         Arc::new(MockTransport::default()),
     )
     .unwrap();
     assert!(flush_in_flight(Duration::from_secs(2)));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the recorder is the target"
+    );
     drop(recorder);
+    // Nothing is registered now, so a request is answered at once rather than
+    // waited out, and the replaced sentinel is not called.
     let t = Instant::now();
-    assert!(!flush_in_flight(Duration::from_secs(2)));
+    assert!(flush_in_flight(Duration::from_secs(2)));
     assert!(t.elapsed() < Duration::from_millis(200), "no wait at all");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn memory_mode_does_not_take_over_the_target() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new();
+    let (calls, f) = counter();
+    let _sentinel = CrashFlush::install(f).unwrap();
+    let mut cfg = RecorderConfig::new(&dir.0, "TOKEN");
+    cfg.memory_only = Some("test".into());
+    let recorder = Recorder::launch(cfg, Arc::new(MockTransport::default())).unwrap();
+    assert!(flush_in_flight(Duration::from_secs(2)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "still the sentinel");
+    drop(recorder);
 }
 
 // The handshake itself, against stand-in flushers (no pipeline).
 
 #[test]
-fn unregistered_returns_false_immediately() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let t = Instant::now();
-    assert!(!flush_in_flight(Duration::from_millis(500)));
-    assert!(t.elapsed() < Duration::from_millis(100));
-}
-
-#[test]
 fn a_responsive_flusher_is_confirmed_promptly() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let calls = Arc::new(AtomicUsize::new(0));
-    let c = Arc::clone(&calls);
-    let cf = CrashFlush::install(move || {
-        c.fetch_add(1, Ordering::SeqCst);
-        true
-    })
-    .unwrap();
+    let (calls, f) = counter();
+    let cf = CrashFlush::install(f).unwrap();
     let t = Instant::now();
     assert!(flush_in_flight(Duration::from_millis(500)));
     assert!(t.elapsed() < Duration::from_millis(250));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(cf);
-    assert!(!flush_in_flight(Duration::from_millis(50)), "deregistered");
+    assert!(flush_in_flight(Duration::from_millis(500)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "deregistered: not called");
+}
+
+#[test]
+fn the_last_registered_target_wins() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (a_calls, a) = counter();
+    let (b_calls, b) = counter();
+    let a = CrashFlush::install(a).unwrap();
+    let b = CrashFlush::install(b).unwrap();
+    assert!(flush_in_flight(Duration::from_millis(500)));
+    assert_eq!(
+        (
+            a_calls.load(Ordering::SeqCst),
+            b_calls.load(Ordering::SeqCst)
+        ),
+        (0, 1)
+    );
+    // Dropping the one that is not current must not deregister the current one.
+    drop(a);
+    assert!(flush_in_flight(Duration::from_millis(500)));
+    assert_eq!(b_calls.load(Ordering::SeqCst), 2);
+    drop(b);
 }
 
 #[test]
@@ -198,6 +242,8 @@ fn a_stuck_flusher_costs_the_budget_and_no_more() {
     assert!(took < Duration::from_millis(400), "{took:?}");
     release.store(true, Ordering::SeqCst);
     drop(cf);
+    // Let the helper finish the stuck call before the next test.
+    std::thread::sleep(Duration::from_millis(50));
 }
 
 #[test]
@@ -224,12 +270,78 @@ fn a_panicking_flusher_does_not_kill_the_helper() {
 }
 
 #[test]
-fn memory_mode_has_nothing_to_flush() {
+fn a_pipeline_thread_does_not_wait_for_itself() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (calls, f) = counter();
+    let cf = CrashFlush::install(f).unwrap();
+    let t = Instant::now();
+    let r = std::thread::spawn(|| {
+        let _p = bugsee_core::crash_flush::register_pipeline_thread();
+        flush_in_flight(Duration::from_secs(2))
+    })
+    .join()
+    .unwrap();
+    assert!(!r, "skipped");
+    assert!(t.elapsed() < Duration::from_millis(200));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(cf);
+}
+
+#[test]
+fn a_crash_flush_raises_the_dying_flag_and_blocks_new_claims() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new();
-    let mut cfg = RecorderConfig::new(&dir.0, "TOKEN");
-    cfg.memory_only = Some("test".into());
-    let recorder = Recorder::launch(cfg, Arc::new(MockTransport::default())).unwrap();
-    assert!(!flush_in_flight(Duration::from_millis(50)));
-    drop(recorder);
+    let claim = dir.0.join("x.claim");
+    bugsee_core::crash_flush::reset_dying_for_test();
+    assert!(bugsee_core::claim::try_claim(&claim).is_some());
+    let (_calls, f) = counter();
+    let cf = CrashFlush::install(f).unwrap();
+    // The plain flush (a panic hook's) does not declare the process dying.
+    flush_in_flight(Duration::from_millis(100));
+    assert!(!bugsee_core::crash_flush::is_dying());
+    bugsee_core::crash_flush::flush_for_crash(Duration::from_millis(100));
+    assert!(bugsee_core::crash_flush::is_dying());
+    assert!(
+        bugsee_core::claim::try_claim(&claim).is_none(),
+        "a dying process starts no claim a kill would leave half-made"
+    );
+    assert!(bugsee_core::claim::try_claim_lenient(&claim).is_none());
+    bugsee_core::crash_flush::reset_dying_for_test();
+    assert!(bugsee_core::claim::try_claim(&claim).is_some());
+    drop(cf);
+}
+
+/// A `fork()` child has none of the parent's threads: it must not wait on the
+/// parent's helper, and must get its own once it registers.
+#[cfg(unix)]
+#[test]
+fn a_fork_child_gets_its_own_helper() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_calls, f) = counter();
+    let cf = CrashFlush::install(f).unwrap();
+    assert!(flush_in_flight(Duration::from_millis(500)));
+    // SAFETY: the child only calls the code under test and `_exit`s.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        let before = flush_in_flight(Duration::from_millis(500));
+        let (_c, g) = counter();
+        let mine = CrashFlush::install(g).unwrap();
+        let after = flush_in_flight(Duration::from_millis(500));
+        std::mem::forget(mine);
+        let code = if !before && after { 0 } else { 1 };
+        // SAFETY: leaving a forked child.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: waiting for our own child.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "child status {status}"
+    );
+    assert!(
+        flush_in_flight(Duration::from_millis(500)),
+        "parent unaffected"
+    );
+    drop(cf);
 }

@@ -253,8 +253,14 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
                 });
             });
             if likely_fatal {
-                let _ =
-                    bugsee_core::crash_flush::flush_in_flight(std::time::Duration::from_millis(50));
+                // Runs AFTER the inline report above (when `report_panics_from_hook`
+                // is on), so that report's processing is ahead of the flush marker
+                // in the worker's queue and is part of what is waited for. A panic
+                // the host goes on to catch outside our guards pays up to the
+                // budget once. The same budget the native handler uses.
+                let _ = bugsee_core::crash_flush::flush_in_flight(
+                    bugsee_core::crash_flush::DEFAULT_BUDGET,
+                );
             }
             // Preserve prior hook behavior (default abort message, other SDKs).
             previous(info);

@@ -908,6 +908,8 @@ fn spawn_pipeline(
     let worker = std::thread::Builder::new()
         .name("bugsee-capture".into())
         .spawn(move || {
+            // A crash on this thread cannot wait for itself to flush.
+            let _pipeline = crate::crash_flush::register_pipeline_thread();
             // Queue any crashed prior session before capturing this one.
             // Contained: a panic here (e.g. a host before_send on a recovered
             // crash) must not abort the thread before worker_loop starts.
@@ -1737,6 +1739,10 @@ fn drain_memory(
     let mut tried: Vec<u64> = Vec::new();
     loop {
         if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        // A dying process starts no delivery it cannot finish (crash_flush).
+        if crate::crash_flush::is_dying() {
             break;
         }
         let now = epoch_ms();

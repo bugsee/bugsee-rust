@@ -10,17 +10,22 @@
 //! little later. These tests die for real, in a child process, immediately after
 //! emitting a burst of events, and read what the next launch recovers:
 //!
-//! * `burst_then_segv` — every event emitted before the fault, including the
-//!   ones still queued when it hit, is in the recovered report.
+//! * `burst_then_segv` — with a long flush budget (so the result does not depend
+//!   on how fast this machine drains), every event emitted before the fault,
+//!   including the ones still queued when it hit, is in the recovered report.
+//!   Without the flush only a few dozen of the 1000 survive.
+//! * `small_burst_real_budget` — the same under the real 50 ms budget, with a
+//!   burst small enough to drain inside it.
 //! * `wedged_worker_then_segv` — the worker is stuck in a host callback, so the
-//!   flush cannot succeed. The process must still die promptly (the handler is
-//!   bounded; the 5 s watchdog must not be what ends it) and the crash is still
-//!   reported, with the events that had already reached disk.
+//!   flush cannot succeed. The process must wait the (test-shortened) budget and
+//!   no longer — proving the wait happens and is bounded; the 5 s watchdog must
+//!   not be what ends it — and the crash is still reported, with the events that
+//!   had already reached disk.
 //!
 //! `harness = false` (see `Cargo.toml`): the child must fault from the real main
 //! thread.
 
-#![cfg(all(feature = "native", unix))]
+#![cfg(all(feature = "native", any(unix, windows)))]
 
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::process::{Command, Stdio};
@@ -38,6 +43,13 @@ const DIR_ENV: &str = "BUGSEE_INFLIGHT_DIR";
 /// before the worker (which serializes and writes) has drained, yet the worker
 /// can drain within the 50 ms handler budget.
 const BURST: usize = 1000;
+/// The burst for the real-budget case: drains well inside 50 ms even on a slow
+/// core, yet is far more than the ~20-40 the no-flush baseline recovers.
+const SMALL_BURST: usize = 250;
+/// Budget used by the cases that prove the mechanism rather than the speed.
+const LONG_BUDGET: Duration = Duration::from_secs(5);
+/// Budget used by the wedged case: long enough to measure, short enough to run.
+const WEDGE_BUDGET: Duration = Duration::from_millis(300);
 
 #[inline(never)]
 fn fault_null() {
@@ -45,9 +57,9 @@ fn fault_null() {
     unsafe { std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1) }
 }
 
-fn emit_burst(prefix: &str) {
+fn emit_burst(prefix: &str, count: usize) {
     let pad = "x".repeat(400);
-    for i in 0..BURST {
+    for i in 0..count {
         let mut params = Map::new();
         params.insert("pad".into(), Value::String(pad.clone()));
         Bugsee::event_with(format!("{prefix}-{i}"), params);
@@ -77,7 +89,11 @@ fn run_child(kind: &str, dir: &str) -> ! {
     std::thread::sleep(Duration::from_millis(300));
 
     match kind {
-        "burst_then_segv" => emit_burst("burst"),
+        "burst_then_segv" => {
+            bugsee_native::set_inflight_flush_budget_for_test(LONG_BUDGET);
+            emit_burst("burst", BURST);
+        }
+        "small_burst_real_budget" => emit_burst("small", SMALL_BURST),
         "wedged_worker_then_segv" => {
             // These reach disk before the worker is wedged...
             for i in 0..20 {
@@ -88,7 +104,8 @@ fn run_child(kind: &str, dir: &str) -> ! {
             // is stuck in the queue.
             Bugsee::capture_message(LogLevel::Error, "wedge the worker");
             std::thread::sleep(Duration::from_millis(300));
-            emit_burst("stuck");
+            bugsee_native::set_inflight_flush_budget_for_test(WEDGE_BUDGET);
+            emit_burst("stuck", 100);
         }
         other => panic!("unknown kind {other}"),
     }
@@ -209,10 +226,35 @@ fn burst_then_segv() -> Result<(), String> {
     })
 }
 
+fn small_burst_real_budget() -> Result<(), String> {
+    with_dir("small", |dir| {
+        crash_child("small_burst_real_budget", dir)?;
+        let bundles = recover(dir);
+        if bundles.len() != 1 {
+            return Err(format!("expected one report, got {}", bundles.len()));
+        }
+        let names = event_names(&bundles[0]);
+        let have = names.iter().filter(|n| n.starts_with("small-")).count();
+        let last = format!("small-{}", SMALL_BURST - 1);
+        if !names.contains(&last) || have != SMALL_BURST {
+            return Err(format!(
+                "events lost under the real budget ({have}/{SMALL_BURST}, last present: {})",
+                names.contains(&last)
+            ));
+        }
+        Ok(())
+    })
+}
+
 fn wedged_worker_then_segv() -> Result<(), String> {
     with_dir("wedged", |dir| {
         let took = crash_child("wedged_worker_then_segv", dir)?;
-        if took > Duration::from_secs(2) {
+        // Waited the budget (without the feature the process dies at once) and no
+        // longer (the 5 s watchdog must not be what ended it).
+        if took < WEDGE_BUDGET - Duration::from_millis(50) {
+            return Err(format!("died in {took:?}: the flush did not wait"));
+        }
+        if took > Duration::from_secs(1) {
             return Err(format!("the dying process hung for {took:?}"));
         }
         let bundles = recover(dir);
@@ -239,8 +281,9 @@ fn main() {
         run_child(&kind, &std::env::var(DIR_ENV).expect("dir"));
     }
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
-    let cases: [(&str, Case); 2] = [
+    let cases: [(&str, Case); 3] = [
         ("burst_then_segv", burst_then_segv),
+        ("small_burst_real_budget", small_burst_real_budget),
         ("wedged_worker_then_segv", wedged_worker_then_segv),
     ];
     let mut failed = Vec::new();
