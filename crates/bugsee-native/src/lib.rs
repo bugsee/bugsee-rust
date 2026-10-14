@@ -41,8 +41,12 @@
 //!   signal that was merely *sent* looks like a fault, so a host that swallows
 //!   one by resetting the default action leaves a marker too (same cleanup).
 //! * **Windows** — reporting happens in the unhandled-exception filter, which
-//!   runs only after every vectored/structured handler declined, so a fault a
-//!   host recovers from never reaches it, whichever was installed first. The CRT
+//!   runs only after every structured handler declined, so a fault a host
+//!   recovers from there never reaches it. Known limit of `crash-handler` 0.8:
+//!   after the first event it handles, it removes its vectored handler and
+//!   `SIGABRT` hook for good (heap corruption and CRT abort are then no longer
+//!   seen), and a host's invalid-parameter handler is followed by
+//!   `exit(0)`. The CRT
 //!   `abort()`, invalid-parameter, purecall and heap-corruption paths are hooked
 //!   too. Rust's own `abort()` (and so an aborting panic) and any other
 //!   fast-fail (`int 0x29`) end the process without reaching any in-process
@@ -713,18 +717,18 @@ mod imp {
             0x4000_0015 => SIGABRT, // FATAL_APP_EXIT
             0xC000_000D => SIGABRT, // INVALID_PARAMETER
             0xC000_0025 => SIGABRT, // NONCONTINUABLE_EXCEPTION (purecall)
-            // The fast-fail family. A real `__fastfail` (`int 0x29`) never reaches a
-            // handler, but the same codes DO arrive when something raises them as
-            // an ordinary exception: the CRT's `/GS` failure reporter calling the
-            // unhandled-exception filter directly, `RaiseFailFastException` with a
-            // debugger or WER consuming it, or an assertion status. They mean "the
-            // program gave up" exactly as the codes above do.
+            // The fast-fail family. A real `__fastfail` (`int 0x29`) and
+            // `RaiseFailFastException` never reach an in-process handler, but the
+            // same codes DO arrive when raised as ordinary exceptions: 0xC0000420
+            // from `__int2c`/`NT_ASSERT`, and third-party `RaiseException` calls
+            // using these codes. They mean "the program gave up" like the above.
             0xC000_0409 => SIGABRT, // STACK_BUFFER_OVERRUN (fast-fail / `/GS`)
             0xC000_0602 => SIGABRT, // FAIL_FAST_EXCEPTION
             0xC000_0420 => SIGABRT, // ASSERTION_FAILURE
             0xC000_0006 => SIGBUS,  // IN_PAGE_ERROR (a failed mapped-file read)
             0xC000_0090 | 0xC000_0091 | 0xC000_0093 => SIGFPE, // FLT_INVALID_OPERATION/OVERFLOW/UNDERFLOW
             0xC000_008F | 0xC000_0092 => SIGFPE, // FLT_INEXACT_RESULT / FLT_STACK_CHECK
+            0xC000_02B4 | 0xC000_02B5 => SIGFPE, // FLT_MULTIPLE_FAULTS / FLT_MULTIPLE_TRAPS
             _ => 0,
         }
     }

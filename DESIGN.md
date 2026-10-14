@@ -264,18 +264,24 @@ That last case previously produced **no report whatsoever** — the SDK shut dow
 |---|---|---|
 | Access violation, illegal/privileged instruction, divide/overflow, alignment, in-page error, breakpoint | yes (unhandled-exception filter) | native crash with frames (`SIGSEGV`/`SIGILL`/`SIGFPE`/`SIGBUS`/`SIGTRAP`) |
 | Stack overflow (main or other thread) | yes (handler runs on the guard-page remainder; header written first) | native crash, `SIGSEGV` |
-| Heap corruption (`0xC0000374`) | yes (vectored handler) | native crash, `SIGABRT` |
+| Heap corruption when raised as an exception (`0xC0000374`); some segment-heap checks fast-fail with `0xC0000409` instead and are invisible | yes for the exception form (vectored handler) | native crash, `SIGABRT` |
 | CRT `abort()` / C++ `std::terminate` / failed C `assert` | yes (CRT `SIGABRT` hook) | native crash, `SIGABRT` (correlated with the panic snapshot if one is fresh) |
 | CRT invalid-parameter, pure virtual call | yes (CRT handlers) | native crash, `SIGABRT` |
-| Exception with a fast-fail code (`0xC0000409`, `0xC0000602`, `0xC0000420`) raised as an ordinary exception (e.g. old `/GS` reporter via the filter) | yes, if it reaches the filter | native crash, `SIGABRT` |
-| Rust `std::process::abort()` and `panic = "abort"` (`int 0x29`, exit status `0xC0000409`) | **no** | with a panic snapshot (`panic = "abort"`): the panic report. Without one (bare `abort()`): abnormal exit |
+| Fast-fail-family code raised as an ordinary exception (`0xC0000420` from `__int2c`/`NT_ASSERT`; third-party `RaiseException` with `0xC0000409`/`0xC0000602`) | yes (dispatched normally) | native crash, `SIGABRT` |
+| Rust `std::process::abort()`, `panic = "abort"` and allocation failure (`handle_alloc_error` ends in `abort()`; no panic snapshot) (`int 0x29`, exit status `0xC0000409`) | **no** | with a panic snapshot (`panic = "abort"`): the panic report. Without one (bare `abort()`): abnormal exit |
 | Native `__fastfail` / `/GS` stack-cookie failure / `RaiseFailFastException` with no debugger (bypass all handlers) | **no** | abnormal exit |
-| `TerminateProcess` / task-manager kill / job-object kill / OOM kill / power loss | **no** | abnormal exit |
-| Handler wedged or faulting | watchdog thread ends the process (exit `0x42554753`) | header-only or no marker; abnormal exit |
+| `TerminateProcess` / task-manager kill / job-object kill / power loss (Windows has no OOM killer; commit exhaustion surfaces as allocation failure, above) | **no** | abnormal exit |
+| Handler wedged or faulting | watchdog thread ends the process (exit `0x42554753`) | marker with header only: native crash without frames; no marker at all: abnormal exit |
 | A DLL with its own *static* CRT calling its `abort()` | no (each CRT has its own `SIGABRT` table) | abnormal exit |
 | Host replaces the unhandled-exception filter after install | no for faults that reach the filter | abnormal exit |
+| *Known limitation* - host installs a CRT invalid-parameter handler (e.g. a no-op) | our callback runs first, then `crash-handler` calls the host's handler and `std::process::exit(0)` | a false native crash report plus a silent exit for hosts that meant to ignore the error |
+| *Known limitation* - after the first event `crash-handler` handles | `AutoHandler::new` calls `restore_previous_handlers()`, removing the vectored handler and resetting `SIGABRT` for good; only the filter/CRT handlers are re-set | later heap-corruption and CRT-abort events are not seen (abnormal exit) |
 
 Tests: `crates/bugsee-native/tests/crash_windows.rs` pins the stack-overflow, CRT-abort, Rust-abort (no marker, status `0xC0000409`) and wedged-handler rows; the exception-code mapping is unit-tested on every platform. Rows marked "no" cannot be closed in-process: they need the **out-of-process monitor** (issue #17), which observes the death from outside. Until then the abnormal-exit report is the floor, and an aborting panic stays attributable through the panic snapshot written before `abort()`.
+
+**WER runtime exception helper (spike).** `WerRegisterRuntimeExceptionModule` registers a DLL that Windows Error Reporting loads into `WerFault.exe` when the process crashes, including fast-fail and `/GS` deaths that no in-process handler sees (the approach Crashpad and sentry-native use, with no standing monitor process). Floor: the API exists from Windows 7 / Server 2008 R2 (`WerRegisterRuntimeExceptionModule` in kernel32), but fast-fail delivery to the helper is dependable on Windows 8+, and it needs WER enabled and not disabled by policy or `SetErrorMode`. Costs: a second shipped artifact (a standalone DLL, the same architecture as the app, with its own path, not the Rust crate itself), a DLL that must run in a hostile context (it executes inside `WerFault.exe`, cannot rely on the Rust runtime, must be allocation- and loader-lock-careful, and reads the dead process through the supplied handle), and a path registered per process at startup. Relation to #17: it observes the death from outside like the monitor does, but is cheaper to run (no resident process) and narrower (it only runs when WER does, and not for `TerminateProcess`/kill). It is the lower-cost first step toward #17 for the fast-fail rows; not implemented here.
+
+**Abnormal-exit report (deferred).** The in-process fallback already reports a panic snapshot when one exists. Enriching the bare abnormal-exit report with more last-known context is left for a follow-up: recovery's `build_abnormal_exit` currently receives nothing beyond the timestamp, and widening it overlaps the runtime/storage work in flight (#9).
 
 **Edge cases:** double-panic in `Drop`; foreign C++/ObjC exceptions (shim, never `catch_unwind`); stack overflow (alt-stack); OOM/OS-kill (inferred); disk-full (drop + internal log); multi-process sharing the data dir (per-pid `gen` subdirs + dir lock).
 
