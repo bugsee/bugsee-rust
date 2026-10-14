@@ -83,14 +83,14 @@ mod imp {
 
     /// Keeps the in-process crash handler installed for its lifetime.
     #[cfg(windows)]
-    pub struct InProcessGuard {
+    pub(crate) struct InProcessGuard {
         _handler: CrashHandler,
     }
 
     /// Keeps the in-process crash handler installed for its lifetime (dropping it
     /// puts the previously installed handlers back).
     #[cfg(unix)]
-    pub struct InProcessGuard {
+    pub(crate) struct InProcessGuard {
         _private: (),
     }
 
