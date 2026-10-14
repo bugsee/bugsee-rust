@@ -289,6 +289,9 @@ struct Shared {
     /// over (it is armed and the pass has not finished).
     launch_armed: AtomicBool,
     launch_done: AtomicBool,
+    /// Set when the launch pass left a session for the worker (queue cap), so a
+    /// worker that already did its one pass runs another.
+    launch_deferred: AtomicBool,
     launch_wait_ms: AtomicU64,
 }
 
@@ -422,6 +425,7 @@ impl Recorder {
             launch_attempted: ForkLock::new(BTreeSet::new()),
             launch_armed: AtomicBool::new(false),
             launch_done: AtomicBool::new(false),
+            launch_deferred: AtomicBool::new(false),
             launch_wait_ms: AtomicU64::new(0),
         });
 
@@ -1084,6 +1088,7 @@ fn spawn_pipeline(
                 caps,
                 sampler,
                 worker_upload_tx,
+                generation,
             );
         })?;
 
@@ -1254,6 +1259,7 @@ fn recover_one(
                 // Not a failed attempt: a supervisor crash loop would otherwise
                 // burn the session's attempts on queue refusals and abandon it.
                 recovery::undo_attempt(data_dir, pending);
+                shared.launch_deferred.store(true, Ordering::SeqCst);
                 return;
             }
         }
@@ -1326,6 +1332,7 @@ fn worker_loop(
     caps: WindowCaps,
     mut sampler: Option<Box<dyn TelemetrySampler>>,
     upload_tx: Sender<UploadMsg>,
+    generation: u64,
 ) {
     // Rotation/eviction/telemetry must run on a wall-clock cadence, NOT only when
     // `recv_timeout` times out. Under sustained capture traffic every `recv`
@@ -1420,6 +1427,18 @@ fn worker_loop(
         if Instant::now() >= next_rotate {
             rotate_tick(store.as_mut(), &shared, &mut sampler);
             next_rotate = Instant::now() + rotate_interval;
+        }
+        // The launch-path pass left a session for us (queue cap) after our one
+        // pass had already run, because it outlived the wait: take it now.
+        if shared.launch_done.load(Ordering::SeqCst)
+            && shared.launch_deferred.swap(false, Ordering::SeqCst)
+        {
+            if let Some(dir) = &data_dir {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_recovery(&shared, dir, generation, marker.as_deref(), true);
+                }));
+                let _ = upload_tx.send(UploadMsg::Wake);
+            }
         }
         // Independent of the rotation interval (which a host may set large).
         if Instant::now() >= next_heartbeat {
