@@ -315,19 +315,37 @@ fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
         let at = from + p;
         let (before, rest) = (&n[..at], &n[at + stem.len()..]);
         let excluded = match stem {
-            b"auth" => rest.starts_with(b"or") && !rest.starts_with(b"oriz"),
-            b"token" => [
-                &b"iz"[..],
-                b"type",
-                b"count",
-                b"len",
-                b"limit",
-                b"usage",
-                b"used",
-                b"budget",
-            ]
-            .iter()
-            .any(|x| rest.starts_with(x)),
+            // `author`/`authority` (but not `authorization`), and
+            // `www-authenticate`/`authentication`.
+            b"auth" => {
+                (rest.starts_with(b"or") && !rest.starts_with(b"oriz"))
+                    || rest.starts_with(b"enticat")
+            }
+            // `tokenizer`, `token_type`/`_count`/`_ttl`/`_endpoint`/`_url`, and
+            // `cancellation_token` (a cooperative-cancel handle, not a secret).
+            b"token" => {
+                [
+                    &b"iz"[..],
+                    b"type",
+                    b"count",
+                    b"len",
+                    b"limit",
+                    b"usage",
+                    b"used",
+                    b"budget",
+                    b"endpoint",
+                    b"url",
+                    b"uri",
+                    b"expir",
+                    b"ttl",
+                    b"scope",
+                    b"kind",
+                ]
+                .iter()
+                .any(|x| rest.starts_with(x))
+                    || before.ends_with(b"cancellation")
+                    || before.ends_with(b"cancel")
+            }
             b"secret" => rest.starts_with(b"ary"),
             b"session" => [
                 &b"start"[..],
@@ -1185,9 +1203,16 @@ impl Scrubber {
                 if !(sep == b'=' || quoted_key) || !secretish {
                     continue;
                 }
-            } else if class == KeyClass::Strong && sep == b':' && !quoted_key && quote.is_none() {
-                // Prose, not a credential: "invalid token: expected ident",
-                // "password: must be at least 8". A bare `token: abc123` still is.
+            } else if class == KeyClass::Strong
+                && sep == b':'
+                && !quoted_key
+                && quote.is_none()
+                && with_normalized(&s[j..key_end], |n| n == b"token")
+            {
+                // Compiler-error wording, not a credential: "invalid token:
+                // expected ident". ONLY the bare word `token` gets this leniency:
+                // `password: secret` / `invalid password: letmein` are redacted
+                // however plain the value looks. A real `token: abc123` still is.
                 let loose = ve - vs >= 6 && !head.iter().all(u8::is_ascii_lowercase);
                 if !loose {
                     continue;
@@ -1962,13 +1987,22 @@ mod tests {
         for t in [
             "invalid token: expected ident",
             "unexpected token: `}`",
-            "password: must be at least 8 characters",
             "INFO my_app::token: refreshed",
-            "secret: required",
+            "token: expected one of `,` or `)`",
         ] {
             assert_eq!(s(t), t, "{t}");
         }
         assert_eq!(s("password: hunter2"), "password: [redacted]");
+        // Only bare `token` gets the prose leniency.
+        assert_eq!(s("password: secret"), "password: [redacted]");
+        assert_eq!(
+            s("invalid password: letmein"),
+            "invalid password: [redacted]"
+        );
+        assert_eq!(s("passwd: letmein"), "passwd: [redacted]");
+        assert_eq!(s("secret: required"), "secret: [redacted]");
+        assert_eq!(s("api_key: abcdefgh"), "api_key: [redacted]");
+        assert_eq!(s("access_token: abcdefgh"), "access_token: [redacted]");
         assert_eq!(s("token: abc123def456"), "token: [redacted]");
         assert_eq!(
             s(r#"{"password": "short"}"#),
@@ -2009,6 +2043,19 @@ mod tests {
             "session_timeout",
             "keyboard",
             "monkey",
+            "cancellation_token",
+            "CancellationToken",
+            "www-authenticate",
+            "WWW-Authenticate",
+            "token_endpoint",
+            "token_url",
+            "token_uri",
+            "token_expiry",
+            "token_expires_at",
+            "token_ttl",
+            "refresh_token_count",
+            "max_token_count",
+            "cancel_token",
         ] {
             assert!(!is_sensitive_key(k), "{k}");
         }

@@ -1412,18 +1412,23 @@ fn process_report(
         return Ok(());
     }
 
-    // Suppress reports the server blacklisted (12004 TooManySimilar), from the
-    // in-memory set (the only one with no usable disk) or the on-disk one.
-    if mem_blacklisted(shared, &meta.signatures)
-        || data_dir.is_some_and(|dir| queue::any_blacklisted(dir, &meta.signatures))
-    {
+    // Suppress reports the server blacklisted (12004 TooManySimilar). Order
+    // matters for a storm: the in-memory set is a lock + hash, so it goes first;
+    // the rate limiter comes next (also lock + hash), so a flood of denied
+    // reports never touches the disk; only the reports the limiter ADMITS pay
+    // for the on-disk `.blacklist` read (which, unlike the in-memory set, also
+    // sees blacklistings written by sibling processes sharing the directory).
+    if mem_blacklisted(shared, &meta.signatures) {
         return Ok(());
     }
-
-    // Rate limit before any disk work (snapshot / ZIP / durable queue).
     let Some(carried) = admit(shared, &mut meta) else {
         return Ok(());
     };
+    if data_dir.is_some_and(|dir| queue::any_blacklisted(dir, &meta.signatures)) {
+        // Dropped after all: hand the suppressed-count summary back.
+        shared.limiter.restore_suppressed(carried);
+        return Ok(());
+    }
 
     let window_start = window_end.saturating_sub(caps.max_window_ms);
     let window = TimeWindow {

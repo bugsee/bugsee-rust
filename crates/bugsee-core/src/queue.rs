@@ -186,7 +186,17 @@ fn blacklist_path(data_dir: &Path) -> PathBuf {
     queue_dir(data_dir).join(".blacklist")
 }
 
+static BLACKLIST_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the on-disk blacklist has been read since process start.
+/// Exists so tests can prove a rate-limited storm performs no disk reads.
+#[doc(hidden)]
+pub fn blacklist_read_count() -> usize {
+    BLACKLIST_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
+    BLACKLIST_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::fs::read_to_string(blacklist_path(data_dir))
         .map(|s| {
             s.lines()

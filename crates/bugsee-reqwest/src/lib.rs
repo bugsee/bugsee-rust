@@ -408,6 +408,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn benign_token_like_names_are_not_redacted() {
+        let url = reqwest::Url::parse(
+            "https://api.example.com/v1?token_endpoint=a&cancellation_token=b&token_ttl=9&token=zzz",
+        )
+        .unwrap();
+        let s = sanitize_url(&url);
+        assert!(
+            s.contains("token_endpoint=a") && s.contains("cancellation_token=b"),
+            "{s}"
+        );
+        assert!(s.contains("token_ttl=9") && !s.contains("zzz"), "{s}");
+        assert!(!is_sensitive_header("WWW-Authenticate"));
+        assert!(!is_sensitive_header("token_url"));
+        assert!(is_sensitive_header("Authorization"));
+    }
+
+    #[test]
     fn redacts_sensitive_query_params() {
         let url = reqwest::Url::parse("https://api.example.com/v1?token=secret&page=2").unwrap();
         let sanitized = sanitize_url(&url);
