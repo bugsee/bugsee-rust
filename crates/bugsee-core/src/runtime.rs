@@ -61,6 +61,30 @@ const DEFAULT_MAX_QUEUED: usize = 8192;
 /// NON-crash reports are dropped-newest; crash reports are never dropped.
 const DEFAULT_MAX_REPORT_QUEUED: usize = 256;
 
+/// Where a recorder keeps its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMode {
+    /// The data directory is usable: capture parts, the liveness marker and the
+    /// retry queue are on disk, so a crash can be recovered on the next launch.
+    Disk,
+    /// No usable data directory (read-only, missing, full, ...). Handled errors
+    /// and manual reports are still delivered, from memory, but there is no
+    /// capture window and nothing survives the process: fatal crashes cannot be
+    /// recovered and an unsent report is lost on exit.
+    Memory,
+}
+
+/// Most reports held in memory awaiting delivery. Reports are rare and a bundle
+/// is small, so this only bounds a pathological storm while offline.
+const MAX_MEMORY_REPORTS: usize = 16;
+
+/// A report waiting in memory for delivery, because it could not be queued on disk.
+struct MemReport {
+    report: AssembledReport,
+    retry: u32,
+    next_attempt_ms: i64,
+}
+
 /// A callback run on every report before delivery. Mutate the metadata in place;
 /// return `false` to drop the report entirely.
 pub type BeforeSend = Box<dyn Fn(&mut ReportMeta) -> bool + Send + Sync>;
@@ -83,6 +107,10 @@ pub enum DropReason {
     TooManySimilar,
     /// Delivery kept failing transiently until the durable retry cap.
     RetriesExhausted,
+    /// The report could not be stored on disk and the in-memory backlog was
+    /// full, so it was dropped rather than queued. Only seen with an unusable
+    /// data directory.
+    StorageUnavailable,
 }
 
 /// Called when a report is abandoned. See [`DropReason`].
@@ -136,6 +164,9 @@ pub struct RecorderConfig {
     pub sample_rate: f64,
     /// Max in-flight capture entries before new ones are dropped (back-pressure).
     pub max_queued_entries: usize,
+    /// Skip the disk entirely and run in [`StorageMode::Memory`]. For a host
+    /// layer that already established no data directory is usable.
+    pub memory_only: bool,
 }
 
 impl RecorderConfig {
@@ -156,6 +187,7 @@ impl RecorderConfig {
             before_breadcrumb: None,
             sample_rate: 1.0,
             max_queued_entries: DEFAULT_MAX_QUEUED,
+            memory_only: false,
         }
     }
 }
@@ -199,6 +231,8 @@ struct Shared {
     max_report_queued: usize,
     /// Whether telemetry sampling is paused (mirrors the facade's pause state).
     paused: AtomicBool,
+    /// Reports that could not be queued on disk, delivered from memory.
+    mem_queue: ForkLock<Vec<MemReport>>,
 }
 
 /// The recorder's own locks join the `fork()` lock protocol, so a forked child
@@ -208,8 +242,10 @@ impl ForkLockable for Shared {
     fn fork_lock(&self) {
         self.scope.fork_lock();
         self.session.fork_lock();
+        self.mem_queue.fork_lock();
     }
     fn fork_unlock(&self) {
+        self.mem_queue.fork_unlock();
         self.session.fork_unlock();
         self.scope.fork_unlock();
     }
@@ -253,7 +289,10 @@ pub struct Recorder {
     shared: Arc<Shared>,
     caps: WindowCaps,
     data_dir: PathBuf,
-    session: Session,
+    /// `None` in memory mode: there is no liveness marker to own.
+    session: Option<Session>,
+    storage: StorageMode,
+    storage_reason: Option<String>,
     rotate_interval: Duration,
     backoff_base: Duration,
     worker: Option<JoinHandle<()>>,
@@ -294,17 +333,40 @@ impl Recorder {
             report_queued: AtomicUsize::new(0),
             max_report_queued: DEFAULT_MAX_REPORT_QUEUED,
             paused: AtomicBool::new(false),
+            mem_queue: ForkLock::new(Vec::new()),
         });
 
         crate::fork::install_fork_hook();
         crate::fork::register_weak(&shared);
 
-        let session = Session::begin(&config.data_dir)?;
         let data_dir = config.data_dir.clone();
+        // An unusable data directory degrades to memory mode instead of failing
+        // the launch: the host must not lose error reporting (or its startup)
+        // because a volume is read-only or full.
+        let (disk, storage_reason) = if config.memory_only {
+            (None, Some("no usable data directory".to_string()))
+        } else {
+            match open_disk(&data_dir, config.caps) {
+                Ok(disk) => (Some(disk), None),
+                Err(e) => (None, Some(format!("{}: {e}", data_dir.display()))),
+            }
+        };
+        if let Some(reason) = &storage_reason {
+            crate::util::warn_once(&format!(
+                "data directory unusable ({reason}); running in memory only: handled errors \
+                 and manual reports are still sent, but crashes cannot be recovered and \
+                 nothing survives this process"
+            ));
+        }
+        let (session, store) = match disk {
+            Some((session, store)) => (Some(session), Some(store)),
+            None => (None, None),
+        };
         let pipeline = spawn_pipeline(
             &shared,
-            &data_dir,
-            session.generation(),
+            store.is_some().then_some(data_dir.as_path()),
+            session.as_ref().map_or(0, Session::generation),
+            store,
             config.caps,
             config.rotate_interval,
             config.upload_backoff_base,
@@ -318,6 +380,12 @@ impl Recorder {
             shared,
             caps: config.caps,
             data_dir,
+            storage: if session.is_some() {
+                StorageMode::Disk
+            } else {
+                StorageMode::Memory
+            },
+            storage_reason,
             session,
             rotate_interval: config.rotate_interval,
             backoff_base: config.upload_backoff_base,
@@ -359,11 +427,19 @@ impl Recorder {
         self.shared.queued.store(0, Ordering::SeqCst);
         self.shared.report_queued.store(0, Ordering::SeqCst);
 
-        let session = Session::begin(&self.data_dir)?;
+        let disk = match self.storage {
+            StorageMode::Disk => Some(open_disk(&self.data_dir, self.caps)?),
+            StorageMode::Memory => None,
+        };
+        let (session, store) = match disk {
+            Some((session, store)) => (Some(session), Some(store)),
+            None => (None, None),
+        };
         let pipeline = spawn_pipeline(
             &self.shared,
-            &self.data_dir,
-            session.generation(),
+            store.is_some().then_some(self.data_dir.as_path()),
+            session.as_ref().map_or(0, Session::generation),
+            store,
             self.caps,
             self.rotate_interval,
             self.backoff_base,
@@ -462,6 +538,18 @@ impl Recorder {
         &self.data_dir
     }
 
+    /// Where this recorder keeps its state. In [`StorageMode::Memory`] crash
+    /// capture is pointless (nothing could be recovered), so the host layer
+    /// should not install the native handler.
+    pub fn storage_mode(&self) -> StorageMode {
+        self.storage
+    }
+
+    /// Why the recorder fell back to [`StorageMode::Memory`], if it did.
+    pub fn storage_reason(&self) -> Option<&str> {
+        self.storage_reason.as_deref()
+    }
+
     /// Path where the native crash handler should write its crash-info marker.
     pub fn crash_info_path(&self) -> PathBuf {
         self.gen_dir().join(crate::recovery::CRASH_INFO_NAME)
@@ -473,9 +561,12 @@ impl Recorder {
     }
 
     fn gen_dir(&self) -> PathBuf {
-        self.data_dir
-            .join("parts")
-            .join(self.session.generation().to_string())
+        self.data_dir.join("parts").join(
+            self.session
+                .as_ref()
+                .map_or(0, Session::generation)
+                .to_string(),
+        )
     }
 
     /// Configured window caps.
@@ -525,7 +616,9 @@ impl Drop for Recorder {
         // unwinding, and its snapshot is deleted by `report_caught`, so this
         // cannot turn a handled panic into a phantom crash.
         if worker_acked && uploader_acked && !std::thread::panicking() {
-            self.session.end();
+            if let Some(session) = &self.session {
+                session.end();
+            }
         }
     }
 }
@@ -660,9 +753,19 @@ fn report_into(
     }
 }
 
-/// Recover any prior generation that ended abnormally, queueing it for delivery.
-/// The crashed session's state is discarded ONLY after the report is durably
-/// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
+/// Claim a session and open its part store, or fail without leaving a liveness
+/// marker behind (a marker with no store would be recovered as a phantom crash).
+fn open_disk(data_dir: &Path, caps: WindowCaps) -> std::io::Result<(Session, PartStore)> {
+    let session = Session::begin(data_dir)?;
+    match PartStore::new(data_dir, session.generation(), caps) {
+        Ok(store) => Ok((session, store)),
+        Err(e) => {
+            session.end();
+            Err(e)
+        }
+    }
+}
+
 /// Start the uploader and the capture worker for `generation`.
 ///
 /// `fresh_launch` is true for a process's first pipeline and false for one
@@ -671,8 +774,9 @@ fn report_into(
 #[allow(clippy::too_many_arguments)]
 fn spawn_pipeline(
     shared: &Arc<Shared>,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     generation: u64,
+    store: Option<PartStore>,
     caps: WindowCaps,
     rotate_interval: Duration,
     backoff_base: Duration,
@@ -682,7 +786,7 @@ fn spawn_pipeline(
     // Uploader thread: drains the durable queue with retry.
     let (upload_tx, upload_rx) = channel();
     let uploader_shared = Arc::clone(shared);
-    let uploader_data_dir = data_dir.to_path_buf();
+    let uploader_data_dir = data_dir.map(Path::to_path_buf);
     let uploader = std::thread::Builder::new()
         .name("bugsee-uploader".into())
         .spawn(move || {
@@ -697,9 +801,8 @@ fn spawn_pipeline(
 
     // Capture worker: owns the part store; enqueues reports.
     let (tx, rx) = channel();
-    let store = PartStore::new(data_dir, generation, caps)?;
     let worker_shared = Arc::clone(shared);
-    let worker_data_dir = data_dir.to_path_buf();
+    let worker_data_dir = data_dir.map(Path::to_path_buf);
     let worker_upload_tx = upload_tx.clone();
 
     let worker = std::thread::Builder::new()
@@ -713,15 +816,17 @@ fn spawn_pipeline(
                 // first (runs before this session enqueues anything). Only a fresh
                 // launch: a fork child's parent may be mid-enqueue right now, and
                 // its in-flight sidecars would look orphaned.
-                if fresh_launch {
-                    queue::gc_orphans(&worker_data_dir);
+                if let (true, Some(dir)) = (fresh_launch, &worker_data_dir) {
+                    queue::gc_orphans(dir);
                 }
                 // A fork child recovers too. A prefork master recovers only at ITS
                 // launch, and its own generation is the lowest, so it can never
                 // recover a worker that died later; the next worker started from
                 // it must, or that crash waits for the master to restart. Claims
                 // keep siblings from recovering the same session twice.
-                run_recovery(&worker_shared, &worker_data_dir, generation);
+                if let Some(dir) = &worker_data_dir {
+                    run_recovery(&worker_shared, dir, generation);
+                }
             }));
             let _ = worker_upload_tx.send(UploadMsg::Wake);
             worker_loop(
@@ -744,6 +849,9 @@ fn spawn_pipeline(
     })
 }
 
+/// Recover any prior generation that ended abnormally, queueing it for delivery.
+/// The crashed session's state is discarded ONLY after the report is durably
+/// enqueued — a failure leaves it on disk for a later attempt (no crash loss).
 fn run_recovery(shared: &Shared, data_dir: &Path, current_generation: u64) {
     for pending in recovery::find_pending(data_dir, current_generation) {
         // Several processes share this directory (a prefork master and its
@@ -827,10 +935,10 @@ fn merge_scope(shared: &Shared, meta: &mut ReportMeta) {
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     rx: Receiver<Msg>,
-    mut store: PartStore,
+    mut store: Option<PartStore>,
     shared: Arc<Shared>,
     rotate_interval: Duration,
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     caps: WindowCaps,
     mut sampler: Option<Box<dyn TelemetrySampler>>,
     upload_tx: Sender<UploadMsg>,
@@ -850,6 +958,8 @@ fn worker_loop(
                 shared.queued.fetch_sub(1, Ordering::Relaxed);
                 // A panic while serializing/appending must not kill the worker.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Memory mode has no capture window: the entry is dropped.
+                    let Some(store) = store.as_mut() else { return };
                     if let Ok(value) = entry.to_json() {
                         if let Ok(bytes) = serde_json::to_vec(&value) {
                             let _ = store.append(entry.wire_type(), entry.timestamp(), &bytes);
@@ -865,7 +975,13 @@ fn worker_loop(
                 shared.report_queued.fetch_sub(1, Ordering::Relaxed);
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     process_report(
-                        &mut store, &shared, &data_dir, caps, meta, window_end, crash_json,
+                        store.as_mut(),
+                        &shared,
+                        data_dir.as_deref(),
+                        caps,
+                        meta,
+                        window_end,
+                        crash_json,
                     )
                     .is_ok()
                 }))
@@ -876,7 +992,7 @@ fn worker_loop(
             }
             Ok(Msg::Snapshot { window_end, ack }) => {
                 let handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    take_snapshot(&mut store, &data_dir, caps, window_end)
+                    take_snapshot(store.as_mut()?, data_dir.as_deref()?, caps, window_end)
                 }))
                 .ok()
                 .flatten();
@@ -884,7 +1000,7 @@ fn worker_loop(
             }
             Ok(Msg::UploadSnapshot { handle, meta }) => {
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    deliver_snapshot(&shared, &data_dir, handle, meta)
+                    deliver_snapshot(&shared, data_dir.as_deref(), handle, meta)
                 }))
                 .unwrap_or(false);
                 if ok {
@@ -892,11 +1008,15 @@ fn worker_loop(
                 }
             }
             Ok(Msg::Flush(ack)) => {
-                let _ = store.flush();
+                if let Some(store) = store.as_mut() {
+                    let _ = store.flush();
+                }
                 let _ = ack.send(());
             }
             Ok(Msg::Stop(ack)) => {
-                let _ = store.flush();
+                if let Some(store) = store.as_mut() {
+                    let _ = store.flush();
+                }
                 let _ = ack.send(());
                 break;
             }
@@ -906,7 +1026,7 @@ fn worker_loop(
         // Run the rotation/eviction/telemetry tick whenever the interval has
         // elapsed — via a message OR a timeout — so steady traffic can't starve it.
         if Instant::now() >= next_rotate {
-            rotate_tick(&mut store, &shared, &mut sampler);
+            rotate_tick(store.as_mut(), &shared, &mut sampler);
             next_rotate = Instant::now() + rotate_interval;
         }
     }
@@ -916,7 +1036,7 @@ fn worker_loop(
 /// window. Panic-contained so a host `TelemetrySampler` panic can't kill the
 /// worker.
 fn rotate_tick(
-    store: &mut PartStore,
+    mut store: Option<&mut PartStore>,
     shared: &Shared,
     sampler: &mut Option<Box<dyn TelemetrySampler>>,
 ) {
@@ -934,13 +1054,15 @@ fn rotate_tick(
                         value,
                         custom: Default::default(),
                     };
-                    if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    if let (Some(store), Ok(bytes)) = (store.as_mut(), serde_json::to_vec(&entry)) {
                         let _ = store.append("traces.system", ts, &bytes);
                     }
                 }
             }
         }
-        let _ = store.rotate();
+        if let Some(store) = store.as_mut() {
+            let _ = store.rotate();
+        }
     }));
 }
 
@@ -971,7 +1093,7 @@ fn take_snapshot(
 /// Assemble + enqueue a report from a pre-taken snapshot (deferred upload path).
 fn deliver_snapshot(
     shared: &Shared,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     handle: SnapshotHandle,
     mut meta: ReportMeta,
 ) -> bool {
@@ -982,7 +1104,7 @@ fn deliver_snapshot(
         }
     }
     // The snapshot dir is reclaimed by `handle`'s Drop on return (any path).
-    reporting::assemble(
+    let assembled = reporting::assemble(
         &handle.dir,
         handle.window,
         &meta,
@@ -991,14 +1113,73 @@ fn deliver_snapshot(
         &shared.app_token,
         handle.window.end,
     )
-    .and_then(|assembled| queue::enqueue(data_dir, &assembled))
-    .is_ok()
+    // The snapshot became unreadable (disk gone): still send what we know.
+    .or_else(|_| assemble_in_memory(shared, &meta, handle.window, None));
+    match assembled {
+        Ok(assembled) => persist_or_hold(shared, data_dir, assembled),
+        Err(_) => false,
+    }
+}
+
+/// Queue `assembled` on disk, or hold it in memory if the disk refuses it
+/// (read-only, full, directory removed) or there is no disk. Always `true`: the
+/// report is held either way.
+fn persist_or_hold(shared: &Shared, data_dir: Option<&Path>, assembled: AssembledReport) -> bool {
+    if let Some(dir) = data_dir {
+        if queue::enqueue(dir, &assembled).is_ok() {
+            return true;
+        }
+        // A failed enqueue can leave a partial sidecar set; the next launch's
+        // orphan sweep reaps it. Do not retry the disk for this report.
+    }
+    hold_in_memory(shared, assembled);
+    true
+}
+
+/// Assemble a bundle with no capture context and no file system access.
+fn assemble_in_memory(
+    shared: &Shared,
+    meta: &ReportMeta,
+    window: TimeWindow,
+    crash_json: Option<Vec<u8>>,
+) -> std::io::Result<AssembledReport> {
+    reporting::assemble_docs(
+        Vec::new(),
+        window,
+        meta,
+        &shared.env,
+        crash_json,
+        &[],
+        &shared.app_token,
+        window.end,
+    )
+}
+
+/// Park a report in the bounded in-memory queue for the uploader. Over the cap
+/// the NEWEST report is dropped (and the host told), keeping the backlog bounded.
+fn hold_in_memory(shared: &Shared, report: AssembledReport) {
+    let full = {
+        let mut queue = shared.mem_queue.lock();
+        if queue.len() >= MAX_MEMORY_REPORTS {
+            true
+        } else {
+            queue.push(MemReport {
+                report,
+                retry: 0,
+                next_attempt_ms: 0,
+            });
+            false
+        }
+    };
+    if full {
+        notify_dropped(shared, DropReason::StorageUnavailable);
+    }
 }
 
 fn process_report(
-    store: &mut PartStore,
+    store: Option<&mut PartStore>,
     shared: &Shared,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     caps: WindowCaps,
     mut meta: ReportMeta,
     window_end: i64,
@@ -1022,49 +1203,80 @@ fn process_report(
     }
 
     // Suppress reports the server blacklisted (12004 TooManySimilar).
-    if queue::any_blacklisted(data_dir, &meta.signatures) {
-        return Ok(());
+    if let Some(dir) = data_dir {
+        if queue::any_blacklisted(dir, &meta.signatures) {
+            return Ok(());
+        }
     }
 
     let window_start = window_end.saturating_sub(caps.max_window_ms);
-    let report_id = crate::util::random_hex(8);
-    let report_dir = data_dir.join("reports").join(&report_id);
-    std::fs::create_dir_all(&report_dir)?;
-
-    // Own the report dir with a `SnapshotHandle` so EVERY exit path reclaims its
-    // hard links via Drop. The earlier manual `remove_dir_all` ran only after a
-    // successful assemble, so a `snapshot_into`/`assemble` failure (most plausibly
-    // disk-full) permanently orphaned a `reports/<id>` dir full of hard-linked
-    // parts, and `reports/` was never GC'd (F7).
     let window = TimeWindow {
         start: window_start,
         end: window_end,
     };
+
+    // With a usable disk, snapshot + assemble from it. Any failure along the way
+    // (most plausibly disk-full or a vanished directory) falls back to a bundle
+    // without capture context, so the report still goes out.
+    let from_disk = match (store, data_dir) {
+        (Some(store), Some(data_dir)) => {
+            assemble_from_disk(store, shared, data_dir, &meta, window, crash_json.clone())
+        }
+        _ => None,
+    };
+    let assembled = match from_disk {
+        Some(assembled) => assembled,
+        None => assemble_in_memory(shared, &meta, window, crash_json)?,
+    };
+
+    // Persist to the durable queue; the uploader delivers it. Failing that, hold
+    // it in memory.
+    persist_or_hold(shared, data_dir, assembled);
+    Ok(())
+}
+
+/// Snapshot the window into a fresh report dir and assemble it, or `None` if the
+/// disk refuses any step.
+fn assemble_from_disk(
+    store: &mut PartStore,
+    shared: &Shared,
+    data_dir: &Path,
+    meta: &ReportMeta,
+    window: TimeWindow,
+    crash_json: Option<Vec<u8>>,
+) -> Option<AssembledReport> {
+    let report_id = crate::util::random_hex(8);
+    let report_dir = data_dir.join("reports").join(&report_id);
+    // Own the report dir with a `SnapshotHandle` BEFORE creating it so EVERY exit
+    // path reclaims its hard links via Drop. The earlier manual `remove_dir_all`
+    // ran only after a successful assemble, so a `snapshot_into`/`assemble`
+    // failure (most plausibly disk-full) permanently orphaned a `reports/<id>` dir
+    // full of hard-linked parts, and `reports/` was never GC'd (F7).
     let handle = SnapshotHandle {
         dir: report_dir,
         window,
     };
+    std::fs::create_dir_all(&handle.dir).ok()?;
 
-    store.snapshot_into(&handle.dir, window_start, window_end)?;
-    let assembled = reporting::assemble(
+    store
+        .snapshot_into(&handle.dir, window.start, window.end)
+        .ok()?;
+    reporting::assemble(
         &handle.dir,
         window,
-        &meta,
+        meta,
         &shared.env,
         crash_json,
         &shared.app_token,
-        window_end,
-    )?;
-
-    // Persist to the durable queue; the uploader delivers it. `handle`'s Drop
-    // reclaims the snapshot dir on return (success or the `?` paths above).
-    queue::enqueue(data_dir, &assembled)
+        window.end,
+    )
+    .ok()
 }
 
 fn uploader_loop(
     rx: Receiver<UploadMsg>,
     shared: Arc<Shared>,
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     backoff_base: Duration,
     fresh_launch: bool,
 ) {
@@ -1075,19 +1287,19 @@ fn uploader_loop(
     // panicking Transport impl can't kill the uploader.
     if fresh_launch {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drain(&shared, &data_dir, backoff_base, true)
+            drain(&shared, data_dir.as_deref(), backoff_base, true)
         }));
     }
     loop {
         match rx.recv_timeout(poll) {
             Ok(UploadMsg::Wake) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain(&shared, &data_dir, backoff_base, false)
+                    drain(&shared, data_dir.as_deref(), backoff_base, false)
                 }));
             }
             Ok(UploadMsg::Drain { deadline, ack }) => {
                 let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain_until_empty(&shared, &data_dir, backoff_base, deadline)
+                    drain_until_empty(&shared, data_dir.as_deref(), backoff_base, deadline)
                 }))
                 .unwrap_or(false);
                 let _ = ack.send(empty);
@@ -1098,7 +1310,7 @@ fn uploader_loop(
             }
             Err(RecvTimeoutError::Timeout) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drain(&shared, &data_dir, backoff_base, false)
+                    drain(&shared, data_dir.as_deref(), backoff_base, false)
                 }));
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1109,9 +1321,12 @@ fn uploader_loop(
 /// Attempt delivery of every due queued report once. On the flush path `force`
 /// is set so backing-off reports are retried immediately. Returns whether any
 /// report was attempted (used to pace `drain_until_empty`).
-fn drain(shared: &Shared, data_dir: &Path, backoff_base: Duration, force: bool) -> bool {
+fn drain(shared: &Shared, data_dir: Option<&Path>, backoff_base: Duration, force: bool) -> bool {
     let now = epoch_ms();
-    let mut attempted = false;
+    let mut attempted = drain_memory(shared, backoff_base, force, true);
+    let Some(data_dir) = data_dir else {
+        return attempted;
+    };
     for report in queue::list_pending(data_dir) {
         // Another process sharing the queue may be delivering this one.
         let Some(_claim) = queue::try_claim(&report) else {
@@ -1242,6 +1457,61 @@ fn notify_dropped(shared: &Shared, reason: DropReason) {
     }
 }
 
+/// Attempt delivery of the in-memory backlog. Mirrors [`deliver_queued`]: a
+/// transient failure keeps the report (counting toward the retry cap only on the
+/// backoff-paced path), anything terminal drops it and tells the host. The queue
+/// is taken out for the duration so the lock is never held across the network.
+fn drain_memory(shared: &Shared, backoff_base: Duration, force: bool, count_failure: bool) -> bool {
+    let pending = std::mem::take(&mut *shared.mem_queue.lock());
+    if pending.is_empty() {
+        return false;
+    }
+    let now = epoch_ms();
+    let mut attempted = false;
+    let mut keep = Vec::new();
+    for mut item in pending {
+        if !force && now < item.next_attempt_ms {
+            keep.push(item);
+            continue;
+        }
+        attempted = true;
+        let mut endpoint_out = None;
+        match transport::deliver(
+            &*shared.transport,
+            &shared.app_token,
+            &shared.environment_json,
+            &shared.session,
+            &item.report,
+            None,
+            &mut endpoint_out,
+        ) {
+            Ok(()) => {}
+            Err(TransportError::Transient(_)) | Err(TransportError::SessionExpired) => {
+                if count_failure {
+                    item.retry += 1;
+                    if item.retry >= UPLOAD_RETRY_CAP {
+                        notify_dropped(shared, DropReason::RetriesExhausted);
+                        continue;
+                    }
+                    item.next_attempt_ms = now + backoff_delay(item.retry, backoff_base);
+                }
+                keep.push(item);
+            }
+            Err(TransportError::TooManySimilar { .. }) => {
+                notify_dropped(shared, DropReason::TooManySimilar);
+            }
+            Err(e) => notify_dropped(shared, drop_reason_for(e)),
+        }
+    }
+    if !keep.is_empty() {
+        // Reports held while we were delivering stay behind the retained ones.
+        let mut queue = shared.mem_queue.lock();
+        keep.append(&mut queue);
+        *queue = keep;
+    }
+    attempted
+}
+
 /// Exponential backoff: `base * 2^(retry-1)`, capped at 300 s.
 fn backoff_delay(retry: u32, base: Duration) -> i64 {
     let shift = retry.saturating_sub(1).min(20);
@@ -1260,14 +1530,15 @@ fn backoff_delay(retry: u32, base: Duration) -> i64 {
 /// whether the queue ended up empty.
 fn drain_until_empty(
     shared: &Shared,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     backoff_base: Duration,
     deadline: Duration,
 ) -> bool {
     let start = Instant::now();
     loop {
         let now = epoch_ms();
-        for report in queue::list_pending(data_dir) {
+        drain_memory(shared, backoff_base, true, false);
+        for report in data_dir.map(queue::list_pending).unwrap_or_default() {
             let Some(_claim) = queue::try_claim(&report) else {
                 continue; // a peer is delivering it; the loop below waits it out
             };
@@ -1276,7 +1547,7 @@ fn drain_until_empty(
             };
             deliver_queued(
                 shared,
-                data_dir,
+                data_dir.unwrap_or(Path::new("")),
                 backoff_base,
                 &report,
                 zip,
@@ -1289,7 +1560,8 @@ fn drain_until_empty(
                 break;
             }
         }
-        if queue::list_pending(data_dir).is_empty() {
+        let disk_empty = data_dir.is_none_or(|d| queue::list_pending(d).is_empty());
+        if disk_empty && shared.mem_queue.lock().is_empty() {
             return true;
         }
         if start.elapsed() >= deadline {

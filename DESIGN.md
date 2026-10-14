@@ -181,6 +181,18 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 
 **Durability envelope (be honest):** buffered append survives **process death** (panic, `abort`, signal, `kill -9`) because completed `write()`s live in the kernel page cache independent of the crashing process — this is what the `recovery_e2e` / `kill -9` tests exercise. It does **not** guarantee survival of **power loss / kernel panic**, since nothing is `fsync`'d; a hardening tier (periodic `fsync`, or the originally-envisioned `mmap(MAP_SHARED)` + `msync`) is **future work**, not current behavior.
 
+**Data directory resolution and failure modes (read-only / ephemeral hosts).** The facade picks the first **writable** candidate (create + write-probe, not mere existence), skipping and recording any that fail: (1) `LaunchOptions::data_dir`; (2) `BUGSEE_DATA_DIR`; (3) platform default `bugsee/<token>` under `$XDG_DATA_HOME`/`~/.local/share` (Linux), `~/Library/Application Support` (macOS), `%LOCALAPPDATA%` (Windows), skipped if the base is unset (container with no home); (4) `<temp_dir>/bugsee/<token>`. Launch never fails for storage reasons. Outcomes:
+
+| Failure | Outcome |
+|---|---|
+| Preferred candidate unusable, a later one works | falls through; one stderr line; `StorageStatus::skipped` lists why |
+| No candidate usable, or `Session::begin`/`PartStore::new` fails | **memory mode** (`StorageMode::Memory`): no capture window (entries dropped), no liveness marker, native crash handler and panic snapshot not installed; handled errors and manual reports are assembled without capture context and delivered from a bounded in-memory backlog (16; overflow drops the newest with `DropReason::StorageUnavailable`); an unsent report dies with the process |
+| Directory vanishes / becomes unwritable mid-run | capture appends are best-effort and silently dropped; a report that cannot snapshot or enqueue is rebuilt without context and held in memory, so it still goes out |
+| Disk full / permission denied at enqueue, snapshot, marker | same as above; the `reports/<id>` snapshot dir is reclaimed by `SnapshotHandle::drop` |
+| Crash handler cannot write its marker | the raw `open`/`write` return values are ignored; the process still dies with the original signal (watchdog bounds the handler) |
+
+Crash recovery needs the data directory to **outlive the process**: on a container, mount a volume and point `data_dir`/`BUGSEE_DATA_DIR` at it. The temp fallback is commonly wiped on restart. `Bugsee::storage_status()` reports `mode`, `data_dir`, `source`, `skipped`, `crash_recovery_available()` and `may_be_ephemeral()` (the SDK cannot tell a volume from a scratch disk; the temp fallback is the only case it flags). Tests: `bugsee-core/tests/storage_failures.rs`, `bugsee/tests/storage_fallback.rs`, `options.rs` unit tests. A real ENOSPC (size-capped tmpfs) is not exercised; failures are injected by blocking path components and removing the directory mid-run.
+
 **Generations:** each launch bumps `gen`; next-launch recovery reads the **previous** gen's parts before advancing.
 
 **Snapshot (no seal, no copy):** pin `[start,end]` (`end`=snapshot instant, `start`=`end−window`) + **hard-link current parts including the active one** into the report dir (`PartStore::snapshot_into`, after a `flush`). At export, read linked parts and include only entries with `start ≤ timestamp ≤ end` (monotonic order → early-stop at the tail; the self-terminating `RecordIter` cleanly ignores any torn trailing write on the active part). Bounds become `manifest.time.start/end`. Cost: 2 timestamps + O(#parts) `link` syscalls. Fallback to copy on FAT/exFAT/cross-volume (capability-probed once). Reflink (APFS `clonefile` / Linux `FICLONE`) a noted future tier.

@@ -10,6 +10,17 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Print `message` to stderr the first time it is called in this process and do
+/// nothing after. For conditions the SDK must announce (it otherwise does no
+/// logging) but that would be noise if repeated, such as a degraded data dir.
+pub fn warn_once(message: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("bugsee: {message}");
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch.
 pub fn epoch_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {

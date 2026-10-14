@@ -8,7 +8,8 @@
 //! Typed launch configuration. Mirrors the mobile SDK option surface, adapted
 //! to a builder rather than a string-keyed registry.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,7 +122,12 @@ impl LaunchOptions {
         self
     }
 
-    /// Override the on-disk data directory (defaults to a per-app temp dir).
+    /// Set the on-disk data directory, taking precedence over everything else.
+    ///
+    /// The directory holds the capture window, the liveness marker and the retry
+    /// queue, and crash recovery works only if it OUTLIVES the process: on a
+    /// container, point it at a volume. See [`DataDirSource`] for the full
+    /// resolution order and what happens when it is not writable.
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = Some(dir.into());
         self
@@ -225,14 +231,162 @@ impl LaunchOptions {
         }
     }
 
-    pub(crate) fn resolved_data_dir(&self) -> PathBuf {
-        self.data_dir.clone().unwrap_or_else(|| {
-            let mut dir = std::env::temp_dir();
-            dir.push("bugsee");
-            // Isolate by app token so multiple apps don't collide.
-            dir.push(short_token(&self.app_token));
-            dir
-        })
+    /// Pick the data directory: the first candidate in [`DataDirSource`] order
+    /// that can actually be created and written to.
+    pub(crate) fn resolve_data_dir(&self) -> DataDirResolution {
+        resolve_data_dir(
+            self.data_dir.as_deref(),
+            &self.app_token,
+            &|name| std::env::var_os(name),
+            &std::env::temp_dir(),
+        )
+    }
+}
+
+/// Environment variable naming the data directory when
+/// [`LaunchOptions::data_dir`] is not set.
+pub const DATA_DIR_ENV: &str = "BUGSEE_DATA_DIR";
+
+/// Which step of the resolution order produced the data directory.
+///
+/// Candidates are tried in this order and the first one that is writable wins;
+/// an unusable one is skipped (and recorded in
+/// [`StorageStatus::skipped`](crate::StorageStatus::skipped)), never fatal:
+///
+/// 1. [`Explicit`](DataDirSource::Explicit): [`LaunchOptions::data_dir`].
+/// 2. [`Environment`](DataDirSource::Environment): `BUGSEE_DATA_DIR`.
+/// 3. [`PlatformDefault`](DataDirSource::PlatformDefault): `bugsee/<token>` under
+///    `$XDG_DATA_HOME` (else `~/.local/share`) on Linux, `~/Library/Application
+///    Support` on macOS, `%LOCALAPPDATA%` on Windows. Skipped when the base is
+///    unset, as in a container with no home directory.
+/// 4. [`TempFallback`](DataDirSource::TempFallback): `bugsee/<token>` under the
+///    system temp directory. Often wiped on restart, so crash recovery may not
+///    survive it; [`StorageStatus::may_be_ephemeral`](crate::StorageStatus::may_be_ephemeral)
+///    reports it.
+///
+/// If none is writable the SDK runs
+/// [in memory](bugsee_core::runtime::StorageMode::Memory): handled errors and
+/// manual reports are still sent, but there is no capture window and no crash
+/// recovery. It logs one line to stderr when it degrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDirSource {
+    Explicit,
+    Environment,
+    PlatformDefault,
+    TempFallback,
+    /// No directory is in use (memory mode).
+    None,
+}
+
+/// The outcome of [`resolve_data_dir`].
+pub(crate) struct DataDirResolution {
+    /// The chosen directory, or `None` if no candidate was writable.
+    pub dir: Option<PathBuf>,
+    pub source: DataDirSource,
+    /// Candidates tried and rejected before the winner, with the reason.
+    pub skipped: Vec<String>,
+}
+
+/// Pure resolution core: `env` and `temp` are injected so tests need not touch
+/// the process environment.
+pub(crate) fn resolve_data_dir(
+    explicit: Option<&Path>,
+    app_token: &str,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    temp: &Path,
+) -> DataDirResolution {
+    let mut candidates: Vec<(DataDirSource, PathBuf)> = Vec::new();
+    if let Some(dir) = explicit {
+        candidates.push((DataDirSource::Explicit, dir.to_path_buf()));
+    }
+    if let Some(dir) = env(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
+        candidates.push((DataDirSource::Environment, PathBuf::from(dir)));
+    }
+    // Isolate by app token so multiple apps don't collide.
+    let app = |base: PathBuf| base.join("bugsee").join(short_token(app_token));
+    if let Some(base) = platform_data_base(env) {
+        candidates.push((DataDirSource::PlatformDefault, app(base)));
+    }
+    candidates.push((DataDirSource::TempFallback, app(temp.to_path_buf())));
+
+    let mut skipped = Vec::new();
+    for (source, dir) in candidates {
+        match probe_writable(&dir) {
+            Ok(()) => {
+                return DataDirResolution {
+                    dir: Some(dir),
+                    source,
+                    skipped,
+                }
+            }
+            Err(e) => skipped.push(format!("{}: {e}", dir.display())),
+        }
+    }
+    DataDirResolution {
+        dir: None,
+        source: DataDirSource::None,
+        skipped,
+    }
+}
+
+/// The per-user data base directory for this platform, if its inputs are set.
+fn platform_data_base(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let set = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if cfg!(windows) {
+        set("LOCALAPPDATA")
+    } else if cfg!(target_vendor = "apple") {
+        set("HOME").map(|h| h.join("Library").join("Application Support"))
+    } else {
+        set("XDG_DATA_HOME").or_else(|| set("HOME").map(|h| h.join(".local").join("share")))
+    }
+}
+
+/// Create `dir` and prove a file can be written in it. Checking writability (not
+/// just existence) is what catches a read-only root file system or a volume
+/// mounted read-only.
+fn probe_writable(dir: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".bugsee-probe-{}", std::process::id()));
+    let result = std::fs::File::create(&probe).and_then(|mut f| f.write_all(b"1"));
+    let _ = std::fs::remove_file(&probe);
+    result
+}
+
+/// Where the SDK keeps its state right now; see
+/// [`Bugsee::storage_status`](crate::Bugsee::storage_status).
+///
+/// On ephemeral storage, crash recovery only works if the directory outlives
+/// the process (a volume mount). The SDK cannot tell a volume from a scratch
+/// disk, so check [`may_be_ephemeral`](StorageStatus::may_be_ephemeral) and
+/// your own deployment.
+#[derive(Debug, Clone)]
+pub struct StorageStatus {
+    /// `Disk` when the data directory is usable; `Memory` when it is not.
+    pub mode: bugsee_core::runtime::StorageMode,
+    /// The directory in use; `None` in memory mode.
+    pub data_dir: Option<PathBuf>,
+    /// Which resolution step produced `data_dir`.
+    pub source: DataDirSource,
+    /// Candidates rejected before the one in use, with the error for each.
+    pub skipped: Vec<String>,
+    /// Why the SDK is in memory mode, if it is.
+    pub reason: Option<String>,
+}
+
+impl StorageStatus {
+    /// Whether a fatal crash can be recovered on the next launch: true only with
+    /// a usable data directory. (It also needs that directory to survive the
+    /// process; see [`may_be_ephemeral`](Self::may_be_ephemeral).)
+    pub fn crash_recovery_available(&self) -> bool {
+        self.mode == bugsee_core::runtime::StorageMode::Disk
+    }
+
+    /// Whether the directory is the temp-dir fallback, which is commonly wiped
+    /// on restart and so may not preserve a crash for the next launch. Set
+    /// [`LaunchOptions::data_dir`] (or `BUGSEE_DATA_DIR`) to a volume to fix it.
+    pub fn may_be_ephemeral(&self) -> bool {
+        self.source == DataDirSource::TempFallback
     }
 }
 
@@ -242,4 +396,108 @@ fn short_token(token: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(16)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bugsee-resolve-{}",
+            bugsee_core::util::random_hex(8)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A path no directory can be created at: a child of a regular file.
+    fn blocked(scratch: &Path, name: &str) -> PathBuf {
+        let file = scratch.join(name);
+        std::fs::write(&file, b"x").unwrap();
+        file.join("sub")
+    }
+
+    fn env_of<'a>(vars: &'a [(&'a str, OsString)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn explicit_directory_wins_when_writable() {
+        let s = scratch();
+        let explicit = s.join("explicit");
+        let env = [(DATA_DIR_ENV, s.join("from-env").into_os_string())];
+        let r = resolve_data_dir(Some(&explicit), "tok", &env_of(&env), &s.join("tmp"));
+        assert_eq!(r.source, DataDirSource::Explicit);
+        assert_eq!(r.dir.as_deref(), Some(explicit.as_path()));
+        assert!(r.skipped.is_empty());
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn unwritable_explicit_falls_through_to_the_environment_variable() {
+        let s = scratch();
+        let bad = blocked(&s, "f1");
+        let good = s.join("from-env");
+        let env = [(DATA_DIR_ENV, good.clone().into_os_string())];
+        let r = resolve_data_dir(Some(&bad), "tok", &env_of(&env), &s.join("tmp"));
+        assert_eq!(r.source, DataDirSource::Environment);
+        assert_eq!(r.dir, Some(good));
+        assert_eq!(r.skipped.len(), 1, "the rejected candidate is recorded");
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn platform_default_is_used_when_home_is_set() {
+        let s = scratch();
+        let home = s.join("home");
+        let env = [
+            ("HOME", home.clone().into_os_string()),
+            ("XDG_DATA_HOME", home.clone().into_os_string()),
+            ("LOCALAPPDATA", home.clone().into_os_string()),
+        ];
+        let r = resolve_data_dir(None, "tok-1", &env_of(&env), &s.join("tmp"));
+        assert_eq!(r.source, DataDirSource::PlatformDefault);
+        assert!(r.dir.unwrap().starts_with(&home));
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn no_home_falls_back_to_the_temp_directory() {
+        let s = scratch();
+        let tmp = s.join("tmp");
+        let r = resolve_data_dir(None, "tok-1", &env_of(&[]), &tmp);
+        assert_eq!(r.source, DataDirSource::TempFallback);
+        assert_eq!(r.dir, Some(tmp.join("bugsee").join("tok1")));
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn nothing_writable_resolves_to_none_and_lists_every_attempt() {
+        let s = scratch();
+        let env = [(DATA_DIR_ENV, blocked(&s, "f2").into_os_string())];
+        let r = resolve_data_dir(
+            Some(&blocked(&s, "f3")),
+            "tok",
+            &env_of(&env),
+            &blocked(&s, "f4"),
+        );
+        assert_eq!(r.source, DataDirSource::None);
+        assert!(r.dir.is_none());
+        assert_eq!(r.skipped.len(), 3);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    #[test]
+    fn an_empty_environment_variable_is_ignored() {
+        let s = scratch();
+        let env = [(DATA_DIR_ENV, OsString::new())];
+        let r = resolve_data_dir(None, "tok", &env_of(&env), &s.join("tmp"));
+        assert_eq!(r.source, DataDirSource::TempFallback);
+        let _ = std::fs::remove_dir_all(&s);
+    }
 }
