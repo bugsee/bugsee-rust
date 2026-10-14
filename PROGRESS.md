@@ -223,7 +223,7 @@ and build/MSRV. Fixed (all validated):
   `mach_to_signal` unknown → UNKNOWN; `StackBuf::dec` `i64::MIN`-safe; `report_caught`
   blocking-lock snapshot cleanup; `0x00`-delimited signature hashing.
 - **Native crash dedup signature (new capability):** crash handler captures the crashing
-  thread's frame PCs async-signal-safely (Apple: `thread_get_state` + fault-safe
+  thread's frame PCs async-signal-safely (Apple: `ucontext` pc/fp + fault-safe
   `mach_vm_read_overwrite` FP-walk; Linux/Android: `backtrace::trace_unsynchronized`);
   module map snapshotted at install (`crash.modules`); recovery computes
   `native_signature` from ASLR-invariant `pc − base` offsets → local blacklist can now
