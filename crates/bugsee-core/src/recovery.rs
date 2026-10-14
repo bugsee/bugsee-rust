@@ -61,6 +61,23 @@ pub struct RecoveredReport {
 /// because it launched earlier) has a live marker that is *not* a crash. Its
 /// marker is left in place for a future launch to recover once the peer is gone.
 pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSession> {
+    find_pending_bounded(data_dir, current_generation, usize::MAX)
+}
+
+/// Like [`find_pending`], for the launch path: newest generation first, and
+/// bounded in what it probes. Every session marker NAME is read (cheap, and the
+/// newest cannot be known without reading them all: `readdir` order is not
+/// generation order), sorted, and only then are files touched: the newest `limit`
+/// pending sessions, plus up to `limit` older ones that already have an
+/// `.attempts` sidecar. The latter keep a session that faults during recovery
+/// itself moving toward `MAX_RECOVERY_ATTEMPTS`, instead of being starved by the
+/// newer sessions each failed recovery leaves behind. At most `limit * 16`
+/// candidates are probed.
+pub fn find_pending_bounded(
+    data_dir: &Path,
+    current_generation: u64,
+    limit: usize,
+) -> Vec<PendingSession> {
     let mut pending = Vec::new();
     let sessions = data_dir.join("sessions");
     let read = match std::fs::read_dir(&sessions) {
@@ -68,8 +85,8 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         Err(_) => return pending,
     };
     let self_pid = std::process::id();
+    let mut candidates: Vec<u64> = Vec::new();
     for entry in read.flatten() {
-        let marker = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(gen_str) = name.strip_suffix(".alive") else {
             continue;
@@ -77,9 +94,22 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         let Ok(generation) = gen_str.parse::<u64>() else {
             continue;
         };
-        if generation >= current_generation {
+        if generation < current_generation {
+            candidates.push(generation);
+        }
+    }
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    let mut retried = Vec::new();
+    let (mut fresh, mut retries) = (0usize, 0usize);
+    for generation in candidates.into_iter().take(limit.saturating_mul(16)) {
+        if fresh >= limit && retries >= limit {
+            break;
+        }
+        let retrying = attempts_path(data_dir, generation).exists();
+        if (retrying && retries >= limit) || (!retrying && fresh >= limit) {
             continue;
         }
+        let marker = sessions.join(format!("{generation}.alive"));
         if !session_is_crashed(data_dir, generation, &marker, self_pid) {
             continue;
         }
@@ -87,15 +117,43 @@ pub fn find_pending(data_dir: &Path, current_generation: u64) -> Vec<PendingSess
         let minidump = exists_opt(parts_dir.join(MINIDUMP_NAME));
         let crash_info = exists_opt(parts_dir.join(CRASH_INFO_NAME));
         let panic_info = exists_opt(parts_dir.join(PANIC_INFO_NAME));
-        pending.push(PendingSession {
+        let session = PendingSession {
             generation,
             parts_dir,
             minidump,
             crash_info,
             panic_info,
-        });
+        };
+        if retrying {
+            retries += 1;
+            retried.push(session);
+        } else {
+            fresh += 1;
+            pending.push(session);
+        }
     }
-    pending
+    // Sessions already tried come FIRST. If recovering the newest keeps killing
+    // the process, each death leaves another newer session behind and the older
+    // one would never get its next attempt counted (and never be queued, or
+    // abandoned at the cap).
+    retried.extend(pending);
+    retried
+}
+
+/// Give back the attempt [`bump_attempts`] just counted, for a session that was
+/// refused for a reason that says nothing about its evidence (the launch path had
+/// no queue room), so such refusals cannot use up `MAX_RECOVERY_ATTEMPTS`.
+pub fn undo_attempt(data_dir: &Path, pending: &PendingSession) {
+    let path = attempts_path(data_dir, pending.generation);
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if current <= 1 {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let _ = std::fs::write(&path, (current - 1).to_string());
+    }
 }
 
 fn exists_opt(p: PathBuf) -> Option<PathBuf> {
@@ -816,6 +874,56 @@ mod tests {
             .iter()
             .map(|p| p.generation)
             .collect()
+    }
+
+    #[test]
+    fn the_bounded_scan_is_newest_first_and_capped() {
+        let dir = tmp();
+        for g in [3u64, 9, 1, 7, 5] {
+            marker(&dir, g, "0");
+        }
+        let got = |current, limit| -> Vec<u64> {
+            find_pending_bounded(&dir, current, limit)
+                .iter()
+                .map(|p| p.generation)
+                .collect()
+        };
+        assert_eq!(got(u64::MAX, 100), vec![9, 7, 5, 3, 1]);
+        assert_eq!(got(u64::MAX, 2), vec![9, 7]);
+        // Only older generations than the caller's own are candidates.
+        assert_eq!(got(7, 100), vec![5, 3, 1]);
+        assert!(got(u64::MAX, 0).is_empty());
+    }
+
+    #[test]
+    fn an_undone_attempt_is_not_counted() {
+        let dir = tmp();
+        marker(&dir, 1, "0");
+        let pending = find_pending(&dir, u64::MAX).pop().unwrap();
+        assert_eq!(bump_attempts(&dir, &pending), 1);
+        assert_eq!(bump_attempts(&dir, &pending), 2);
+        undo_attempt(&dir, &pending);
+        assert_eq!(bump_attempts(&dir, &pending), 2);
+        undo_attempt(&dir, &pending);
+        undo_attempt(&dir, &pending);
+        assert_eq!(bump_attempts(&dir, &pending), 1);
+    }
+
+    #[test]
+    fn a_session_with_failed_attempts_is_not_starved_by_newer_ones() {
+        let dir = tmp();
+        for g in 1..=6u64 {
+            marker(&dir, g, "0");
+        }
+        // Session 2 was tried before (and the process died doing it).
+        std::fs::write(attempts_path(&dir, 2), "1").unwrap();
+        let got: Vec<u64> = find_pending_bounded(&dir, u64::MAX, 2)
+            .iter()
+            .map(|p| p.generation)
+            .collect();
+        // The one already tried comes first, so it advances even if the newest
+        // keeps killing the process.
+        assert_eq!(got, vec![2, 6, 5]);
     }
 
     #[test]

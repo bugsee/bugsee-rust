@@ -102,6 +102,63 @@ pub fn list_pending(data_dir: &Path) -> Vec<QueuedReport> {
     out
 }
 
+/// Most reports the launch-path recovery will leave queued before it stops adding
+/// recovered crashes (see [`admit_recovered`]).
+pub const MAX_QUEUED_REPORTS: usize = 64;
+/// Most queued bundle bytes before the same.
+pub const MAX_QUEUED_BYTES: u64 = 64 << 20;
+
+/// Whether the launch-path recovery should queue a recovered crash.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    Admit,
+    /// A queued report already carries exactly this signature set.
+    Duplicate,
+    /// The queue is at its entry or byte cap.
+    Full,
+}
+
+/// Decide whether a recovered crash with `signatures` may be queued.
+///
+/// A host in a crash loop re-reports the same crash on every start, and the loop
+/// is faster than the uploader, so neither the server's duplicate verdict nor the
+/// local blacklist is ever reached. Instead the first copy stays queued and
+/// later copies with the identical, non-empty signature set are dropped; once it
+/// has been delivered a recurrence is queued again. The queue is also capped
+/// (entries and bytes): beyond it the caller keeps the crash's evidence for the
+/// background pass rather than queue more on the launch path. Reports without signatures are never
+/// treated as duplicates.
+pub fn admit_recovered(data_dir: &Path, signatures: &[String]) -> Admission {
+    let wanted: BTreeSet<&String> = signatures.iter().collect();
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for report in list_pending(data_dir) {
+        count += 1;
+        bytes += std::fs::metadata(&report.bundle).map_or(0, |m| m.len());
+        if count >= MAX_QUEUED_REPORTS || bytes >= MAX_QUEUED_BYTES {
+            return Admission::Full;
+        }
+        if wanted.is_empty() {
+            continue;
+        }
+        let queued: BTreeSet<String> = std::fs::read(report.req_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("signatures").and_then(|s| s.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        if queued.len() == wanted.len() && wanted.iter().all(|s| queued.contains(*s)) {
+            return Admission::Duplicate;
+        }
+    }
+    Admission::Admit
+}
+
 /// Load a queued report's bundle bytes, request body, retry count, and the
 /// earliest next-attempt time (epoch ms).
 pub fn load(report: &QueuedReport) -> std::io::Result<(Vec<u8>, Vec<u8>, u32, i64)> {
@@ -302,6 +359,40 @@ pub fn any_blacklisted(data_dir: &Path, sigs: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_report(data: &Path, sigs: &[&str]) {
+        let list: Vec<String> = sigs.iter().map(|s| format!("\"{s}\"")).collect();
+        enqueue(
+            data,
+            &AssembledReport {
+                bundle_name: format!("{}.bundle.zip", crate::util::random_hex(10)),
+                zip: b"z".to_vec(),
+                request_json: format!("{{\"signatures\":[{}]}}", list.join(",")).into_bytes(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recovered_crashes_are_deduplicated_against_the_queue_and_capped() {
+        let data = std::env::temp_dir().join(format!("bugsee-qadm-{}", crate::util::random_hex(8)));
+        let sig = |s: &str| vec![s.to_string()];
+        assert_eq!(admit_recovered(&data, &sig("a")), Admission::Admit);
+        queue_report(&data, &["a"]);
+        assert_eq!(admit_recovered(&data, &sig("a")), Admission::Duplicate);
+        assert_eq!(admit_recovered(&data, &sig("b")), Admission::Admit);
+        // A different signature SET is not a duplicate; neither is no signature.
+        assert_eq!(
+            admit_recovered(&data, &["a".to_string(), "b".to_string()]),
+            Admission::Admit
+        );
+        assert_eq!(admit_recovered(&data, &[]), Admission::Admit);
+        for i in 1..MAX_QUEUED_REPORTS {
+            queue_report(&data, &[&format!("s{i}")]);
+        }
+        assert_eq!(admit_recovered(&data, &sig("new")), Admission::Full);
+        let _ = std::fs::remove_dir_all(&data);
+    }
 
     #[test]
     fn gc_spares_a_peers_in_flight_enqueue_and_reaps_old_orphans() {
