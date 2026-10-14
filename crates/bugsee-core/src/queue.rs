@@ -195,6 +195,11 @@ pub fn blacklist_read_count() -> usize {
     BLACKLIST_READS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The locally blacklisted signatures in `data_dir` (empty if none or unreadable).
+pub fn blacklisted_signatures(data_dir: &Path) -> BTreeSet<String> {
+    load_blacklist(data_dir)
+}
+
 fn load_blacklist(data_dir: &Path) -> BTreeSet<String> {
     BLACKLIST_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::fs::read_to_string(blacklist_path(data_dir))
