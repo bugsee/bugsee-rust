@@ -228,6 +228,8 @@ impl Bugsee {
             bugsee_panic::set_report_from_hook(options.report_panics_from_hook);
         }
 
+        register_exit_flush(options.flush_at_exit);
+
         Ok(LaunchGuard { _private: () })
     }
 
@@ -256,7 +258,30 @@ impl Bugsee {
         })
     }
 
-    /// Stop the SDK and flush pending work (dropping the recorder joins the worker).
+    /// Stop the SDK: persist everything captured so far, then end the session
+    /// cleanly. Idempotent, and a no-op when not launched. Never uploads.
+    ///
+    /// # The shutdown contract
+    ///
+    /// | Exit path | Captured data and queued reports | Next launch |
+    /// |---|---|---|
+    /// | `stop`/`shutdown`, or the launch guard dropped (return from `main`) | Everything captured is persisted; a report not yet uploaded stays in the durable queue | No abnormal-exit report; queued reports are delivered once |
+    /// | `exit()` / `process::exit` | As above only with [`LaunchOptions::flush_at_exit`]; otherwise whatever the worker had already written | With the option: as above. Without: one abnormal-exit report |
+    /// | `SIGTERM`/`SIGINT` with [`Bugsee::install_termination_flush`] | Flushed (bounded), then a clean stop if the signal would have terminated the process | As the first row. The host's own handler is still called |
+    /// | `SIGTERM`/`SIGINT` without the hook, `SIGKILL`, OOM kill, power loss | Records are appended as the worker drains them, so completed records and queued reports survive; the last few in flight may not | One abnormal-exit report, carrying the recovered window |
+    /// | Fatal signal, aborting panic, unwinding panic out of `main` | See the crash capture docs | One crash report |
+    ///
+    /// Nothing is reported twice: a stopped session's marker is gone, and a
+    /// recovered one is consumed when its report is queued. In memory mode
+    /// (see [`StorageMode`]) nothing survives the process, so `flush` before
+    /// exiting is the only delivery guarantee.
+    ///
+    /// Bounds: `stop` waits at most 2 s each for the capture worker and the
+    /// uploader to acknowledge. If one does not (a host callback wedged), the
+    /// marker is deliberately left, so the session is recovered rather than
+    /// lost. It is not async-signal-safe and must not be called from a signal
+    /// handler (use [`Bugsee::install_termination_flush`]). In a `fork` child
+    /// it acts on that child's own recorder.
     pub fn stop() {
         check_fork();
         #[cfg(feature = "native")]
@@ -270,6 +295,56 @@ impl Bugsee {
         // if a thread were wedged).
         let recorder = RECORDER.lock().take();
         drop(recorder);
+    }
+
+    /// Flush, then stop: the one call to make before a deliberate exit.
+    ///
+    /// Waits up to `timeout` for captured work to be persisted and the upload
+    /// queue to drain ([`Bugsee::flush`]), then [`Bugsee::stop`]s, which ends
+    /// the session cleanly whatever the flush returned. Returns the flush
+    /// result: `true` if every report was delivered. `false` is not a loss —
+    /// undelivered reports stay in the durable queue for the next launch (in
+    /// disk mode) — and also covers "not launched". Idempotent. Total time is
+    /// bounded by `timeout` plus the bounds documented on `stop`.
+    pub fn shutdown(timeout: Duration) -> bool {
+        let flushed = Self::flush(timeout);
+        Self::stop();
+        flushed
+    }
+
+    /// Opt in to flushing on `SIGTERM`/`SIGINT` (unix) or console control
+    /// events (Windows: Ctrl+C, Ctrl+Break, close, logoff, shutdown).
+    ///
+    /// Containers and process managers stop a service with `SIGTERM` and kill it
+    /// after a grace period; without this the process dies with the signal's
+    /// default action and the next launch reports an abnormal termination. It is
+    /// never installed by default and it never takes the signal from you:
+    ///
+    /// - **Unix.** The handler only writes to a self-pipe, then calls whatever
+    ///   handler was installed before it. A thread does the flush. If the
+    ///   previous disposition was the default (terminate), it runs
+    ///   [`Bugsee::shutdown`] with `timeout`, restores the default and re-raises
+    ///   the signal, so the exit status is unchanged and only delayed; a second
+    ///   signal meanwhile terminates at once. If the host had its own handler (or
+    ///   ignores the signal) the SDK only flushes, and the host decides when to
+    ///   exit and ends the session by dropping the guard / calling `stop`. Call
+    ///   this **after** installing your own handler, or make yours chain: a
+    ///   handler installed later that does not chain replaces this one.
+    ///   Signals covered: `SIGTERM`, `SIGINT`. A `fork` child inherits the
+    ///   handler but not its thread; it terminates by default as usual, and
+    ///   calling this again in the child re-arms it there.
+    /// - **Windows.** A console control handler that flushes (and, for close,
+    ///   logoff and shutdown, which end the process regardless, also stops)
+    ///   then returns `FALSE` so the next handler still runs. Windows gives
+    ///   close/logoff/shutdown handlers only a few seconds: use a short
+    ///   `timeout`. A service-control stop is not a console event and is not
+    ///   covered; call [`Bugsee::shutdown`] from your stop handler.
+    ///
+    /// Idempotent; a second call only updates `timeout`. Works before `launch`
+    /// (it flushes nothing until there is something to flush). Choose `timeout`
+    /// below your orchestrator's grace period (Kubernetes defaults to 30 s).
+    pub fn install_termination_flush(timeout: Duration) -> io::Result<()> {
+        crate::termination::install(timeout)
     }
 
     /// Whether the SDK is launched and not paused.
@@ -455,6 +530,13 @@ impl Bugsee {
     }
 
     /// Block until pending work drains, or `timeout` elapses.
+    ///
+    /// Persists everything captured before the call and tries to upload every
+    /// queued report; returns `true` only if the outbound queue is then empty
+    /// (`false` on timeout, a failing transport, or when not launched).
+    /// Idempotent, callable from any thread, and it leaves the SDK running. A
+    /// `false` loses nothing in disk mode: the reports stay queued. Not
+    /// async-signal-safe. See [`Bugsee::stop`] for the per-exit-path contract.
     pub fn flush(timeout: Duration) -> bool {
         // Off-lock: flush blocks; must not hold the mutex across the wait.
         Self::handle().map(|h| h.flush(timeout)).unwrap_or(false)
@@ -478,6 +560,34 @@ impl Bugsee {
     fn handle() -> Option<bugsee_core::RecorderHandle> {
         check_fork();
         RECORDER.lock().as_ref().map(|r| r.handle())
+    }
+}
+
+/// Exit-time flush timeout in milliseconds, `0` when not requested.
+static EXIT_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+}
+
+extern "C" fn flush_at_exit() {
+    let ms = EXIT_FLUSH_MS.load(Ordering::SeqCst);
+    if ms > 0 {
+        let _ = std::panic::catch_unwind(|| Bugsee::shutdown(Duration::from_millis(ms)));
+    }
+}
+
+/// Arm (or, with `None`, disarm) the `atexit` handler. libc cannot unregister
+/// it, so it is registered once per process and consults the timeout.
+fn register_exit_flush(timeout: Option<Duration>) {
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    let ms = timeout.map_or(0, |t| t.as_millis().clamp(1, u64::MAX as u128) as u64);
+    EXIT_FLUSH_MS.store(ms, Ordering::SeqCst);
+    if ms > 0 && !REGISTERED.swap(true, Ordering::SeqCst) {
+        // SAFETY: registering a plain `extern "C"` function.
+        unsafe {
+            atexit(flush_at_exit);
+        }
     }
 }
 

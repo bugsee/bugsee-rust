@@ -39,6 +39,7 @@ pub struct LaunchOptions {
     pub(crate) before_send: Option<BeforeSend>,
     pub(crate) before_breadcrumb: Option<BeforeBreadcrumb>,
     pub(crate) sample_rate: f64,
+    pub(crate) flush_at_exit: Option<Duration>,
 }
 
 impl LaunchOptions {
@@ -63,6 +64,7 @@ impl LaunchOptions {
             before_send: None,
             before_breadcrumb: None,
             sample_rate: 1.0,
+            flush_at_exit: None,
         }
     }
 
@@ -119,6 +121,29 @@ impl LaunchOptions {
     /// Enable/disable periodic system/process telemetry sampling (default `true`).
     pub fn system_telemetry(mut self, enabled: bool) -> Self {
         self.system_telemetry = enabled;
+        self
+    }
+
+    /// Treat `std::process::exit` (and any other libc `exit`) as a deliberate
+    /// stop: at exit, flush for up to `timeout` and end the session cleanly
+    /// (default: off).
+    ///
+    /// Without it, a process that calls `exit` while the SDK is still launched
+    /// leaves its liveness marker behind and is reported on the next launch as
+    /// an abnormal termination, because nothing in the process can tell that
+    /// `exit` from a death. Enable this when your application ends through
+    /// `exit` on purpose. Returning from `main` needs no option: dropping the
+    /// launch guard already stops cleanly.
+    ///
+    /// It registers a libc `atexit` handler, so it does not run on `abort`, a
+    /// fatal signal or `_exit` — those stay abnormal terminations, as they
+    /// should. Caveat: a panic that unwinds out of `main` while the launch
+    /// guard has been leaked (`mem::forget`, a `static`) would be treated as a
+    /// deliberate exit; keep the guard as a local in `main`.
+    ///
+    /// See [`crate::Bugsee::stop`] for exactly what is guaranteed.
+    pub fn flush_at_exit(mut self, timeout: Duration) -> Self {
+        self.flush_at_exit = Some(timeout);
         self
     }
 

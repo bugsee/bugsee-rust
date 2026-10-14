@@ -243,6 +243,10 @@ struct Shared {
     max_report_queued: usize,
     /// Whether telemetry sampling is paused (mirrors the facade's pause state).
     paused: AtomicBool,
+    /// Set when the recorder is being stopped: a flush in progress gives up at
+    /// once, so the stop is acknowledged inside its bound (and the session can
+    /// end cleanly) instead of waiting out the flush's whole deadline.
+    stopping: AtomicBool,
     /// Reports that could not be queued on disk, delivered from memory. An entry
     /// stays here until its delivery is settled, so the length is the real backlog.
     mem_queue: ForkLock<Vec<MemReport>>,
@@ -350,6 +354,7 @@ impl Recorder {
             report_queued: AtomicUsize::new(0),
             max_report_queued: DEFAULT_MAX_REPORT_QUEUED,
             paused: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             mem_queue: ForkLock::new(Vec::new()),
             next_mem_id: AtomicU64::new(0),
             degraded: AtomicBool::new(false),
@@ -626,6 +631,7 @@ impl Drop for Recorder {
         // A thread wedged in a host callback with no timeout is DETACHED (its
         // JoinHandle dropped un-joined) rather than hanging the stopping thread
         // forever. (Called only after the facade released its global lock.)
+        self.shared.stopping.store(true, Ordering::SeqCst);
         let (tx, rx) = channel();
         let worker_acked =
             self.tx.send(Msg::Stop(tx)).is_ok() && rx.recv_timeout(Duration::from_secs(2)).is_ok();
@@ -1706,6 +1712,9 @@ fn drain_until_empty(
 ) -> bool {
     let start = Instant::now();
     loop {
+        if shared.stopping.load(Ordering::SeqCst) {
+            return false; // stop wins; what is queued stays queued
+        }
         let now = epoch_ms();
         drain_memory(shared, backoff_base, true, false, Some(start + deadline));
         for &data_dir in dirs {
@@ -1727,7 +1736,7 @@ fn drain_until_empty(
                     now,
                     false,
                 );
-                if start.elapsed() >= deadline {
+                if start.elapsed() >= deadline || shared.stopping.load(Ordering::SeqCst) {
                     break;
                 }
             }
