@@ -166,6 +166,34 @@ fn worker_thread_name() -> Option<String> {
     }
 }
 
+/// How long a process must outlive a worker-thread panic for the persisted
+/// snapshot to be dropped as stale. An abort follows the hook within
+/// milliseconds, far inside this.
+const SNAPSHOT_SURVIVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// After [`SNAPSHOT_SURVIVAL`], delete the snapshot just written, unless a later
+/// panic has replaced it. Best effort on a detached thread: if the process dies
+/// first (an abort), the snapshot is there for next-launch correlation.
+fn expire_snapshot_if_survived() {
+    let Some(path) = SNAPSHOT_PATH
+        .try_lock()
+        .and_then(|g| current_snapshot_path(&g).cloned())
+    else {
+        return;
+    };
+    let Some(written) = PanicInfo::read_from(&path).map(|i| i.timestamp) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("bugsee-panic-expire".into())
+        .spawn(move || {
+            std::thread::sleep(SNAPSHOT_SURVIVAL);
+            if PanicInfo::read_from(&path).is_some_and(|i| i.timestamp == written) {
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+}
+
 /// Install the chained global panic observer and register `reporter`.
 /// Idempotent — the hook is installed at most once; the first reporter wins.
 pub fn install(reporter: Arc<dyn PanicReporter>) {
@@ -235,15 +263,14 @@ pub fn install(reporter: Arc<dyn PanicReporter>) {
                         handled: is_worker,
                         thread: worker_thread,
                     });
-                    // A worker-thread panic is reported and the process lives
-                    // on: its snapshot must not outlast it, or a later SIGKILL
-                    // would be read as this panic having killed the process.
+                    // A worker-thread panic is reported and the process may live
+                    // on: if it is still running a moment later its snapshot is
+                    // stale, and a later SIGKILL must not be read as this panic
+                    // having killed it. Not deleted here: under `panic = "abort"`
+                    // the process dies right after the hook, and the snapshot is
+                    // what correlates the SIGABRT with the panic.
                     if is_worker {
-                        if let Some(guard) = SNAPSHOT_PATH.try_lock() {
-                            if let Some(path) = current_snapshot_path(&guard) {
-                                let _ = std::fs::remove_file(path);
-                            }
-                        }
+                        expire_snapshot_if_survived();
                     }
                 }
             }

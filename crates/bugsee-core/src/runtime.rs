@@ -304,7 +304,7 @@ struct Shared {
     health_errors: AtomicU64,
     /// Register the backend session at launch instead of with the first report
     /// (release health on): see [`register_eagerly`].
-    eager_session: bool,
+    eager_session: AtomicBool,
 }
 
 /// What the launch-path recovery pass needs, fixed at launch.
@@ -442,7 +442,7 @@ impl Recorder {
             launch_wait_ms: AtomicU64::new(0),
             health: ForkLock::new(None),
             health_errors: AtomicU64::new(0),
-            eager_session: config.release_health,
+            eager_session: AtomicBool::new(false),
         });
 
         crate::fork::install_fork_hook();
@@ -475,6 +475,11 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        // Only a session that can be recovered is registered eagerly: a memory-mode
+        // run could never contribute its crash, so counting it would read healthy.
+        shared
+            .eager_session
+            .store(config.release_health && session.is_some(), Ordering::SeqCst);
         if config.release_health {
             if let Some(session) = &session {
                 *shared.health.lock() = crate::health::HealthTracker::start(
@@ -1864,7 +1869,7 @@ fn uploader_loop(
     // never uploads would never be counted. Best effort, on this thread, before
     // anything else; failure (offline) is silent and retried at most every
     // `EAGER_RETRY` from the poll below, falling back to the lazy path.
-    let eager = fresh_launch && shared.eager_session;
+    let eager = fresh_launch && shared.eager_session.load(Ordering::SeqCst);
     let mut last_eager = Instant::now();
     if eager {
         register_eagerly(&shared);

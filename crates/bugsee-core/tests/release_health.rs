@@ -185,3 +185,17 @@ fn an_empty_data_dir_is_rejected() {
     assert!(health::HealthTracker::start(std::path::Path::new(""), 1, &env).is_none());
     assert!(health::finished(std::path::Path::new("")).is_empty());
 }
+
+#[test]
+fn a_memory_mode_launch_is_not_registered_eagerly() {
+    // It could never contribute a recovered crash, so counting it as a session
+    // would read healthy.
+    let d = dir("memory-eager");
+    let mock = Arc::new(MockTransport::default());
+    let mut cfg = config(&d, true);
+    cfg.memory_only = Some("test".into());
+    let rec = Recorder::launch(cfg, mock.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(*mock.sessions.lock().unwrap(), 0);
+    drop(rec);
+}
