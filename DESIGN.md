@@ -470,7 +470,7 @@ E2E feeding a real `*.bundle.zip` to the worker's ingest (DESIGN §13).
 
 ## 16. References
 
-- `report-bundle-structure` (GitHub `bugsee/report-bundle-structure`) — the authoritative cross-platform wire contract (extracted from Android SDK 7.0.0).
+- `bugsee/specs` (`sdk/reporting/`; formerly `report-bundle-structure`) — the authoritative cross-platform wire contract (extracted from Android SDK 7.0.0).
 - `rust_crash_panic_capture_design.md` — original crash/panic capture research (this repo).
 - Android SDK `com.bugsee.library` (`Bugsee.java`, `OptionsDescriptors.java`, `IssueReportingRequest.java`, `ReportFile.java`, `ExceptionSignature.java`).
 - iOS nextgen `BugseeLib` (`Reporting/`, `Capture/`, `Detection/Crash/`) — export/persistence/crash mechanics.
