@@ -14,7 +14,7 @@ bugsee-panic = { workspace = true, optional = true }
 bugsee-native = { workspace = true, optional = true }
 serde_json = { workspace = true }
 backtrace = "0.3"
-ureq = { version = "2", optional = true, features = ["json"] }
+ureq = { version = "3", optional = true, features = ["json"] }
 sysinfo = { version = "0.33", optional = true, default-features = false, features = ["system", "disk"] }
 
 # Unconditional on unix: the data-directory ownership checks (`options.rs`) call
