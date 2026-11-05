@@ -88,7 +88,7 @@ fn launch_capture_upload_produces_valid_bundle() {
     // The bundle is a valid ZIP with the required documents.
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).expect("valid zip");
     let names: Vec<String> = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.iter().any(|n| n == "manifest.json"));
     assert!(names.iter().any(|n| n == "request.json"));

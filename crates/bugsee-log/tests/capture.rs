@@ -56,7 +56,7 @@ fn log_records_become_log_entries() {
     let bundles = mock.uploaded_bundles.lock().unwrap();
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
     let log_name = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .find(|n| n.ends_with(".log.json"))
         .expect("log.json present");
     let mut bytes = Vec::new();

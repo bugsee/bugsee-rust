@@ -120,7 +120,7 @@ fn event_names(bundle: &[u8]) -> Vec<String> {
     let mut names = Vec::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).expect("zip entry");
-        if !entry.name().contains("events.user") {
+        if !entry.name().unwrap().contains("events.user") {
             continue;
         }
         let mut raw = Vec::new();

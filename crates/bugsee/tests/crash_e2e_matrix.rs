@@ -242,7 +242,7 @@ fn crash_json_from(bundle: &[u8]) -> Value {
     let mut zip = ZipArchive::new(Cursor::new(bundle)).expect("bundle is a zip");
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).expect("zip entry");
-        if entry.name() == "crash.json" {
+        if entry.name().is_ok_and(|n| n == "crash.json") {
             let mut raw = Vec::new();
             entry.read_to_end(&mut raw).expect("read crash.json");
             return serde_json::from_slice(&raw).expect("crash.json parses");
