@@ -82,7 +82,7 @@ async fn captures_request_and_response_into_network_json() {
     assert_eq!(bundles.len(), 1);
     let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
     let net_name = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .find(|n| n.ends_with(".network.json"))
         .expect("network.json present");
     let mut nbytes = Vec::new();

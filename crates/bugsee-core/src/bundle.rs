@@ -64,10 +64,7 @@ pub fn bundle_filename() -> String {
 
 /// Write `entries` as a flat report-bundle ZIP into `writer`, returning the
 /// inner writer once the central directory is finalized.
-pub fn write_bundle<W: Write + Seek>(
-    writer: W,
-    entries: &[BundleEntry],
-) -> zip::result::ZipResult<W> {
+pub fn write_bundle<W: Write + Seek>(writer: W, entries: &[BundleEntry]) -> std::io::Result<W> {
     let mut zip = ZipWriter::new(writer);
     for entry in entries {
         let method = match entry.compression {
@@ -75,8 +72,9 @@ pub fn write_bundle<W: Write + Seek>(
             EntryCompression::Zstd => CompressionMethod::Zstd,
         };
         let options = SimpleFileOptions::default().compression_method(method);
-        zip.start_file(entry.name.as_str(), options)?;
+        zip.start_file(entry.name.as_str(), options)
+            .map_err(std::io::Error::other)?;
         zip.write_all(&entry.data)?;
     }
-    zip.finish()
+    zip.finish().map_err(std::io::Error::other)
 }

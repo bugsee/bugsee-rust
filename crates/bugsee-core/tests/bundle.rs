@@ -100,9 +100,9 @@ fn bundle_roundtrip_layout_and_compression() {
     for i in 0..zip.len() {
         let f = zip.by_index(i).unwrap();
         assert!(
-            !f.name().contains('/'),
+            !f.name().unwrap().contains('/'),
             "archive must be flat: {}",
-            f.name()
+            f.name().unwrap()
         );
     }
 

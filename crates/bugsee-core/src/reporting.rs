@@ -261,7 +261,7 @@ pub fn assemble_docs(
 
     let bundle_name = bundle_filename();
     let mut zip = Vec::new();
-    write_bundle(std::io::Cursor::new(&mut zip), &entries).map_err(std::io::Error::other)?;
+    write_bundle(std::io::Cursor::new(&mut zip), &entries)?;
 
     Ok(AssembledReport {
         bundle_name,

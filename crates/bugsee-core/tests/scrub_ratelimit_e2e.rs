@@ -86,7 +86,7 @@ fn unzip_all(zip: &[u8]) -> Vec<(String, String)> {
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             (
-                f.name().to_string(),
+                f.name().unwrap().to_string(),
                 String::from_utf8_lossy(&buf).into_owned(),
             )
         })

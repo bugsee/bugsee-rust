@@ -62,7 +62,7 @@ fn transaction_with_span_exports_to_performance_json() {
 
     // Find the performance file.
     let perf_name = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .find(|n| n.ends_with(".performance.json"))
         .expect("performance.json present");
 

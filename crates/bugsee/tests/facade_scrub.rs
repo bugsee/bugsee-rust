@@ -37,7 +37,7 @@ fn all_text(zip: &[u8]) -> String {
     let mut out = String::new();
     for i in 0..z.len() {
         let mut f = z.by_index(i).unwrap();
-        if f.name() == ".apptoken" {
+        if f.name().is_ok_and(|n| n == ".apptoken") {
             continue;
         }
         let mut b = Vec::new();
