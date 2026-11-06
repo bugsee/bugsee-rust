@@ -4,13 +4,13 @@ _Snapshot: 2026-08-07 · `main` @ `0164a30` · 149 tests on macOS / 121 on Windo
 
 > **Ingestion is verified end to end against a live deployment.** A real crash
 > from a real binary routes, symbolicates against uploaded symbols, and groups
-> across runs on `apidev.bugsee.com`. Getting there surfaced six defects across
+> across runs on a live Bugsee deployment. Getting there surfaced six defects across
 > four repos — see [Verified against a live deployment](#recent-work--verified-against-a-live-deployment-and-the-six-defects-it-found).
 
 A standalone, cross-platform crash + native-fatal + panic + handled-error reporter,
 built in **Bugsee mobile-SDK style**, producing **backend-compatible report bundles**
 that ingest into the existing appserver/viewer unchanged. Design + decision log live
-in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/report-bundle-structure`.
+in [`DESIGN.md`](./DESIGN.md); the wire contract is `bugsee/specs` (`sdk/reporting/`).
 
 ## Crates (9)
 
@@ -124,7 +124,7 @@ to the real worker code.
   (`symbolfiles/pdb.py`, MSF magic sniffing, `symbolic`-based debug-id
   identification) and Rust native frame symbolication against the symbol store;
   `bugsee-cli` gained PDB discovery + upload; the wire contract in
-  `report-bundle-structure` documents the triple (`bundle/crash.md`,
+  `bugsee/specs` (`sdk/reporting/`) documents the triple (`bundle/crash.md`,
   `platforms/rust.md`) including the load-bearing arch-normalization rule.
 - **Cross-repo integration harness** (`tests/integration/rust_worker_e2e.py`):
   generates a Cargo project, builds it **twice** (`panic = "abort"` and
@@ -258,7 +258,7 @@ and build/MSRV. Fixed (all validated):
 
 ## Recent work — verified against a live deployment, and the six defects it found
 
-The first end-to-end run against `apidev.bugsee.com` (build → upload symbols →
+The first end-to-end run against a live Bugsee deployment (build → upload symbols →
 crash → recover → deliver → read the issue back). It passed, but only after six
 defects came out — every one of them invisible to the existing tests, because
 each sat in a seam between two repos.
@@ -372,7 +372,7 @@ ordinary matrix — and it passes on Windows.
 The whole workspace — 121 tests — passes natively there, including the two that
 had only ever run in CI: a real SEH access violation producing a marker, and our
 PE CodeView parse agreeing with `symbolic` on a real PE. Then the full
-`deployment_e2e.py` round trip against apidev: build with a PDB → upload →
+`deployment_e2e.py` round trip against a live deployment: build with a PDB → upload →
 crash → recover → deliver, twice.
 
 Both events grouped onto **one** issue, and the frames **resolved** —
@@ -422,7 +422,7 @@ can fix.
   settings that were already correct.
 - **Cross-SDK `source_*` adoption** — Android merged (`33a3d6d94`, in
   `origin/master`); iOS on `origin/nextgen` (`c0d4bfbd7`, not yet in
-  `master`/`release`); the contract in `report-bundle-structure` documents the
+  `master`/`release`); the contract in `bugsee/specs` (`sdk/reporting/`) documents the
   **mirror rule** — each `source_*` key is a *copy* of an environment value from
   the same source of truth, never an independent probe, and a producer omits any
   key it has no counterpart for. That is why only Rust emits `source_arch`.
