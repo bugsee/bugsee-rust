@@ -426,9 +426,10 @@ fn child() {
             };
             let _ = recovered.join();
         }
-        // A SIGABRT sent by `kill` while a host handler is recovering a fault is a
-        // crash of its own, not that host's abort. Only the faulting thread can take
-        // it (every other one blocks SIGABRT).
+        // A SIGABRT with `si_code == SI_USER` (what `kill` delivers) reaching a thread
+        // that is inside a host handler is a crash of its own, not that host's abort.
+        // The host forges it at its own thread, so delivery is deterministic: no other
+        // thread is involved and no signal mask is set up.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         "sent_abort_during_recovery" => {
             install_host_with(kill_sending_host, 0);
