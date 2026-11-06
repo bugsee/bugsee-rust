@@ -252,7 +252,9 @@ fn child() {
             }
             // Not the host's page: the host declines, so this one is real.
             // SAFETY: deliberate null write.
-            unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+            unsafe {
+                std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+            };
         }
         // A signal that was only SENT, swallowed by the host's handler.
         "sent_and_swallowed" => {
@@ -267,7 +269,9 @@ fn child() {
             }
             // And the SDK is still armed afterwards.
             // SAFETY: deliberate null write.
-            unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+            unsafe {
+                std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+            };
         }
         // The thread already has a SMALL alternate stack (Rust gives its threads
         // one sized for its own tiny handler). Unwinding in our handler must not

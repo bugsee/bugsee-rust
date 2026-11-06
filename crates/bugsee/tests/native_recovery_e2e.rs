@@ -59,7 +59,7 @@ fn run_as_child_if_requested() {
     std::thread::sleep(Duration::from_millis(300));
 
     unsafe {
-        let p: *mut u8 = std::ptr::null_mut();
+        let p: *mut u8 = std::hint::black_box(std::ptr::null_mut());
         std::ptr::write_volatile(p, 1);
     }
     // Unreachable; if the platform failed to fault, exit cleanly so the parent's

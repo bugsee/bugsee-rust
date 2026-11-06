@@ -130,12 +130,19 @@ jobs:
 
       # --locked forces the committed Cargo.lock: MSRV is only meaningful against
       # the exact dependency graph it was verified with (newer transitive deps can
-      # silently raise the floor). Scope is deliberately lib/bin only (no
-      # --all-targets): MSRV is a promise about the consumer-facing crates, and
-      # dev-deps (proptest, …) may float a higher floor that would give a false
-      # MSRV failure unrelated to what downstreams actually compile.
+      # silently raise the floor). The build step is
+      # deliberately lib/bin only: MSRV is a promise about the consumer-facing
+      # crates. The test-target compile below is a separate step so a dev-dep
+      # raising the floor shows up as its own, clearly-labelled failure.
       - name: Build (MSRV)
         run: cargo build --workspace --locked
+
+      # Older toolchains can reject test code that current stable accepts (e.g.
+      # rustc 1.88's deny-by-default invalid_null_arguments on deliberate null
+      # writes), so compile all test targets on MSRV too. Compile only
+      # (--no-run): a toolchain-compat check, not a second test run.
+      - name: Compile all test targets (MSRV)
+        run: cargo test --workspace --all-targets --locked --no-run
 
   # The mobile targets have a different libc (bionic) and a different Apple
   # sandbox than their desktop cousins, and the crash handler is cfg'd per
