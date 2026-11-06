@@ -2732,10 +2732,23 @@ mod imp {
 
         /// Is this `SIGABRT` raised from inside the host handler we called?
         #[inline(never)]
-        fn aborting_inside_host(tid: i32, sig: libc::c_int) -> bool {
+        fn aborting_inside_host(tid: i32, sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
             if sig != libc::SIGABRT {
                 return false;
             }
+            // `abort()` raises its SIGABRT at its own thread (`tgkill`, never
+            // `kill`). One that was sent with `kill` — by a supervisor, another
+            // process, or another thread — only happens to land on a thread that is
+            // inside a host handler: it is a crash of its own, not the host's
+            // abort, and the recovering fault's report must not be completed in its
+            // place. (Only Linux says how a signal was sent this reliably.)
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // SAFETY: kernel-provided siginfo of a signal we are handling.
+            if unsafe { (*info).si_code } == libc::SI_USER {
+                return false;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let _ = info;
             let Some(slot) = find_chain(tid) else {
                 return false;
             };
@@ -2813,7 +2826,7 @@ mod imp {
                 return;
             }
             let path = MARKER_PATH.load(Ordering::Acquire);
-            if aborting_inside_host(tid, sig) {
+            if aborting_inside_host(tid, sig, info) {
                 unsafe { finish_original_report(tid, path) };
                 return;
             }

@@ -397,6 +397,37 @@ fn child() {
             };
             let _ = recovered.join();
         }
+        // A SIGABRT sent by `kill` while a host handler is recovering a fault is a
+        // crash of its own, not that host's abort. Only the faulting thread can take
+        // it (every other one blocks SIGABRT).
+        "sent_abort_during_recovery" => {
+            install_host_with(aborting_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = guarded_page() as usize;
+            // SAFETY: blocks SIGABRT on this thread only; spawned threads inherit it
+            // and the faulting one unblocks it below.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGABRT);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            }
+            let faulting = std::thread::spawn(move || {
+                // SAFETY: unblocks SIGABRT for this thread, then a deliberate fault
+                // the host recovers from, slowly.
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGABRT);
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                    std::ptr::write_volatile(p as *mut u8, 7);
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            // SAFETY: sends SIGABRT to ourselves the way a supervisor would.
+            unsafe { libc::kill(libc::getpid(), libc::SIGABRT) };
+            let _ = faulting.join();
+        }
         // A host whose handler is one-shot (`SA_RESETHAND`): the kernel would reset
         // it before running it, and so must the SDK when it calls it.
         "one_shot_host" => {
@@ -725,6 +756,19 @@ fn an_abort_from_inside_a_host_completes_the_report_even_when_not_first_in_fligh
         "the aborting fault, not the other thread's recovery, is what died: {marker:?}"
     );
     assert!(marker.contains("frame=0x"), "{marker:?}");
+}
+
+// Linux only: elsewhere a signal that was sent cannot be told from one that was raised.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_sent_abort_during_a_recovery_is_reported_as_the_abort() {
+    child();
+    let (out, marker) = run(
+        "sent_abort_during_recovery",
+        "a_sent_abort_during_a_recovery_is_reported_as_the_abort",
+    );
+    assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
+    assert!(marker.contains("signal=6\n"), "{marker:?}");
 }
 
 #[test]
