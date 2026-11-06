@@ -2730,26 +2730,57 @@ mod imp {
             }
         }
 
+        /// Was this signal sent with `kill` (`SI_USER`)? Only Linux says so reliably:
+        /// `abort()` and `pthread_kill` raise at their own thread (`SI_TKILL`).
+        #[inline(never)]
+        unsafe fn sent_by_kill(info: *const libc::siginfo_t) -> bool {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                // SAFETY: kernel-provided siginfo of the signal being handled.
+                unsafe { (*info).si_code == libc::SI_USER }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                let _ = info;
+                false
+            }
+        }
+
+        /// A SIGABRT that was sent (not the host's `abort()`) is ending the process:
+        /// report it as itself. Header only — the unwind is not async-signal-safe
+        /// and this runs nested inside a host handler, possibly on a small alternate
+        /// stack, where a re-fault would end the process of SIGSEGV instead.
+        #[inline(never)]
+        unsafe fn report_sent_abort(
+            tid: i32,
+            path: *mut Vec<PathChar>,
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            pc: usize,
+        ) {
+            if path.is_null() {
+                return;
+            }
+            lock_writing(tid);
+            if !report_is_complete() {
+                let watchdog = Watchdog::arm();
+                // SAFETY: the path is a leaked box; `info` is the kernel's siginfo.
+                unsafe { write_header(&*path, sig, info, pc) };
+                let generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                OWNER.store(generation, Ordering::Release);
+                FRAMED.store(generation, Ordering::Release);
+                watchdog.disarm();
+            }
+            WRITING.store(0, Ordering::Release);
+            flush_inflight_events();
+        }
+
         /// Is this `SIGABRT` raised from inside the host handler we called?
         #[inline(never)]
-        fn aborting_inside_host(tid: i32, sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
+        fn aborting_inside_host(tid: i32, sig: libc::c_int) -> bool {
             if sig != libc::SIGABRT {
                 return false;
             }
-            // `abort()` raises its SIGABRT at its own thread (`tgkill`, never
-            // `kill`). One that was sent with `kill` — by a supervisor, another
-            // process, or another thread — only happens to land on a thread that is
-            // inside a host handler: it is a crash of its own, not the host's
-            // abort, and the recovering fault's report must not be completed in its
-            // place. (Only Linux says how a signal was sent this reliably; for the
-            // rest, and for `pthread_kill`, the caller ends the process anyway.)
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            // SAFETY: kernel-provided siginfo of a signal we are handling.
-            if unsafe { (*info).si_code } == libc::SI_USER {
-                return false;
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let _ = info;
             let Some(slot) = find_chain(tid) else {
                 return false;
             };
@@ -2827,16 +2858,24 @@ mod imp {
                 return;
             }
             let path = MARKER_PATH.load(Ordering::Acquire);
-            if aborting_inside_host(tid, sig, info) {
-                unsafe { finish_original_report(tid, path) };
-                // The host's `abort()` ends the process as soon as this returns
-                // (glibc puts the default action back and raises again), so doing
-                // it here changes nothing for a real abort. What it adds: a SIGABRT
-                // that was merely sent to this thread while it is inside a host
-                // handler (`pthread_kill`, which looks exactly like `abort()`'s
-                // own raise; or `kill` where `si_code` cannot say) is not
-                // swallowed, with the host then recovering and the process
-                // carrying on past an abort.
+            if aborting_inside_host(tid, sig) {
+                // A SIGABRT inside the host handler we called is, nearly always,
+                // that host's own `abort()`: the process is dying of the fault it
+                // was recovering, whose report is still missing its frames.
+                //
+                // It can also be a SIGABRT merely SENT to this thread while it is in
+                // the host (`kill` by a supervisor or another thread, which only
+                // happens to land here; `pthread_kill`, which looks exactly like
+                // `abort()`'s own raise). Linux says when it was `kill`: that is a
+                // crash of its own, and the recovering fault's report must not
+                // stand in for it. Either way the process ends of SIGABRT right
+                // here, as `abort()` would a moment later, so nothing is swallowed.
+                if unsafe { sent_by_kill(info) } {
+                    let regs = unsafe { regs_of(uc) };
+                    unsafe { report_sent_abort(tid, path, sig, info, regs.pc) };
+                } else {
+                    unsafe { finish_original_report(tid, path) };
+                }
                 unsafe { die_of(sig, info) };
                 return;
             }

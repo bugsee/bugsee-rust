@@ -145,6 +145,35 @@ extern "C" fn aborting_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut 
     }
 }
 
+/// A host that, while recovering its guard-page fault, is sent a SIGABRT the way
+/// `kill` delivers one (`si_code == SI_USER`). The kernel only lets a thread forge
+/// that for ITSELF, hence a handler that signals its own thread: the same thing a
+/// `kill` from a supervisor does when it happens to be taken by a thread that is
+/// inside a host handler.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn kill_sending_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // SAFETY: async-signal-safe syscalls on a page this process mapped.
+    unsafe {
+        let addr = (*info).si_addr() as usize & !4095;
+        if addr == PAGE.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut si: libc::siginfo_t = std::mem::zeroed();
+            si.si_signo = libc::SIGABRT;
+            si.si_code = libc::SI_USER;
+            libc::syscall(
+                libc::SYS_rt_tgsigqueueinfo,
+                libc::getpid() as libc::c_long,
+                libc::syscall(libc::SYS_gettid) as libc::c_long,
+                libc::SIGABRT as libc::c_long,
+                &si as *const libc::siginfo_t,
+            );
+            // Reached only if the process lives: the host then recovers.
+            libc::mprotect(addr as *mut _, 4096, libc::PROT_READ | libc::PROT_WRITE);
+        } else {
+            libc::abort();
+        }
+    }
+}
+
 /// What a host installed AFTER the SDK saw as the previous handler (the SDK's).
 static CHAIN_PREV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -400,33 +429,15 @@ fn child() {
         // A SIGABRT sent by `kill` while a host handler is recovering a fault is a
         // crash of its own, not that host's abort. Only the faulting thread can take
         // it (every other one blocks SIGABRT).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         "sent_abort_during_recovery" => {
-            install_host_with(aborting_host, 0);
+            install_host_with(kill_sending_host, 0);
             let _h = bugsee_native::install(marker.clone()).unwrap();
-            let p = guarded_page() as usize;
-            // SAFETY: blocks SIGABRT on this thread only; spawned threads inherit it
-            // and the faulting one unblocks it below.
-            unsafe {
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                libc::sigaddset(&mut set, libc::SIGABRT);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-            }
-            let faulting = std::thread::spawn(move || {
-                // SAFETY: unblocks SIGABRT for this thread, then a deliberate fault
-                // the host recovers from, slowly.
-                unsafe {
-                    let mut set: libc::sigset_t = std::mem::zeroed();
-                    libc::sigemptyset(&mut set);
-                    libc::sigaddset(&mut set, libc::SIGABRT);
-                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-                    std::ptr::write_volatile(p as *mut u8, 7);
-                }
-            });
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            // SAFETY: sends SIGABRT to ourselves the way a supervisor would.
-            unsafe { libc::kill(libc::getpid(), libc::SIGABRT) };
-            let _ = faulting.join();
+            let p = guarded_page();
+            // SAFETY: deliberate fault; the host handler is sent a SIGABRT (as `kill`
+            // would deliver it) while it is recovering.
+            unsafe { std::ptr::write_volatile(p, 7) };
+            say("SURVIVED");
         }
         // A SIGABRT sent to the faulting thread with `pthread_kill` while its host
         // handler is recovering looks exactly like the host's own `abort()`. The
@@ -787,8 +798,17 @@ fn a_sent_abort_during_a_recovery_is_reported_as_the_abort() {
         "sent_abort_during_recovery",
         "a_sent_abort_during_a_recovery_is_reported_as_the_abort",
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SURVIVED"),
+        "the abort was swallowed: {stdout}"
+    );
     assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
     assert!(marker.contains("signal=6\n"), "{marker:?}");
+    // Header only: the first frame is the PC in the header. Unwinding from inside a
+    // host handler (possibly on a small alternate stack) is what could re-fault and
+    // end the process of SIGSEGV, so nothing is unwound here.
+    assert_eq!(marker.matches("frame=0x").count(), 1, "{marker:?}");
 }
 
 #[test]
