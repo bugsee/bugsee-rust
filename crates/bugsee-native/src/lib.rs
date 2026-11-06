@@ -2173,10 +2173,15 @@ mod imp {
             unsafe {
                 let prev = (*PREVIOUS.0.get()).as_mut_ptr().cast::<libc::sigaction>();
                 let mut sa: libc::sigaction = core::mem::zeroed();
+                // Nothing is added to the mask: the kernel blocks the delivered
+                // signal itself, and that is all. Whatever else the thread had
+                // blocked stays blocked, and nothing more does. The host handler we
+                // chain to then runs under the mask it would have had if it had
+                // been called directly, so a host that `abort()`s from inside its
+                // handler delivers SIGABRT to us (glibc 2.41 no longer unblocks it
+                // for the caller). A fault while we write the marker is caught by
+                // the `WRITING` latch, not by the mask.
                 libc::sigemptyset(&mut sa.sa_mask);
-                for sig in SIGNALS {
-                    libc::sigaddset(&mut sa.sa_mask, sig);
-                }
                 sa.sa_sigaction = handler as *const () as usize;
                 sa.sa_flags = libc::SA_ONSTACK | libc::SA_SIGINFO;
                 ARMED.store(1, Ordering::Release);
