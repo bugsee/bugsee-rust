@@ -357,7 +357,7 @@ fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
                 (rest.starts_with(b"or") && !rest.starts_with(b"oriz"))
                     || rest.starts_with(b"enticat")
                     || (rest.starts_with(b"orization")
-                        && [&b"endpoint"[..], b"url", b"uri"]
+                        && [&b"endpoint"[..], b"url", b"uri", b"requestendpoint"]
                             .iter()
                             .any(|x| rest[9..].starts_with(x)))
                     || (before.ends_with(b"o") && public_oauth_suffix(rest))
@@ -386,6 +386,11 @@ fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
                     b"ttl",
                     b"scope",
                     b"kind",
+                    // OIDC discovery: `id_token_signing_alg_values_supported`
+                    // and the `_encryption_alg`/`_encryption_enc` siblings.
+                    b"signingalg",
+                    b"encryptionalg",
+                    b"encryptionenc",
                 ]
                 .iter()
                 .any(|x| rest.starts_with(x))
@@ -405,6 +410,10 @@ fn stem_hit(n: &[u8], stem: &[u8]) -> bool {
                 b"ttl",
                 b"age",
                 b"expir",
+                // OIDC session management: `end_session_endpoint`,
+                // `check_session_iframe`.
+                b"endpoint",
+                b"iframe",
             ]
             .iter()
             .any(|x| rest.starts_with(x)),
@@ -834,6 +843,7 @@ impl Scrubber {
             b"bearer",
             b"basic",
             b"jwt",
+            b"verifier",
             b"pin",
             b"otp",
             b"sk-",
@@ -2133,6 +2143,12 @@ mod tests {
             "CancellationToken",
             "www-authenticate",
             "WWW-Authenticate",
+            "end_session_endpoint",
+            "check_session_iframe",
+            "id_token_signing_alg_values_supported",
+            "id_token_encryption_alg_values_supported",
+            "id_token_encryption_enc_values_supported",
+            "pushed_authorization_request_endpoint",
             "token_endpoint",
             "token_url",
             "token_uri",
@@ -2168,6 +2184,10 @@ mod tests {
             "x-api-key",
             "PWD",
             "p_w_d_token",
+            "session_endpoint_token",
+            "id_token_signing_secret",
+            "authorization_request_token",
+            "pushed_authorization_request",
         ] {
             assert!(is_sensitive_key(k), "{k}");
         }
@@ -2208,12 +2228,30 @@ mod tests {
             r#"{"card":4111111111111111}"#,
             r#"{"m":"/home/bob/x"}"#,
             r#"{"m":"Authorization: Bearer abc123"}"#,
+            r#"{"oauth_verifier":"x"}"#,
+            r#"{"m":"code_verifier=abcXYZ123"}"#,
         ] {
             if sc.scrub_json_bytes(rec.as_bytes()).is_some() {
                 assert!(sc.might_match(rec.as_bytes()), "{rec}");
             }
         }
+        // A verifier-only record must be scrubbed, so it must not be skipped.
+        let rec = br#"{"code_verifier":"x"}"#;
+        assert!(sc.scrub_json_bytes(rec).is_some());
+        assert!(sc.might_match(rec));
         assert!(!sc.might_match(br#"{"timestamp":1,"level":2,"message":"connection reset"}"#));
+    }
+
+    /// Every key stem the matcher knows must also be a prefilter trigger, or a
+    /// record carrying only that key would be skipped unscrubbed.
+    #[test]
+    fn prefilter_covers_every_key_stem() {
+        let sc = Scrubber::default();
+        for k in STEMS.iter().chain(TEXT_STRONG).chain(EXACT) {
+            // The value must carry no prefilter trigger of its own.
+            let rec = format!(r#"{{"{k}":"zzzz"}}"#);
+            assert!(sc.might_match(rec.as_bytes()), "{k}");
+        }
     }
 
     /// Deterministic pseudo-random (xorshift) soup of every trigger fragment.
