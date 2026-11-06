@@ -428,6 +428,26 @@ fn child() {
             unsafe { libc::kill(libc::getpid(), libc::SIGABRT) };
             let _ = faulting.join();
         }
+        // A SIGABRT sent to the faulting thread with `pthread_kill` while its host
+        // handler is recovering looks exactly like the host's own `abort()`. The
+        // process must still end of SIGABRT, not carry on once the host recovers.
+        "pthread_killed_abort_during_recovery" => {
+            install_host_with(aborting_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = guarded_page();
+            // SAFETY: the id of this (the installing) thread, which the helper
+            // signals while it is inside the host handler below.
+            let me = unsafe { libc::pthread_self() } as usize;
+            let helper = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                // SAFETY: signals the thread that is inside the host handler.
+                unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGABRT) };
+            });
+            // SAFETY: deliberate fault the host recovers from, slowly.
+            unsafe { std::ptr::write_volatile(p, 7) };
+            let _ = helper.join();
+            say("SURVIVED");
+        }
         // A host whose handler is one-shot (`SA_RESETHAND`): the kernel would reset
         // it before running it, and so must the SDK when it calls it.
         "one_shot_host" => {
@@ -769,6 +789,21 @@ fn a_sent_abort_during_a_recovery_is_reported_as_the_abort() {
     );
     assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
     assert!(marker.contains("signal=6\n"), "{marker:?}");
+}
+
+#[test]
+fn a_thread_directed_abort_during_a_recovery_still_ends_the_process() {
+    child();
+    let (out, _marker) = run(
+        "pthread_killed_abort_during_recovery",
+        "a_thread_directed_abort_during_a_recovery_still_ends_the_process",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SURVIVED"),
+        "the abort was swallowed: {stdout}"
+    );
+    assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
 }
 
 #[test]

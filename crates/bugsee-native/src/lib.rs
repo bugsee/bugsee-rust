@@ -2741,7 +2741,8 @@ mod imp {
             // process, or another thread — only happens to land on a thread that is
             // inside a host handler: it is a crash of its own, not the host's
             // abort, and the recovering fault's report must not be completed in its
-            // place. (Only Linux says how a signal was sent this reliably.)
+            // place. (Only Linux says how a signal was sent this reliably; for the
+            // rest, and for `pthread_kill`, the caller ends the process anyway.)
             #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: kernel-provided siginfo of a signal we are handling.
             if unsafe { (*info).si_code } == libc::SI_USER {
@@ -2828,6 +2829,15 @@ mod imp {
             let path = MARKER_PATH.load(Ordering::Acquire);
             if aborting_inside_host(tid, sig, info) {
                 unsafe { finish_original_report(tid, path) };
+                // The host's `abort()` ends the process as soon as this returns
+                // (glibc puts the default action back and raises again), so doing
+                // it here changes nothing for a real abort. What it adds: a SIGABRT
+                // that was merely sent to this thread while it is inside a host
+                // handler (`pthread_kill`, which looks exactly like `abort()`'s
+                // own raise; or `kill` where `si_code` cannot say) is not
+                // swallowed, with the host then recovering and the process
+                // carrying on past an abort.
+                unsafe { die_of(sig, info) };
                 return;
             }
 
