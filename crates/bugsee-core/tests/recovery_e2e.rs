@@ -640,6 +640,72 @@ fn a_logout_whose_old_file_cannot_be_removed_is_retried_until_it_is_gone() {
     drop(recorder);
 }
 
+/// A recorder whose `scope.json` slot holds a directory, so every rename onto it
+/// (and every unlink of it) fails while temp files still write: the state of a
+/// destination held open by a scanner. Returns the recorder and the scope path.
+#[cfg(unix)]
+fn recorder_with_unreplaceable_scope_file(dir: &TempDir) -> (Recorder, PathBuf) {
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+    std::fs::remove_file(&scope_file).unwrap();
+    std::fs::create_dir(&scope_file).unwrap();
+    (recorder, scope_file)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kept_temp_file_survives_a_later_write_that_stages_nothing_if_it_only_lacks_things() {
+    use bugsee_core::model::scope::Scope;
+    let dir = TempDir::new();
+    let (recorder, scope_file) = recorder_with_unreplaceable_scope_file(&dir);
+    // B is fully written to a temp file but cannot be renamed into place.
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    assert_eq!(
+        Scope::load_recovering(&scope_file)
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("b@example.com")
+    );
+    // The next change only adds to B but cannot be staged (over the cap): the
+    // kept temp still lacks only that, so it must not be swept away.
+    recorder.with_scope(|s| s.set_attribute("big", Value::from("x".repeat(2 << 20))));
+    assert_eq!(
+        Scope::load_recovering(&scope_file)
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("b@example.com"),
+        "the newest complete snapshot survives"
+    );
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kept_temp_file_is_dropped_when_a_later_failed_write_changes_the_identity() {
+    use bugsee_core::model::scope::Scope;
+    let dir = TempDir::new();
+    let (recorder, scope_file) = recorder_with_unreplaceable_scope_file(&dir);
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    // The identity moves on to C but C cannot be staged: the kept temp now names
+    // someone else, and reporting less beats reporting B.
+    recorder.with_scope(|s| {
+        s.set_email(Some("c@example.com".into()));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    assert!(
+        Scope::load_recovering(&scope_file).is_none(),
+        "no stale identity is left to recover"
+    );
+    drop(recorder);
+}
+
 #[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.

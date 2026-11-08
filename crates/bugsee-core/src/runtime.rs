@@ -378,6 +378,9 @@ struct ScopeWritten {
     path: Option<PathBuf>,
     /// The scope on disk at `path` (empty when there is no file).
     scope: Scope,
+    /// A temp file a failed rename left behind, with its version and scope: the
+    /// newest complete snapshot, which recovery prefers over `scope.json`.
+    kept_tmp: Option<(u64, Scope)>,
 }
 
 impl Shared {
@@ -446,17 +449,39 @@ impl Shared {
         // otherwise (an identity, label or attribute changed or went away) remove
         // it, so a crash reports less rather than something wrong.
         let same_file = written.path.as_ref() == Some(&path);
+        if !same_file {
+            written.kept_tmp = None;
+        }
         let keep_stale = same_file && snapshot.extends(&written.scope);
         let transient = !matches!(staged, Staged::TooLarge);
+        let was_ready = matches!(staged, Staged::Ready(_));
+        let was_remove = matches!(staged, Staged::Remove);
         let result = staged.commit(&path, version, keep_stale);
+        // Temp files below this version can no longer win. A write that stages
+        // nothing (too large, or the disk refused) is no newer than a temp file a
+        // failed rename left earlier, so that one stays while the new scope only
+        // adds to it, and goes once the scope moves on (an identity change must
+        // not leave the previous one to be recovered).
+        let mut sweep_floor = version;
         match result {
             Ok(()) => {
+                written.kept_tmp = None;
                 self.scope_lagging.store(false, Ordering::Relaxed);
                 self.scope_retry_at.store(0, Ordering::Relaxed);
                 written.path = Some(path.clone());
                 written.scope = snapshot;
             }
             Err(_) => {
+                if was_ready {
+                    written.kept_tmp = Some((version, snapshot.clone()));
+                } else if was_remove {
+                    written.kept_tmp = None;
+                } else if let Some((kept_version, kept)) = written.kept_tmp.take() {
+                    if snapshot.extends(&kept) {
+                        sweep_floor = kept_version;
+                        written.kept_tmp = Some((kept_version, kept));
+                    }
+                }
                 // Not keeping the old file means removing it; if that unlink
                 // failed too (read-only directory, a scanner holding it open) the
                 // old scope is still on disk, so remember it as such.
@@ -480,10 +505,9 @@ impl Shared {
                 );
             }
         }
-        // Temp files of older versions can no longer win; the scan runs outside
-        // the ordering lock (it also takes fork prepare).
+        // The scan runs outside the ordering lock (it also takes fork prepare).
         drop(written);
-        Scope::sweep_older(&path, version);
+        Scope::sweep_older(&path, sweep_floor);
     }
 
     /// Point scope persistence at `path` and write the current scope there (a
