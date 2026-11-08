@@ -145,6 +145,35 @@ extern "C" fn aborting_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut 
     }
 }
 
+/// A host that, while recovering its guard-page fault, is sent a SIGABRT the way
+/// `kill` delivers one (`si_code == SI_USER`). The kernel only lets a thread forge
+/// that for ITSELF, hence a handler that signals its own thread: the same thing a
+/// `kill` from a supervisor does when it happens to be taken by a thread that is
+/// inside a host handler.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn kill_sending_host(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // SAFETY: async-signal-safe syscalls on a page this process mapped.
+    unsafe {
+        let addr = (*info).si_addr() as usize & !4095;
+        if addr == PAGE.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut si: libc::siginfo_t = std::mem::zeroed();
+            si.si_signo = libc::SIGABRT;
+            si.si_code = libc::SI_USER;
+            libc::syscall(
+                libc::SYS_rt_tgsigqueueinfo,
+                libc::getpid() as libc::c_long,
+                libc::syscall(libc::SYS_gettid) as libc::c_long,
+                libc::SIGABRT as libc::c_long,
+                &si as *const libc::siginfo_t,
+            );
+            // Reached only if the process lives: the host then recovers.
+            libc::mprotect(addr as *mut _, 4096, libc::PROT_READ | libc::PROT_WRITE);
+        } else {
+            libc::abort();
+        }
+    }
+}
+
 /// What a host installed AFTER the SDK saw as the previous handler (the SDK's).
 static CHAIN_PREV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -400,6 +429,40 @@ fn child() {
                 std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
             };
             let _ = recovered.join();
+        }
+        // A SIGABRT with `si_code == SI_USER` (what `kill` delivers) reaching a thread
+        // that is inside a host handler is a crash of its own, not that host's abort.
+        // The host forges it at its own thread, so delivery is deterministic: no other
+        // thread is involved and no signal mask is set up.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "sent_abort_during_recovery" => {
+            install_host_with(kill_sending_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = guarded_page();
+            // SAFETY: deliberate fault; the host handler is sent a SIGABRT (as `kill`
+            // would deliver it) while it is recovering.
+            unsafe { std::ptr::write_volatile(p, 7) };
+            say("SURVIVED");
+        }
+        // A SIGABRT sent to the faulting thread with `pthread_kill` while its host
+        // handler is recovering looks exactly like the host's own `abort()`. The
+        // process must still end of SIGABRT, not carry on once the host recovers.
+        "pthread_killed_abort_during_recovery" => {
+            install_host_with(aborting_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            let p = guarded_page();
+            // SAFETY: the id of this (the installing) thread, which the helper
+            // signals while it is inside the host handler below.
+            let me = unsafe { libc::pthread_self() } as usize;
+            let helper = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                // SAFETY: signals the thread that is inside the host handler.
+                unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGABRT) };
+            });
+            // SAFETY: deliberate fault the host recovers from, slowly.
+            unsafe { std::ptr::write_volatile(p, 7) };
+            let _ = helper.join();
+            say("SURVIVED");
         }
         // A host whose handler is one-shot (`SA_RESETHAND`): the kernel would reset
         // it before running it, and so must the SDK when it calls it.
@@ -729,6 +792,43 @@ fn an_abort_from_inside_a_host_completes_the_report_even_when_not_first_in_fligh
         "the aborting fault, not the other thread's recovery, is what died: {marker:?}"
     );
     assert!(marker.contains("frame=0x"), "{marker:?}");
+}
+
+// Linux only: elsewhere a signal that was sent cannot be told from one that was raised.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_sent_abort_during_a_recovery_is_reported_as_the_abort() {
+    child();
+    let (out, marker) = run(
+        "sent_abort_during_recovery",
+        "a_sent_abort_during_a_recovery_is_reported_as_the_abort",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SURVIVED"),
+        "the abort was swallowed: {stdout}"
+    );
+    assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
+    assert!(marker.contains("signal=6\n"), "{marker:?}");
+    // Header only: the first frame is the PC in the header. Unwinding from inside a
+    // host handler (possibly on a small alternate stack) is what could re-fault and
+    // end the process of SIGSEGV, so nothing is unwound here.
+    assert_eq!(marker.matches("frame=0x").count(), 1, "{marker:?}");
+}
+
+#[test]
+fn a_thread_directed_abort_during_a_recovery_still_ends_the_process() {
+    child();
+    let (out, _marker) = run(
+        "pthread_killed_abort_during_recovery",
+        "a_thread_directed_abort_during_a_recovery_still_ends_the_process",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SURVIVED"),
+        "the abort was swallowed: {stdout}"
+    );
+    assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
 }
 
 #[test]
