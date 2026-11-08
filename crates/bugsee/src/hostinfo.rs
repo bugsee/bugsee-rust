@@ -6,7 +6,8 @@
 //
 
 //! Per-platform host facts that neither `std` nor `sysinfo` expose: the local
-//! UTC offset, the hardware model, and the Windows user locale.
+//! UTC offset, the hardware model and manufacturer, and the user locale on the
+//! platforms where the POSIX environment says nothing (Windows, Apple).
 //!
 //! This is the one place in the host crate that calls into the OS directly, so
 //! the `unsafe` is confined here and kept to single FFI calls with no
@@ -44,11 +45,20 @@ pub(crate) fn hardware_model() -> Option<String> {
     imp::hardware_model()
 }
 
+/// The hardware manufacturer, e.g. `Apple`, `LENOVO`, `samsung`.
+///
+/// Linux reads the DMI `sys_vendor`, Windows the SMBIOS `SystemManufacturer`
+/// registry value, Android `ro.product.manufacturer`; Apple platforms are
+/// always `Apple`. Firmware placeholders are reported as absent, as for
+/// [`hardware_model`]. ARM boards that only have a device tree report none.
+pub(crate) fn manufacturer() -> Option<String> {
+    imp::manufacturer()
+}
+
 /// The user's locale from the OS settings, in the `en_US` form, for when the
-/// POSIX environment variables the caller already reads say nothing. Only
-/// Windows has such a setting wired up. macOS GUI apps and iOS do not set
-/// `LANG` either, so they currently report no locale; reading the preferred
-/// language from CoreFoundation is a follow-up.
+/// POSIX environment variables the caller already reads say nothing: Windows
+/// reads the user's UI language, and macOS GUI apps and iOS (which do not set
+/// `LANG`) read the preferred language from CoreFoundation.
 pub(crate) fn locale() -> Option<String> {
     imp::locale()
 }
@@ -61,9 +71,11 @@ pub(crate) fn locale() -> Option<String> {
 fn clean_model(raw: &str) -> Option<String> {
     let value = raw.replace('\0', "");
     let value = value.trim();
-    const PLACEHOLDERS: [&str; 11] = [
+    const PLACEHOLDERS: [&str; 13] = [
         "to be filled by o.e.m.",
         "system product name",
+        "system manufacturer",
+        "oem",
         "default string",
         "not specified",
         "not applicable",
@@ -87,7 +99,7 @@ fn clean_model(raw: &str) -> Option<String> {
 /// digits; a tag without one (`fr`, `sr-Latn`) yields the bare language.
 /// Anything from a `_` on (`de-DE_phoneb`, a Windows sort-order suffix) is cut
 /// first.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_vendor = "apple")), allow(dead_code))]
 fn locale_from_bcp47(tag: &str) -> Option<String> {
     let tag = tag.split('_').next().unwrap_or("");
     let mut parts = tag.split('-');
@@ -200,11 +212,10 @@ mod imp {
         clean_model(&String::from_utf8_lossy(&buf))
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     pub(super) fn hardware_model() -> Option<String> {
         // DMI covers x86 servers and laptops; the device tree covers ARM
-        // boards (Raspberry Pi and friends), which have no DMI. Android exposes
-        // neither to an app, so it reports nothing here.
+        // boards (Raspberry Pi and friends), which have no DMI.
         [
             "/sys/class/dmi/id/product_name",
             "/sys/firmware/devicetree/base/model",
@@ -213,6 +224,95 @@ mod imp {
         .find_map(|path| clean_model(&std::fs::read_to_string(path).ok()?))
     }
 
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+    pub(super) fn manufacturer() -> Option<String> {
+        clean_model(&std::fs::read_to_string("/sys/class/dmi/id/sys_vendor").ok()?)
+    }
+
+    /// Android exposes neither DMI nor a device tree to an app, but the
+    /// `ro.product.*` build properties are world-readable through bionic.
+    #[cfg(target_os = "android")]
+    fn system_property(name: &std::ffi::CStr) -> Option<String> {
+        // PROP_VALUE_MAX: the value buffer bionic requires, terminator included.
+        let mut buf = [0u8; 92];
+        // SAFETY: `name` is NUL-terminated and `buf` is the PROP_VALUE_MAX
+        // bytes the function is documented to write at most.
+        let n = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr().cast()) };
+        if n <= 0 {
+            return None;
+        }
+        clean_model(&String::from_utf8_lossy(
+            &buf[..(n as usize).min(buf.len() - 1)],
+        ))
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn hardware_model() -> Option<String> {
+        system_property(c"ro.product.model")
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn manufacturer() -> Option<String> {
+        system_property(c"ro.product.manufacturer")
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn manufacturer() -> Option<String> {
+        Some("Apple".to_string())
+    }
+
+    /// The preferred language from CoreFoundation, which is what the system
+    /// settings show (`en-US`, `zh-Hans-CN`). Bare-language answers (`en`)
+    /// pass through as the bare language. Declared by hand like the Win32
+    /// calls; CoreFoundation is public API on every Apple OS.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn locale() -> Option<String> {
+        use std::ffi::c_void;
+        type CFIndex = isize;
+        const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFLocaleCopyPreferredLanguages() -> *const c_void;
+            fn CFArrayGetCount(array: *const c_void) -> CFIndex;
+            fn CFArrayGetValueAtIndex(array: *const c_void, idx: CFIndex) -> *const c_void;
+            fn CFStringGetCString(
+                s: *const c_void,
+                buf: *mut libc::c_char,
+                size: CFIndex,
+                encoding: u32,
+            ) -> u8;
+            fn CFRelease(cf: *const c_void);
+        }
+
+        // SAFETY: "Copy" returns a +1 array that we release exactly once; the
+        // element is borrowed from it (so only read before the release); the
+        // buffer is the size passed to `CFStringGetCString`.
+        let tag = unsafe {
+            let langs = CFLocaleCopyPreferredLanguages();
+            if langs.is_null() {
+                return None;
+            }
+            let mut buf = [0 as libc::c_char; 128];
+            let tag = if CFArrayGetCount(langs) > 0 {
+                let first = CFArrayGetValueAtIndex(langs, 0);
+                (!first.is_null()
+                    && CFStringGetCString(first, buf.as_mut_ptr(), buf.len() as CFIndex, UTF8) != 0)
+                    .then(|| {
+                        std::ffi::CStr::from_ptr(buf.as_ptr())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+            } else {
+                None
+            };
+            CFRelease(langs);
+            tag
+        };
+        super::locale_from_bcp47(&tag?)
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
     pub(super) fn locale() -> Option<String> {
         None
     }
@@ -310,9 +410,17 @@ mod imp {
     }
 
     pub(super) fn hardware_model() -> Option<String> {
-        // The SMBIOS product name Windows caches at boot.
+        bios_string("SystemProductName")
+    }
+
+    pub(super) fn manufacturer() -> Option<String> {
+        bios_string("SystemManufacturer")
+    }
+
+    /// An SMBIOS string Windows caches in the registry at boot.
+    fn bios_string(name: &str) -> Option<String> {
         let subkey = wide(r"HARDWARE\DESCRIPTION\System\BIOS");
-        let value = wide("SystemProductName");
+        let value = wide(name);
         let mut len: u32 = 0;
         // SAFETY: a null buffer asks for the required size (in bytes) only.
         let rc = unsafe {
@@ -407,6 +515,9 @@ mod imp {
     pub(super) fn hardware_model() -> Option<String> {
         None
     }
+    pub(super) fn manufacturer() -> Option<String> {
+        None
+    }
     pub(super) fn locale() -> Option<String> {
         None
     }
@@ -481,6 +592,39 @@ mod tests {
         assert!(model.contains(','), "expected e.g. MacBookPro18,3: {model}");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reports_apple_and_a_preferred_language() {
+        assert_eq!(manufacturer().as_deref(), Some("Apple"));
+        // The form must be language[_REGION], never a dashed BCP-47 tag.
+        let loc = locale().expect("CoreFoundation preferred language must resolve");
+        assert!(!loc.contains('-') && loc.len() >= 2, "{loc}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_manufacturer_and_model_match_dmi_when_present() {
+        // Containers and VMs often have no DMI, so absence is legitimate; what
+        // must hold is that a readable, non-placeholder file is reported
+        // verbatim (trimmed) and that nothing is invented without one.
+        let read = |p: &str| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|r| clean_model(&r))
+        };
+        assert_eq!(manufacturer(), read("/sys/class/dmi/id/sys_vendor"));
+        if let Some(expected) = read("/sys/class/dmi/id/product_name") {
+            assert_eq!(hardware_model(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn manufacturer_placeholders_are_reported_as_absent() {
+        for raw in ["System manufacturer", "OEM", "To Be Filled By O.E.M."] {
+            assert_eq!(clean_model(raw), None, "{raw:?}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_bias_is_negated_and_daylight_adjusted() {
@@ -518,7 +662,7 @@ mod tests {
         assert!(locale.len() >= 2, "{locale}");
         // Model may legitimately be absent on a VM with placeholder SMBIOS, so
         // only assert it never comes back as a placeholder.
-        if let Some(m) = hardware_model() {
+        for m in [hardware_model(), manufacturer()].into_iter().flatten() {
             assert_eq!(clean_model(&m).as_deref(), Some(m.as_str()));
         }
     }

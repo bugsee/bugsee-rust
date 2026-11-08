@@ -125,6 +125,31 @@ fn full_public_api_flow() {
         "platform.type must be OS-typed, got {platform_type}"
     );
 
+    // The host facts gathered at launch reach the wire under the contract's
+    // keys. Only what every desktop host resolves is required everywhere;
+    // locale (needs `LANG` on Linux) and model/manufacturer (no DMI in
+    // containers) are asserted where the platform guarantees them.
+    #[cfg(feature = "telemetry")]
+    {
+        let platform = &req["environment"]["platform"];
+        assert!(platform["utc_offset"].is_i64(), "{platform}");
+        assert!(
+            platform["memory_total"].as_u64().unwrap_or(0) > 0,
+            "{platform}"
+        );
+        assert!(platform["version"].is_string(), "{platform}");
+        #[cfg(target_os = "macos")]
+        {
+            let hw = &req["environment"]["hardware"];
+            assert_eq!(hw["manufacturer"], "Apple", "{hw}");
+            assert!(
+                hw["model"].as_str().is_some_and(|m| m.contains(',')),
+                "{hw}"
+            );
+            assert!(platform["locale"].is_string(), "{platform}");
+        }
+    }
+
     let mut mbytes = Vec::new();
     zip.by_name("manifest.json")
         .unwrap()
