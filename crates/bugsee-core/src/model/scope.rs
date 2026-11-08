@@ -13,7 +13,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 /// Ambient enrichment applied to reports.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scope {
     /// User identifier → `request.json.email`.
     pub email: Option<String>,
@@ -165,6 +165,7 @@ mod tests {
         let mut small = Scope::default();
         small.set_email(Some("a@b.c".into()));
         assert!(small.persist(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]

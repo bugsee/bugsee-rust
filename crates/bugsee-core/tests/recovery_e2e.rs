@@ -481,7 +481,11 @@ fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     let recorder =
         Recorder::launch(RecorderConfig::new(&dir2.path, "TOKEN"), transport.clone()).unwrap();
     // This run's own scope must not leak into the recovered crash.
-    recorder.with_scope(|s| s.set_email(Some("new-run@example.com".into())));
+    recorder.with_scope(|s| {
+        s.set_email(Some("new-run@example.com".into()));
+        s.labels.push("new-run-label".into());
+        s.set_attribute("new_run_attr", Value::from(true));
+    });
     assert!(recorder.flush(Duration::from_secs(5)));
 
     let bundles = transport.uploaded_bundles.lock().unwrap();
@@ -490,6 +494,7 @@ fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     assert_eq!(req["email"], "crashed@example.com");
     assert_eq!(req["labels"], serde_json::json!(["beta"]));
     assert_eq!(manifest["attrs"]["plan"], "pro");
+    assert!(manifest["attrs"].get("new_run_attr").is_none());
     drop(bundles);
     assert!(!dir2.path.join("parts/1").exists());
     drop(recorder);

@@ -348,9 +348,13 @@ impl Shared {
     /// crash path never touches it); best-effort, since scope is enrichment.
     fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
         let mut guard = self.scope.lock();
+        let before = guard.clone();
         let result = f(&mut guard);
-        if let Some(path) = self.scope_file.lock().as_ref() {
-            let _ = guard.persist(path);
+        // Only a real change is written (hosts may set the same value per request).
+        if *guard != before {
+            if let Some(path) = self.scope_file.lock().as_ref() {
+                let _ = guard.persist(path);
+            }
         }
         result
     }
