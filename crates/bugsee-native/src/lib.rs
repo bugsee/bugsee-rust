@@ -2808,6 +2808,12 @@ mod imp {
         /// The cost: a fault the host would have recovered also pays an unwind and a
         /// marker append on such a thread (it is deleted again afterwards). On a big
         /// alternate stack, or the thread's own stack, it pays nothing extra.
+        ///
+        /// Known limits: if the unwind itself does not fit a very small alternate
+        /// stack, a fault the host would have recovered ends the process (as a
+        /// stack overflow already could). And only the first fault in flight is
+        /// completed early; a nested abort of a later one still unwinds inside the
+        /// nested handler.
         #[inline(never)]
         fn must_complete_before_host(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
             // SAFETY: kernel-provided siginfo.
