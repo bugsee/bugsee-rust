@@ -409,13 +409,16 @@ impl Shared {
         result
     }
 
-    /// A non-empty scope whose session file is gone. Scope lock held.
+    /// The session file needs another attempt with nothing changed: it lags the
+    /// in-memory scope after a failed write (including a failed removal, which
+    /// matters for an empty scope: a logged-out identity must not linger), or a
+    /// non-empty scope's file is gone. Scope lock held.
     fn scope_file_missing(&self, scope: &Scope) -> bool {
-        !scope.is_empty()
-            && !self.scope_unpersistable.load(Ordering::Relaxed)
+        !self.scope_unpersistable.load(Ordering::Relaxed)
             && scope_retry_due(self.scope_retry_at.load(Ordering::Relaxed), epoch_ms())
             && (self.scope_lagging.load(Ordering::Relaxed)
-                || self.scope_file.lock().as_ref().is_some_and(|p| !p.exists()))
+                || (!scope.is_empty()
+                    && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())))
     }
 
     /// A versioned snapshot to persist, or `None` without a session file.

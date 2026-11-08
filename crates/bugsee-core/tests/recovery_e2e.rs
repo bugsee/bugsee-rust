@@ -604,6 +604,42 @@ fn an_identity_change_whose_old_file_cannot_be_removed_is_never_left_as_the_old_
     drop(recorder);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_logout_whose_old_file_cannot_be_removed_is_retried_until_it_is_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+    assert!(scope_file.exists());
+
+    // Logout while the directory is read-only: the unlink fails and the file
+    // still names user A although the scope is now empty.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| s.set_email(None));
+    let root = std::fs::write(parts.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if root {
+        return;
+    }
+    assert!(scope_file.exists(), "the unlink really failed");
+
+    // Writable again; the host logs out again (an empty scope, unchanged).
+    std::thread::sleep(Duration::from_millis(1200));
+    recorder.with_scope(|s| s.set_email(None));
+    assert!(
+        !scope_file.exists(),
+        "the stale identity is removed, not kept"
+    );
+    drop(recorder);
+}
+
 #[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.
