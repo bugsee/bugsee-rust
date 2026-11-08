@@ -332,7 +332,7 @@ BugseeStatus bugsee_options_set_sample_rate(BugseeOptions *options, double rate)
 
 /*
  Longest time `launch` may spend recovering a previous crash, in
- milliseconds. Default: the SDK's built-in budget (a few seconds). 0 skips
+ milliseconds. Default 500 ms. 0 skips
  the launch pass entirely: crashes are recovered in the background instead.
 
  # Safety
@@ -481,7 +481,8 @@ BugseeStatus bugsee_upload(void);
 /*
  Block until pending work drains, or `timeout_ms` elapses. Returns `Ok` on a
  full drain, `Timeout` if the SDK is launched but the queue did not drain in
- time, or `NotLaunched` if the SDK was never launched (F1).
+ time, or `NotLaunched` if the SDK is not launched (never launched, or
+ stopped).
  */
 BugseeStatus bugsee_flush(uint32_t timeout_ms);
 

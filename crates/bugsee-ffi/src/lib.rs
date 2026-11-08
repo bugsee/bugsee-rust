@@ -150,14 +150,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Drop a caught panic payload without letting a panicking destructor unwind
+/// out of an `extern "C"` function (which would abort the process).
+fn drop_payload(payload: Box<dyn std::any::Any + Send>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+}
+
 /// Run `f` inside a panic boundary, mapping a contained panic to `Panic`.
 fn guarded(f: impl FnOnce() -> BugseeStatus) -> BugseeStatus {
     match bugsee::guard(f) {
         Ok(status) => status,
         Err(payload) => {
             let message = panic_message(&*payload);
-            // A payload whose destructor panics must not unwind out of `extern "C"`.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+            drop_payload(payload);
             fail(
                 BugseeStatus::Panic,
                 format!("panic contained at the FFI boundary: {message}"),
@@ -367,7 +372,9 @@ pub unsafe extern "C" fn bugsee_options_new(
 #[no_mangle]
 pub unsafe extern "C" fn bugsee_options_free(options: *mut BugseeOptions) {
     if !options.is_null() {
-        let _ = bugsee::guard(|| drop(unsafe { Box::from_raw(options) }));
+        if let Err(payload) = bugsee::guard(|| drop(unsafe { Box::from_raw(options) })) {
+            drop_payload(payload);
+        }
     }
 }
 
@@ -606,7 +613,7 @@ pub unsafe extern "C" fn bugsee_options_set_sample_rate(
 }
 
 /// Longest time `launch` may spend recovering a previous crash, in
-/// milliseconds. Default: the SDK's built-in budget (a few seconds). 0 skips
+/// milliseconds. Default 500 ms. 0 skips
 /// the launch pass entirely: crashes are recovered in the background instead.
 ///
 /// # Safety
@@ -731,7 +738,11 @@ pub extern "C" fn bugsee_stop() -> BugseeStatus {
 pub extern "C" fn bugsee_is_active() -> i32 {
     match bugsee::guard(Bugsee::is_active) {
         Ok(true) => 1,
-        _ => 0,
+        Ok(false) => 0,
+        Err(payload) => {
+            drop_payload(payload);
+            0
+        }
     }
 }
 
@@ -939,7 +950,8 @@ pub extern "C" fn bugsee_upload() -> BugseeStatus {
 
 /// Block until pending work drains, or `timeout_ms` elapses. Returns `Ok` on a
 /// full drain, `Timeout` if the SDK is launched but the queue did not drain in
-/// time, or `NotLaunched` if the SDK was never launched (F1).
+/// time, or `NotLaunched` if the SDK is not launched (never launched, or
+/// stopped).
 #[no_mangle]
 pub extern "C" fn bugsee_flush(timeout_ms: u32) -> BugseeStatus {
     guarded(|| {
