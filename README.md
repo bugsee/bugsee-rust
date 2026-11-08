@@ -50,7 +50,7 @@ next launch, so give the process a data directory that survives restarts
 
 - [`DESIGN.md`](./DESIGN.md): architecture and decision log.
 - [`PROGRESS.md`](./PROGRESS.md): current status.
-- Wire format: [`bugsee/specs`](https://github.com/bugsee/specs) (`sdk/reporting/`).
+- Wire format: see DESIGN.md §16.
 
 ## Development
 
