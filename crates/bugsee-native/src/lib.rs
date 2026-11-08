@@ -1856,32 +1856,6 @@ mod imp {
         (pc != 0).then_some(pc)
     }
 
-    /// The interrupted stack pointer from the signal's saved register state.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe fn context_sp(uc: *const libc::ucontext_t) -> usize {
-        // SAFETY: `uc` is the kernel-provided `ucontext_t` of the fault.
-        let mc = unsafe { &(*uc).uc_mcontext };
-        #[cfg(target_arch = "x86_64")]
-        let sp = mc.gregs[15] as usize; // REG_RSP
-        #[cfg(target_arch = "x86")]
-        let sp = mc.gregs[7] as usize; // REG_ESP
-        #[cfg(target_arch = "aarch64")]
-        let sp = mc.sp as usize;
-        #[cfg(target_arch = "arm")]
-        let sp = mc.arm_sp as usize;
-        #[cfg(not(any(
-            target_arch = "x86_64",
-            target_arch = "x86",
-            target_arch = "aarch64",
-            target_arch = "arm"
-        )))]
-        let sp = {
-            let _ = mc;
-            0usize
-        };
-        sp
-    }
-
     #[cfg(unix)]
     /// The Unix signal path (Linux, Android, macOS).
     ///
@@ -2011,7 +1985,7 @@ mod imp {
             CHAIN.iter().find(|s| s.tid.load(Ordering::Acquire) == tid)
         }
         /// The marker generation whose frames are already on disk, so completing a
-        /// report twice (eagerly for a stack overflow, then again from the
+        /// report twice (eagerly on a small alternate stack, then again from the
         /// `abort()` that follows it) appends them once.
         static FRAMED: AtomicU64 = AtomicU64::new(0);
         /// The marker generation completed BEFORE its host handler ran, on a small
@@ -2823,16 +2797,23 @@ mod imp {
         ///
         /// A host that ends the process with `abort()` from inside its handler (Rust's
         /// own stack-overflow handler, or any host that aborts on a fault it does not
-        /// recover) needs a whole second signal frame on the alternate stack the
-        /// handler is already running on. On a SMALL alternate stack (the one Rust
-        /// gives a spawned thread; the SDK only replaces the installing thread's) that
-        /// frame does not fit, the nested `SIGABRT` cannot be delivered and the process
-        /// dies of `SIGSEGV` with the report still missing its frames. So there, for
-        /// every fault signal, the report is completed first. On a big alternate stack
-        /// (or on the thread's own stack) the abort path completes it, and a recovered
-        /// fault (a JVM yellow page, Go stack growth) pays nothing extra.
+        /// recover) raises a second signal on the alternate stack the handler is
+        /// already running on. On a SMALL alternate stack (the one Rust gives a
+        /// spawned thread; the SDK only replaces the installing thread's) the unwind
+        /// that the nested handler would then run for the report does not fit, and the
+        /// process dies of `SIGSEGV` with the report missing its frames. So there the
+        /// report is completed first, for a real fault (not a signal merely sent, and
+        /// not a breakpoint, which a host resumes from).
+        ///
+        /// The cost: a fault the host would have recovered also pays an unwind and a
+        /// marker append on such a thread (it is deleted again afterwards). On a big
+        /// alternate stack, or the thread's own stack, it pays nothing extra.
         #[inline(never)]
-        fn must_complete_before_host() -> bool {
+        fn must_complete_before_host(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
+            // SAFETY: kernel-provided siginfo.
+            if sig == libc::SIGTRAP || is_sent(unsafe { (*info).si_code }) {
+                return false;
+            }
             on_small_alt_stack()
         }
 
@@ -2882,7 +2863,7 @@ mod imp {
 
             let regs = unsafe { regs_of(uc) };
             let (_first, generation) = unsafe { record_header(tid, path, sig, info, regs.pc) };
-            if generation != 0 && must_complete_before_host() {
+            if generation != 0 && must_complete_before_host(sig, info) {
                 EARLY.store(generation, Ordering::Release);
                 unsafe { complete_report(tid, &*path, regs, generation) };
             }
