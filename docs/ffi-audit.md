@@ -249,3 +249,16 @@ callback contract).
 The issue also asked for follow-up issues to be filed for the items above
 (at minimum 1-4, 6 and 9). They are not created by this PR and should be
 opened by the maintainers from this table.
+
+## 5. Status of items 1-4 and 5 (issue #39)
+
+Landed: `bugsee_abi_version` / `BUGSEE_ABI_VERSION` / `bugsee_version`;
+`bugsee_options_new(abi_version, token, &out)` + typed setters +
+`bugsee_launch_with_options` (the legacy `bugsee_launch*` stay); thread-local
+`bugsee_last_error`, `bugsee_status_string`, `ABI_MISMATCH`; handled
+`bugsee_report_error(json, len)` with host frames; `bugsee_shutdown`,
+`bugsee_install_termination_flush`, `bugsee_storage_status` (flag bits); an
+out-of-range log level is `INVALID_ARGUMENT`; the header carries the contract
+(strings, NULL, threads, lifecycle). Still open: `ALREADY_LAUNCHED` / `IO_ERROR`
+codes, the unhandled-exception path, `(ptr,len)` variants for the other calls,
+`clear_*`, and a storage-status path string.
