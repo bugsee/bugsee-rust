@@ -454,13 +454,17 @@ impl Shared {
                 written.scope = snapshot;
             }
             Err(_) => {
-                if !keep_stale {
+                // Not keeping the old file means removing it; if that unlink
+                // failed too (read-only directory, a scanner holding it open) the
+                // old scope is still on disk, so remember it as such.
+                let survives = keep_stale || path.exists();
+                if !survives {
                     written.path = Some(path.clone());
                     written.scope = Scope::default(); // the file is gone
                 }
-                // A kept file is behind the in-memory scope: retry next call.
+                // A surviving file is behind the in-memory scope: retry next call.
                 self.scope_lagging
-                    .store(keep_stale && transient, Ordering::Relaxed);
+                    .store(survives && transient, Ordering::Relaxed);
                 self.scope_retry_at
                     .store(epoch_ms() + SCOPE_RETRY_MS, Ordering::Relaxed);
                 self.degraded.store(true, Ordering::Relaxed);

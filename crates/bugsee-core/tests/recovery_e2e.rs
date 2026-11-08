@@ -570,6 +570,40 @@ fn a_failed_write_that_changes_an_attribute_never_keeps_the_old_value() {
     drop(recorder);
 }
 
+#[cfg(unix)]
+#[test]
+fn an_identity_change_whose_old_file_cannot_be_removed_is_never_left_as_the_old_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+
+    // Read-only directory: neither the new write nor the unlink of the old file
+    // can happen, so `scope.json` still names user A while the session is B.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    let root = std::fs::write(parts.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if root {
+        return;
+    }
+    assert!(recorder.is_degraded());
+
+    // The disk is writable again; the host repeats the same email (no change).
+    // After the back-off the stale identity must be replaced, never kept.
+    std::thread::sleep(Duration::from_millis(1200));
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    let now: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(now["email"], "b@example.com", "never the previous user");
+    drop(recorder);
+}
+
 #[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.
