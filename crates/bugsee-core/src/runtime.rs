@@ -417,10 +417,10 @@ impl Shared {
     /// matters for an empty scope: a logged-out identity must not linger), or a
     /// non-empty scope's file is gone. Scope lock held.
     fn scope_file_missing(&self, scope: &Scope) -> bool {
-        !self.scope_unpersistable.load(Ordering::Relaxed)
-            && scope_retry_due(self.scope_retry_at.load(Ordering::Relaxed), epoch_ms())
+        scope_retry_due(self.scope_retry_at.load(Ordering::Relaxed), epoch_ms())
             && (self.scope_lagging.load(Ordering::Relaxed)
-                || (!scope.is_empty()
+                || (!self.scope_unpersistable.load(Ordering::Relaxed)
+                    && !scope.is_empty()
                     && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())))
     }
 
@@ -472,12 +472,17 @@ impl Shared {
                 written.scope = snapshot;
             }
             Err(_) => {
+                // After the attempt (which tried to unlink the old file unless
+                // keeping it), is the old file still there?
+                let dest_exists = path.exists();
                 if was_ready {
                     written.kept_tmp = Some((version, snapshot.clone()));
                 } else if was_remove {
                     written.kept_tmp = None;
                 } else if let Some((kept_version, kept)) = written.kept_tmp.take() {
-                    if snapshot.extends(&kept) {
+                    // Kept while the new scope only adds to it, or while the old
+                    // file still lingers (recovery prefers the temp over it).
+                    if snapshot.extends(&kept) || dest_exists {
                         sweep_floor = kept_version;
                         written.kept_tmp = Some((kept_version, kept));
                     }
@@ -485,14 +490,16 @@ impl Shared {
                 // Not keeping the old file means removing it; if that unlink
                 // failed too (read-only directory, a scanner holding it open) the
                 // old scope is still on disk, so remember it as such.
-                let survives = keep_stale || path.exists();
+                let survives = keep_stale || dest_exists;
                 if !survives {
                     written.path = Some(path.clone());
                     written.scope = Scope::default(); // the file is gone
                 }
-                // A surviving file is behind the in-memory scope: retry next call.
+                // A surviving file is behind the in-memory scope: retry next
+                // call. A hopeless (too large) scope is retried only to get a
+                // surviving old identity removed, not to be written.
                 self.scope_lagging
-                    .store(survives && transient, Ordering::Relaxed);
+                    .store(survives && (transient || !keep_stale), Ordering::Relaxed);
                 self.scope_retry_at
                     .store(epoch_ms() + SCOPE_RETRY_MS, Ordering::Relaxed);
                 self.degraded.store(true, Ordering::Relaxed);

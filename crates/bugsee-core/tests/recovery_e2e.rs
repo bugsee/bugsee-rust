@@ -688,13 +688,23 @@ fn a_kept_temp_file_survives_a_later_write_that_stages_nothing_if_it_only_lacks_
 
 #[cfg(unix)]
 #[test]
-fn a_kept_temp_file_is_dropped_when_a_later_failed_write_changes_the_identity() {
+fn a_kept_temp_file_is_dropped_once_the_old_file_is_gone_and_the_identity_moved_on() {
     use bugsee_core::model::scope::Scope;
     let dir = TempDir::new();
     let (recorder, scope_file) = recorder_with_unreplaceable_scope_file(&dir);
     recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
-    // The identity moves on to C but C cannot be staged: the kept temp now names
-    // someone else, and reporting less beats reporting B.
+    // While the old file lingers the kept temp is what recovery prefers.
+    assert_eq!(
+        Scope::load_recovering(&scope_file)
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("b@example.com")
+    );
+    // The handle on the old file goes away; then the identity moves on to C but
+    // C cannot be staged. The kept temp now names someone else and nothing is
+    // left to fall back to, so reporting less beats reporting B.
+    std::fs::remove_dir(&scope_file).unwrap();
     recorder.with_scope(|s| {
         s.set_email(Some("c@example.com".into()));
         s.set_attribute("big", Value::from("x".repeat(2 << 20)));
@@ -703,6 +713,42 @@ fn a_kept_temp_file_is_dropped_when_a_later_failed_write_changes_the_identity() 
         Scope::load_recovering(&scope_file).is_none(),
         "no stale identity is left to recover"
     );
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_too_large_identity_change_whose_old_file_cannot_be_removed_is_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+
+    // A to B, with an attribute over the cap, while the directory is read-only:
+    // nothing can be staged and the old file cannot be unlinked.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| {
+        s.set_email(Some("b@example.com".into()));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    let root = std::fs::write(parts.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if root {
+        return;
+    }
+    assert!(scope_file.exists(), "the unlink really failed");
+
+    // Writable again; the host repeats B (unchanged, still over the cap). The
+    // stale identity must still go, even though the scope itself cannot persist.
+    std::thread::sleep(Duration::from_millis(1200));
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    assert!(!scope_file.exists(), "user A is not left on disk");
     drop(recorder);
 }
 
