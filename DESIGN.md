@@ -170,6 +170,7 @@ Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. *
 ```
 <data>/gen                                   persisted monotonic generation counter
 <data>/parts/<gen>/<part-n>/<channel>.part   live capture, buffered append streams
+<data>/parts/<gen>/scope.json            this session's scope (email, labels, attributes); scope.json.<n>.tmp is a write in flight
 <data>/reports/<id>/                         per-report snapshot (hard links) + state
 <data>/queue/                                finished *.bundle.zip awaiting upload
 ```
