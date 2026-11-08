@@ -230,7 +230,8 @@ BugseeStatus bugsee_options_set_endpoint(BugseeOptions *options, const char *val
 BugseeStatus bugsee_options_set_data_dir(BugseeOptions *options, const char *value);
 
 /*
- Set the application version reported with every issue. NULL = detect.
+ Set the application version reported with every issue. NULL = unset: the
+ SDK cannot infer it, so without it issues carry no version.
 
  # Safety
  `options` must be a live handle from `bugsee_options_new` that no other
@@ -241,7 +242,8 @@ BugseeStatus bugsee_options_set_data_dir(BugseeOptions *options, const char *val
 BugseeStatus bugsee_options_set_app_version(BugseeOptions *options, const char *value);
 
 /*
- Set the application build reported with every issue. NULL = detect.
+ Set the application build reported with every issue. NULL = unset: the
+ SDK cannot infer it, so without it issues carry no build.
 
  # Safety
  `options` must be a live handle from `bugsee_options_new` that no other
@@ -253,7 +255,8 @@ BugseeStatus bugsee_options_set_app_build(BugseeOptions *options, const char *va
 
 /*
  Set the application package / bundle id reported with every issue.
- NULL = detect.
+ NULL = the host process's executable name, which in a managed host
+ (PHP, Python, Node, ...) is the interpreter, so pass the real app id.
 
  # Safety
  `options` must be a live handle from `bugsee_options_new` that no other
@@ -535,7 +538,10 @@ BugseeStatus bugsee_storage_status(uint32_t *out_flags);
  first (at most 512 are kept); `function` is required per frame, and a frame
  with `"in_app": false` is hidden from grouping (an error with no in-app
  frames groups by name and reason alone, so send them). `causes` runs outermost first
- (at most 32 are kept). Unknown fields are ignored. Does nothing (and returns
+ (at most 32 are kept). `handled` may be omitted or `true`; `false` (an
+ uncaught exception needing a synchronous, durable path) is rejected as
+ `INVALID_ARGUMENT` because that path is not implemented. Other unknown
+ fields are ignored. Does nothing (and returns
  `OK`) before launch, like the other capture calls.
 
  # Safety

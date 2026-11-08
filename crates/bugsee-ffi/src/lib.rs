@@ -93,6 +93,7 @@ fn fail(status: BugseeStatus, message: impl Into<Vec<u8>>) -> BugseeStatus {
     status
 }
 
+/// Record `message` and return `InvalidArgument`.
 fn invalid(message: &str) -> BugseeStatus {
     fail(BugseeStatus::InvalidArgument, message)
 }
@@ -257,6 +258,7 @@ pub struct BugseeOptions {
 }
 
 impl BugseeOptions {
+    /// A bag with only the token set; every other option is left at its default.
     fn new(app_token: String) -> Self {
         BugseeOptions {
             app_token,
@@ -277,6 +279,7 @@ impl BugseeOptions {
         }
     }
 
+    /// Apply only the options the host set, leaving the rest to `LaunchOptions`.
     fn to_launch_options(&self) -> LaunchOptions {
         let mut o = LaunchOptions::new(self.app_token.clone());
         if let Some(v) = &self.endpoint {
@@ -431,7 +434,8 @@ pub unsafe extern "C" fn bugsee_options_set_data_dir(
     })
 }
 
-/// Set the application version reported with every issue. NULL = detect.
+/// Set the application version reported with every issue. NULL = unset: the
+/// SDK cannot infer it, so without it issues carry no version.
 ///
 /// # Safety
 /// `options` must be a live handle from `bugsee_options_new` that no other
@@ -451,7 +455,8 @@ pub unsafe extern "C" fn bugsee_options_set_app_version(
     })
 }
 
-/// Set the application build reported with every issue. NULL = detect.
+/// Set the application build reported with every issue. NULL = unset: the
+/// SDK cannot infer it, so without it issues carry no build.
 ///
 /// # Safety
 /// `options` must be a live handle from `bugsee_options_new` that no other
@@ -472,7 +477,8 @@ pub unsafe extern "C" fn bugsee_options_set_app_build(
 }
 
 /// Set the application package / bundle id reported with every issue.
-/// NULL = detect.
+/// NULL = the host process's executable name, which in a managed host
+/// (PHP, Python, Node, ...) is the interpreter, so pass the real app id.
 ///
 /// # Safety
 /// `options` must be a live handle from `bugsee_options_new` that no other
@@ -1054,6 +1060,7 @@ const MAX_HOST_FRAMES: usize = 512;
 /// Cause-chain links kept from a host error.
 const MAX_HOST_CAUSES: usize = 32;
 
+/// An optional string field: `None` when absent or null, an error when mistyped.
 fn str_field(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
     match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1062,6 +1069,7 @@ fn str_field(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, Stri
     }
 }
 
+/// Map one host frame object to a core `Frame`.
 fn parse_frame(value: &Value, index: usize) -> Result<Frame, String> {
     let ctx = |e: String| format!("frames[{index}]: {e}");
     let obj = value
@@ -1116,11 +1124,20 @@ struct HostError {
     frames: Vec<Frame>,
 }
 
+/// Parse and validate a `bugsee_report_error` document.
 fn parse_host_error(json: &str) -> Result<HostError, String> {
     let value: Value = serde_json::from_str(json).map_err(|e| format!("not valid JSON: {e}"))?;
     let obj = value
         .as_object()
         .ok_or_else(|| "the document must be a JSON object".to_string())?;
+    match obj.get("handled") {
+        None | Some(Value::Null) | Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => return Err(
+            "`handled: false` (an unhandled exception) is not supported by this entry point yet"
+                .to_string(),
+        ),
+        Some(_) => return Err("`handled` must be a boolean".to_string()),
+    }
     let name = str_field(obj, "name")?.unwrap_or_else(|| "Exception".to_string());
     let reason = str_field(obj, "reason")?.unwrap_or_default();
 
@@ -1182,7 +1199,10 @@ fn parse_host_error(json: &str) -> Result<HostError, String> {
 /// first (at most 512 are kept); `function` is required per frame, and a frame
 /// with `"in_app": false` is hidden from grouping (an error with no in-app
 /// frames groups by name and reason alone, so send them). `causes` runs outermost first
-/// (at most 32 are kept). Unknown fields are ignored. Does nothing (and returns
+/// (at most 32 are kept). `handled` may be omitted or `true`; `false` (an
+/// uncaught exception needing a synchronous, durable path) is rejected as
+/// `INVALID_ARGUMENT` because that path is not implemented. Other unknown
+/// fields are ignored. Does nothing (and returns
 /// `OK`) before launch, like the other capture calls.
 ///
 /// # Safety
@@ -1536,6 +1556,13 @@ mod tests {
         );
         assert!(last_error().unwrap().contains("frames[0]"));
         assert_eq!(send(br#"{"causes": {}}"#), BugseeStatus::InvalidArgument);
+        assert_eq!(
+            send(br#"{"handled": false}"#),
+            BugseeStatus::InvalidArgument
+        );
+        assert!(last_error().unwrap().contains("not supported"));
+        assert_eq!(send(br#"{"handled": "no"}"#), BugseeStatus::InvalidArgument);
+        assert_eq!(send(br#"{"handled": true}"#), BugseeStatus::Ok);
         // Entries past the caps are still validated.
         let mut late_bad = String::from(r#"{"frames":["#);
         for _ in 0..MAX_HOST_FRAMES {
