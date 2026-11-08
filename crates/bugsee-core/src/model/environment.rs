@@ -99,6 +99,9 @@ pub struct Gpu {
 pub struct Hardware {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The hardware vendor (`Apple`, `LENOVO`, `samsung`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +240,8 @@ pub struct HostFacts {
     pub utc_offset: Option<i32>,
     /// `hardware.model`, the machine's model string (e.g. `"MacBookPro18,3"`).
     pub hardware_model: Option<String>,
+    /// `hardware.manufacturer`, the hardware vendor (e.g. `"Apple"`).
+    pub hardware_manufacturer: Option<String>,
 }
 
 impl Environment {
@@ -266,6 +271,7 @@ impl Environment {
         env.platform.locale = facts.locale.clone();
         env.platform.utc_offset = facts.utc_offset;
         env.hardware.model = facts.hardware_model.clone();
+        env.hardware.manufacturer = facts.hardware_manufacturer.clone();
         env
     }
 
@@ -382,6 +388,7 @@ mod tests {
             locale: Some("en_US".into()),
             utc_offset: Some(-300),
             hardware_model: Some("MacBookPro18,3".into()),
+            hardware_manufacturer: Some("Apple".into()),
         };
         let v = serde_json::to_value(Environment::detect_with(
             "1.0.0",
@@ -401,6 +408,7 @@ mod tests {
         // east"), so pin it here rather than only in the host crate.
         assert_eq!(v["platform"]["utc_offset"], -300);
         assert_eq!(v["hardware"]["model"], "MacBookPro18,3");
+        assert_eq!(v["hardware"]["manufacturer"], "Apple");
     }
 
     #[test]
@@ -426,7 +434,9 @@ mod tests {
                 "{key} should be omitted, not null"
             );
         }
-        assert!(!v["hardware"].as_object().unwrap().contains_key("model"));
+        let hardware = v["hardware"].as_object().unwrap();
+        assert!(!hardware.contains_key("model"));
+        assert!(!hardware.contains_key("manufacturer"));
     }
 
     #[test]

@@ -90,6 +90,7 @@ pub fn host_facts(data_dir: &Path) -> HostFacts {
         locale: locale().or_else(crate::hostinfo::locale),
         utc_offset: crate::hostinfo::utc_offset_minutes(),
         hardware_model: crate::hostinfo::hardware_model(),
+        hardware_manufacturer: crate::hostinfo::manufacturer(),
     }
 }
 
