@@ -95,6 +95,10 @@ impl Bugsee {
         // waits for the very lock we would be holding.
         RECORDER.ensure_registered();
         RESOLUTION.ensure_registered();
+        // `revive_after_fork` locks NATIVE under REVIVING; register it here so
+        // that lock is never first-registered while another is held.
+        #[cfg(feature = "native")]
+        NATIVE.ensure_registered();
         check_fork();
         // No writable directory is not an error: the recorder runs in memory so
         // handled errors still go out (see `DataDirSource`).

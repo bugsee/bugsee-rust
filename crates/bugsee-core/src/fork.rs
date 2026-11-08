@@ -51,7 +51,7 @@
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Once, Weak};
+use std::sync::{Arc, Weak};
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -378,6 +378,7 @@ pub fn lock_backtrace() -> BacktraceGuard {
 pub fn install_fork_hook() {
     #[cfg(unix)]
     {
+        use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             // Register the backtrace lock now, not lazily on its first use: a
