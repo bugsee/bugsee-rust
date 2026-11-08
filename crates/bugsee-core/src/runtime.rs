@@ -361,6 +361,14 @@ struct LaunchPlan {
 /// Minimum gap between retries of a failed scope write that nothing changed.
 const SCOPE_RETRY_MS: i64 = 1_000;
 
+/// Whether a retry gated by `retry_at` is due at `now` (both epoch ms). The wall
+/// clock is not monotonic: a retry time more than one back-off window ahead can
+/// only mean the clock stepped backwards after the failure, so it is due rather
+/// than suppressed for as long as the step.
+fn scope_retry_due(retry_at: i64, now: i64) -> bool {
+    now >= retry_at || retry_at - now > SCOPE_RETRY_MS
+}
+
 /// The scope file as this process last left it.
 #[derive(Default)]
 struct ScopeWritten {
@@ -405,7 +413,7 @@ impl Shared {
     fn scope_file_missing(&self, scope: &Scope) -> bool {
         !scope.is_empty()
             && !self.scope_unpersistable.load(Ordering::Relaxed)
-            && epoch_ms() >= self.scope_retry_at.load(Ordering::Relaxed)
+            && scope_retry_due(self.scope_retry_at.load(Ordering::Relaxed), epoch_ms())
             && (self.scope_lagging.load(Ordering::Relaxed)
                 || self.scope_file.lock().as_ref().is_some_and(|p| !p.exists()))
     }
@@ -2731,6 +2739,23 @@ fn drain_until_empty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scope_retry_backoff_survives_a_clock_stepping_backwards() {
+        let at = 1_000_000;
+        // Normal: not due inside the window, due once it has passed.
+        assert!(!scope_retry_due(at, at - 1));
+        assert!(scope_retry_due(at, at));
+        assert!(scope_retry_due(at, at + 5));
+        // The clock stepped back by minutes after the failure: `at` is now far
+        // beyond one back-off window, which can only mean a step, so retry.
+        assert!(scope_retry_due(at, at - SCOPE_RETRY_MS - 1));
+        assert!(scope_retry_due(at, at - 600_000));
+        // Right at the edge of a legitimate window it still waits.
+        assert!(!scope_retry_due(at, at - SCOPE_RETRY_MS));
+        // Never failed.
+        assert!(scope_retry_due(0, 12345));
+    }
     use crate::model::enums::BreadcrumbLevel;
     use crate::transport::MockTransport;
 
