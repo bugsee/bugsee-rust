@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -279,6 +279,10 @@ struct Shared {
     /// A transient write failure kept an older file that now lags the in-memory
     /// scope: retry on the next scope call even if nothing changed.
     scope_lagging: AtomicBool,
+    /// Earliest time (epoch ms) an unchanged scope is re-staged after a failed
+    /// write, so a bad disk costs one attempt per [`SCOPE_RETRY_MS`], not one per
+    /// call. A scope that changed is always written.
+    scope_retry_at: AtomicI64,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
@@ -354,6 +358,9 @@ struct LaunchPlan {
     heartbeat_of: Option<PathBuf>,
 }
 
+/// Minimum gap between retries of a failed scope write that nothing changed.
+const SCOPE_RETRY_MS: i64 = 1_000;
+
 /// The scope file as this process last left it.
 #[derive(Default)]
 struct ScopeWritten {
@@ -398,6 +405,7 @@ impl Shared {
     fn scope_file_missing(&self, scope: &Scope) -> bool {
         !scope.is_empty()
             && !self.scope_unpersistable.load(Ordering::Relaxed)
+            && epoch_ms() >= self.scope_retry_at.load(Ordering::Relaxed)
             && (self.scope_lagging.load(Ordering::Relaxed)
                 || self.scope_file.lock().as_ref().is_some_and(|p| !p.exists()))
     }
@@ -433,6 +441,7 @@ impl Shared {
         match result {
             Ok(()) => {
                 self.scope_lagging.store(false, Ordering::Relaxed);
+                self.scope_retry_at.store(0, Ordering::Relaxed);
                 written.path = Some(path.clone());
                 written.scope = snapshot;
             }
@@ -444,6 +453,8 @@ impl Shared {
                 // A kept file is behind the in-memory scope: retry next call.
                 self.scope_lagging
                     .store(keep_stale && transient, Ordering::Relaxed);
+                self.scope_retry_at
+                    .store(epoch_ms() + SCOPE_RETRY_MS, Ordering::Relaxed);
                 self.degraded.store(true, Ordering::Relaxed);
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 crate::util::warn_once(
@@ -600,6 +611,7 @@ impl Recorder {
             scope_written: ForkLock::new(ScopeWritten::default()),
             scope_unpersistable: AtomicBool::new(false),
             scope_lagging: AtomicBool::new(false),
+            scope_retry_at: AtomicI64::new(0),
             env,
             environment_json,
             app_token: config.app_token.clone(),

@@ -524,13 +524,22 @@ fn a_transient_write_failure_that_kept_the_old_file_is_retried_on_the_next_call(
         "the kept file lags"
     );
 
-    // The host sets the very same value again (no change): the lagging file is
-    // still brought up to date.
-    recorder.with_scope(|s| {
-        if !s.labels.contains(&"beta".to_string()) {
-            s.labels.push("beta".into());
-        }
-    });
+    // The host sets the very same value again (no change). While the failure is
+    // fresh the retry backs off, so a bad disk does not cost a write per call.
+    let same = |recorder: &Recorder| {
+        recorder.with_scope(|s| {
+            if !s.labels.contains(&"beta".to_string()) {
+                s.labels.push("beta".into());
+            }
+        })
+    };
+    same(&recorder);
+    let still: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(still["labels"], serde_json::json!([]), "retry backs off");
+
+    // After the back-off the lagging file is brought up to date.
+    std::thread::sleep(Duration::from_millis(1200));
+    same(&recorder);
     let healed: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
     assert_eq!(healed["labels"], serde_json::json!(["beta"]));
     drop(recorder);
