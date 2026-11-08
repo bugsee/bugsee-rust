@@ -17,7 +17,7 @@
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bugsee::core::transport::{Transport, TransportError};
@@ -30,6 +30,9 @@ const KIND_ENV: &str = "BUGSEE_SHUTDOWN_WIN_KIND";
 const DIR_ENV: &str = "BUGSEE_SHUTDOWN_WIN_DIR";
 const PENDING: &str = "pending-report-marker";
 const ABNORMAL: &str = "terminated abnormally";
+
+/// The relaunch launches the process-global SDK, so cases must not overlap.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// An unreachable backend: every report stays queued on disk.
 struct Unreachable;
@@ -114,6 +117,7 @@ fn count(reports: &[Value], needle: &str) -> usize {
 /// Run the child to its end and return `(exit code, pending, abnormal)` over
 /// what the following launch recovers.
 fn run_case(kind: &str) -> (Option<i32>, usize, usize) {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "bugsee-shutdown-win-{kind}-{}",
         bugsee::core::util::random_hex(6)
@@ -124,7 +128,7 @@ fn run_case(kind: &str) -> (Option<i32>, usize, usize) {
         .env(KIND_ENV, kind)
         .env(DIR_ENV, &dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
     let start = Instant::now();
@@ -138,6 +142,14 @@ fn run_case(kind: &str) -> (Option<i32>, usize, usize) {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    assert!(
+        matches!(status.code(), Some(0)),
+        "[{kind}] child failed: {status:?} {stderr}"
+    );
     let recovered = relaunch(&dir);
     let again = relaunch(&dir);
     assert!(
