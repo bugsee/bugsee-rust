@@ -712,6 +712,9 @@ impl Recorder {
                 _ => None,
             };
         }
+        // Until the child's own session file is bound below, scope changes must
+        // not touch the parent's (a failed revive keeps running with this recorder).
+        self.shared.bind_scope_file(None);
         let pipeline = spawn_pipeline(
             &self.shared,
             store.is_some().then_some(self.data_dir.as_path()),

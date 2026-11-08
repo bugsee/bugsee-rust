@@ -39,26 +39,43 @@ impl Scope {
     /// Persist the identity, labels and attributes to `path` (temp file + rename,
     /// so a crash mid-write leaves the previous copy). An empty scope removes the
     /// file. Called on change, never on the crash path.
+    ///
+    /// Never leaves a stale copy: when the new scope cannot be written (or is
+    /// larger than recovery will read), the old file is removed, so a crash
+    /// reports no identity rather than a previous one.
     pub fn persist(&self, path: &Path) -> std::io::Result<()> {
+        let remove = || match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
         if self.is_empty() {
-            return match std::fs::remove_file(path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            };
+            return remove();
         }
+        let written = self.write_file(path);
+        if written.is_err() {
+            let _ = remove();
+        }
+        written
+    }
+
+    fn write_file(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "email": self.email,
             "labels": self.labels,
             "attributes": self.attributes,
         }))
         .map_err(std::io::Error::other)?;
+        if bytes.len() as u64 > MAX_PERSISTED_BYTES {
+            return Err(std::io::Error::other("scope too large to persist"));
+        }
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = std::path::PathBuf::from(tmp);
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path).inspect_err(|_| {
+        let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
-        })
+        }
+        result
     }
 
     /// Read a scope written by [`Scope::persist`]. `None` when absent, oversized
@@ -132,6 +149,22 @@ mod tests {
         assert_eq!(back.email.as_deref(), Some("a@b.c"));
         assert_eq!(back.labels, vec!["beta".to_string()]);
         assert_eq!(back.attributes.get("k"), Some(&Value::from(1)));
+    }
+
+    #[test]
+    fn an_oversized_or_unwritable_scope_leaves_no_stale_file() {
+        let path = tmp();
+        let mut s = Scope::default();
+        s.set_email(Some("old@b.c".into()));
+        s.persist(&path).unwrap();
+        s.set_attribute("big", Value::from("x".repeat(MAX_PERSISTED_BYTES as usize)));
+        assert!(s.persist(&path).is_err());
+        assert!(!path.exists(), "the previous scope must not survive");
+        // Unwritable target (missing directory): error, nothing left behind.
+        let missing = path.with_file_name("nope").join(SCOPE_FILE);
+        let mut small = Scope::default();
+        small.set_email(Some("a@b.c".into()));
+        assert!(small.persist(&missing).is_err());
     }
 
     #[test]
