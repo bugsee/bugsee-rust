@@ -8,7 +8,7 @@
 //! The Bugsee wire-format data model.
 //!
 //! Every type here serializes to the JSON documented in the cross-platform
-//! report-bundle contract (`bugsee/report-bundle-structure`). Capture files use
+//! report-bundle contract (`bugsee/specs` (`sdk/reporting/`)). Capture files use
 //! the envelope `{"version":2,"events":[…]}`; `manifest.json` is version `1`.
 
 pub mod crash;
