@@ -429,3 +429,457 @@ fn a_torn_or_garbage_part_tail_is_ignored_on_recovery() {
         drop(recorder);
     }
 }
+
+fn request_and_manifest(bundle: &[u8]) -> (Value, Value) {
+    let mut zip = ZipArchive::new(Cursor::new(bundle.to_vec())).unwrap();
+    let mut read = |name: &str| {
+        let mut b = Vec::new();
+        zip.by_name(name).unwrap().read_to_end(&mut b).unwrap();
+        serde_json::from_slice::<Value>(&b).unwrap()
+    };
+    (read("request.json"), read("manifest.json"))
+}
+
+#[test]
+fn a_scope_that_cannot_be_persisted_degrades_the_recorder_and_drops_the_stale_file() {
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+    assert!(scope_file.exists());
+    assert!(!recorder.is_degraded(), "a healthy write is not degraded");
+
+    // Over the persistable cap: the old identity must not outlive the change
+    // (a crash would report the wrong user), and the loss is surfaced.
+    recorder.with_scope(|s| {
+        s.set_email(Some("b@example.com".into()));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    assert!(!scope_file.exists(), "the stale identity is not kept");
+    assert!(recorder.is_degraded(), "the lost scope is surfaced");
+
+    // It is not re-staged on every call while it stays hopeless.
+    recorder.with_scope(|s| s.labels.push("l".into()));
+    assert!(!scope_file.exists());
+    // Once it fits again, persistence resumes.
+    recorder.with_scope(|s| {
+        s.attributes.remove("big");
+    });
+    assert!(scope_file.exists());
+    drop(recorder);
+}
+
+#[test]
+fn a_failed_additive_scope_write_keeps_the_identity_on_disk() {
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_email(Some("user@example.com".into())));
+    // The next change (the email is untouched) cannot be persisted.
+    recorder.with_scope(|s| s.set_attribute("big", Value::from("x".repeat(2 << 20))));
+    assert!(recorder.is_degraded(), "the lost write is surfaced");
+    let kept = std::fs::read(&scope_file).expect("the identity written earlier survives");
+    let kept: Value = serde_json::from_slice(&kept).unwrap();
+    assert_eq!(kept["email"], "user@example.com");
+    assert!(kept["attributes"].get("big").is_none());
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transient_write_failure_that_kept_the_old_file_is_retried_on_the_next_call() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("user@example.com".into())));
+
+    // A read-only session directory: the temp file cannot be written, so the
+    // old file (same email) is kept while the in-memory scope moves on.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| s.labels.push("beta".into()));
+    let writable = std::fs::write(parts.join("probe"), b"").is_ok(); // running as root
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if writable {
+        return;
+    }
+    assert!(recorder.is_degraded());
+    let lagging: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(
+        lagging["labels"],
+        serde_json::json!([]),
+        "the kept file lags"
+    );
+
+    // The host sets the very same value again (no change). While the failure is
+    // fresh the retry backs off, so a bad disk does not cost a write per call.
+    let same = |recorder: &Recorder| {
+        recorder.with_scope(|s| {
+            if !s.labels.contains(&"beta".to_string()) {
+                s.labels.push("beta".into());
+            }
+        })
+    };
+    same(&recorder);
+    let still: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(still["labels"], serde_json::json!([]), "retry backs off");
+
+    // After the back-off the lagging file is brought up to date.
+    std::thread::sleep(Duration::from_millis(1200));
+    same(&recorder);
+    let healed: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(healed["labels"], serde_json::json!(["beta"]));
+    drop(recorder);
+}
+
+#[test]
+fn a_failed_write_that_changes_an_attribute_never_keeps_the_old_value() {
+    // Hosts that carry identity in an attribute (no email) must not be reported
+    // as the previous user when the write that changed it fails.
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_attribute("user_id", Value::from("A")));
+    assert!(scope_file.exists());
+    recorder.with_scope(|s| {
+        s.set_attribute("user_id", Value::from("B"));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    assert!(recorder.is_degraded());
+    assert!(
+        !scope_file.exists(),
+        "user A must not outlive the change to B"
+    );
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_identity_change_whose_old_file_cannot_be_removed_is_never_left_as_the_old_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+
+    // Read-only directory: neither the new write nor the unlink of the old file
+    // can happen, so `scope.json` still names user A while the session is B.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    let root = std::fs::write(parts.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if root {
+        return;
+    }
+    assert!(recorder.is_degraded());
+
+    // The disk is writable again; the host repeats the same email (no change).
+    // After the back-off the stale identity must be replaced, never kept.
+    std::thread::sleep(Duration::from_millis(1200));
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    let now: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(now["email"], "b@example.com", "never the previous user");
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_logout_whose_old_file_cannot_be_removed_is_retried_until_it_is_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+    assert!(scope_file.exists());
+
+    // Logout while the directory is read-only: the unlink fails and the file
+    // still names user A although the scope is now empty.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| s.set_email(None));
+    let root = std::fs::write(parts.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if root {
+        return;
+    }
+    assert!(scope_file.exists(), "the unlink really failed");
+
+    // Writable again; the host logs out again (an empty scope, unchanged).
+    std::thread::sleep(Duration::from_millis(1200));
+    recorder.with_scope(|s| s.set_email(None));
+    assert!(
+        !scope_file.exists(),
+        "the stale identity is removed, not kept"
+    );
+    drop(recorder);
+}
+
+/// A recorder whose `scope.json` slot holds a directory, so every rename onto it
+/// (and every unlink of it) fails while temp files still write: the state of a
+/// destination held open by a scanner. Returns the recorder and the scope path.
+#[cfg(unix)]
+fn recorder_with_unreplaceable_scope_file(dir: &TempDir) -> (Recorder, PathBuf) {
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+    std::fs::remove_file(&scope_file).unwrap();
+    std::fs::create_dir(&scope_file).unwrap();
+    (recorder, scope_file)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kept_temp_file_survives_a_later_write_that_stages_nothing_if_it_only_lacks_things() {
+    use bugsee_core::model::scope::Scope;
+    let dir = TempDir::new();
+    let (recorder, scope_file) = recorder_with_unreplaceable_scope_file(&dir);
+    // B is fully written to a temp file but cannot be renamed into place.
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    assert_eq!(
+        Scope::load_recovering(&scope_file)
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("b@example.com")
+    );
+    // The next change only adds to B but cannot be staged (over the cap): the
+    // kept temp still lacks only that, so it must not be swept away.
+    recorder.with_scope(|s| s.set_attribute("big", Value::from("x".repeat(2 << 20))));
+    assert_eq!(
+        Scope::load_recovering(&scope_file)
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("b@example.com"),
+        "the newest complete snapshot survives"
+    );
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kept_temp_file_is_dropped_once_the_old_file_is_gone_and_the_identity_moved_on() {
+    use bugsee_core::model::scope::Scope;
+    let dir = TempDir::new();
+    let (recorder, scope_file) = recorder_with_unreplaceable_scope_file(&dir);
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    // While the old file lingers the kept temp is what recovery prefers.
+    assert_eq!(
+        Scope::load_recovering(&scope_file)
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("b@example.com")
+    );
+    // The handle on the old file goes away; then the identity moves on to C but
+    // C cannot be staged. The kept temp now names someone else and nothing is
+    // left to fall back to, so reporting less beats reporting B.
+    std::fs::remove_dir(&scope_file).unwrap();
+    recorder.with_scope(|s| {
+        s.set_email(Some("c@example.com".into()));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    assert!(
+        Scope::load_recovering(&scope_file).is_none(),
+        "no stale identity is left to recover"
+    );
+    drop(recorder);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_too_large_identity_change_whose_old_file_cannot_be_removed_is_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+
+    // A to B, with an attribute over the cap, while the directory is read-only:
+    // nothing can be staged and the old file cannot be unlinked.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| {
+        s.set_email(Some("b@example.com".into()));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    let root = std::fs::write(parts.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if root {
+        return;
+    }
+    assert!(scope_file.exists(), "the unlink really failed");
+
+    // Writable again; the host repeats B (unchanged, still over the cap). The
+    // stale identity must still go, even though the scope itself cannot persist.
+    std::thread::sleep(Duration::from_millis(1200));
+    recorder.with_scope(|s| s.set_email(Some("b@example.com".into())));
+    assert!(!scope_file.exists(), "user A is not left on disk");
+    drop(recorder);
+}
+
+#[test]
+fn a_session_persists_its_scope_and_a_crash_recovers_it() {
+    // Run 1: scope lands in the session directory as it changes.
+    let dir = TempDir::new();
+    let first = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = first.crash_info_path().with_file_name("scope.json");
+    assert!(!scope_file.exists(), "nothing to persist yet");
+    first.with_scope(|s| {
+        s.set_email(Some("crashed@example.com".into()));
+        s.labels.push("beta".into());
+        s.set_attribute("plan", Value::from("pro"));
+    });
+    assert!(scope_file.exists(), "scope persisted on change");
+    let scope_bytes = std::fs::read(&scope_file).unwrap();
+    // A lost file is restored by the next call even if the value is unchanged.
+    std::fs::remove_file(&scope_file).unwrap();
+    first.with_scope(|s| s.set_email(Some("crashed@example.com".into())));
+    assert!(scope_file.exists(), "a missing scope file is restored");
+    first.with_scope(|s| s.set_attribute("later", Value::from(1)));
+    assert!(scope_file.exists());
+    assert_ne!(
+        std::fs::read(&scope_file).unwrap(),
+        scope_bytes,
+        "rewritten on change"
+    );
+    first.with_scope(|s| {
+        s.set_email(None);
+        s.labels.clear();
+        s.clear_all_attributes();
+    });
+    assert!(!scope_file.exists(), "an empty scope leaves no file");
+    drop(first);
+
+    // The crashed session, as a later launch finds it.
+    let dir2 = TempDir::new();
+    seed_crashed_session(&dir2.path, 1);
+    std::fs::write(dir2.path.join("parts/1/scope.json"), scope_bytes).unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir2.path, "TOKEN"), transport.clone()).unwrap();
+    // This run's own scope must not leak into the recovered crash.
+    recorder.with_scope(|s| {
+        s.set_email(Some("new-run@example.com".into()));
+        s.labels.push("new-run-label".into());
+        s.set_attribute("new_run_attr", Value::from(true));
+    });
+    assert!(recorder.flush(Duration::from_secs(5)));
+
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1);
+    let (req, manifest) = request_and_manifest(&bundles[0]);
+    assert_eq!(req["email"], "crashed@example.com");
+    assert_eq!(req["labels"], serde_json::json!(["beta"]));
+    assert_eq!(manifest["attrs"]["plan"], "pro");
+    assert!(manifest["attrs"].get("new_run_attr").is_none());
+    drop(bundles);
+    assert!(!dir2.path.join("parts/1").exists());
+    drop(recorder);
+}
+
+/// Launch over a crashed session whose `parts/1` holds `files`, and return the
+/// recovered report's request body.
+fn recover_with_scope_files(files: &[(&str, &[u8])]) -> Value {
+    let dir = TempDir::new();
+    seed_crashed_session(&dir.path, 1);
+    for (name, bytes) in files {
+        std::fs::write(dir.path.join("parts/1").join(name), bytes).unwrap();
+    }
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir.path, "TOKEN"), transport.clone()).unwrap();
+    assert!(recorder.flush(Duration::from_secs(5)));
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1);
+    let (req, _) = request_and_manifest(&bundles[0]);
+    drop(bundles);
+    assert!(
+        !dir.path.join("parts/1").exists(),
+        "evidence discarded once queued"
+    );
+    drop(recorder);
+    req
+}
+
+#[test]
+fn a_crash_mid_scope_write_recovers_the_newest_complete_scope() {
+    // Died after the temp file was written, before the rename: `scope.json` is
+    // one change behind and the temp file carries the identity the user had.
+    let old = br#"{"email":"old@example.com","labels":[],"attributes":{}}"#;
+    let new = br#"{"email":"new@example.com","labels":["beta"],"attributes":{}}"#;
+    let req = recover_with_scope_files(&[("scope.json", old), ("scope.json.5.tmp", new)]);
+    assert_eq!(req["email"], "new@example.com");
+    assert_eq!(req["labels"], serde_json::json!(["beta"]));
+}
+
+#[test]
+fn a_torn_scope_temp_file_falls_back_to_the_previous_scope() {
+    let old = br#"{"email":"old@example.com","labels":[],"attributes":{}}"#;
+    let torn = br#"{"email":"new@exam"#;
+    let req = recover_with_scope_files(&[("scope.json", old), ("scope.json.5.tmp", torn)]);
+    assert_eq!(req["email"], "old@example.com");
+}
+
+#[test]
+fn a_crash_before_the_first_scope_rename_still_recovers_it() {
+    let only = br#"{"email":"first@example.com","labels":[],"attributes":{}}"#;
+    let req = recover_with_scope_files(&[("scope.json.1.tmp", only)]);
+    assert_eq!(req["email"], "first@example.com");
+}
+
+#[test]
+fn a_corrupt_persisted_scope_does_not_stop_recovery() {
+    let dir = TempDir::new();
+    seed_crashed_session(&dir.path, 1);
+    std::fs::write(dir.path.join("parts/1/scope.json"), b"{torn").unwrap();
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir.path, "TOKEN"), transport.clone()).unwrap();
+    assert!(recorder.flush(Duration::from_secs(5)));
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1);
+    let (req, _) = request_and_manifest(&bundles[0]);
+    assert!(req["email"].is_null());
+    drop(bundles);
+    drop(recorder);
+}

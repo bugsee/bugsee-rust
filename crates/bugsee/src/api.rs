@@ -515,24 +515,33 @@ impl Bugsee {
     /// Set the user identifier (`request.json.email`).
     pub fn set_email(email: impl Into<String>) {
         let email = email.into();
-        Self::with_recorder(|r| r.with_scope(|s| s.set_email(Some(email.clone()))));
+        // Via a handle: persisting the scope does file I/O, never under `RECORDER`.
+        if let Some(h) = Self::handle() {
+            h.with_scope(|s| s.set_email(Some(email)));
+        }
     }
 
     /// Set a report-level attribute (`manifest.attrs`).
     pub fn set_attribute(key: impl Into<String>, value: impl Into<Value>) {
         let key = key.into();
         let value = value.into();
-        Self::with_recorder(|r| r.with_scope(|s| s.set_attribute(key.clone(), value.clone())));
+        if let Some(h) = Self::handle() {
+            h.with_scope(|s| s.set_attribute(key, value));
+        }
     }
 
     /// Clear one report-level attribute.
     pub fn clear_attribute(key: &str) {
-        Self::with_recorder(|r| r.with_scope(|s| s.clear_attribute(key)));
+        if let Some(h) = Self::handle() {
+            h.with_scope(|s| s.clear_attribute(key));
+        }
     }
 
     /// Clear all report-level attributes.
     pub fn clear_all_attributes() {
-        Self::with_recorder(|r| r.with_scope(|s| s.clear_all_attributes()));
+        if let Some(h) = Self::handle() {
+            h.with_scope(|s| s.clear_all_attributes());
+        }
     }
 
     /// Trigger an immediate `code_upload` report.

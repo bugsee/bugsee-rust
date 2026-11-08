@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -42,7 +42,7 @@ use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
 use crate::model::environment::Environment;
 use crate::model::report::TimeWindow;
-use crate::model::scope::Scope;
+use crate::model::scope::{Scope, Staged};
 use crate::reporting::{self, AssembledReport, ReportMeta};
 use crate::session::Session;
 use crate::transport::{self, Transport, TransportError};
@@ -264,6 +264,25 @@ impl Drop for SnapshotHandle {
 /// State shared between the facade, the capture worker, and the uploader.
 struct Shared {
     scope: ForkLock<Scope>,
+    /// Where the scope is persisted for this session (`None` in memory mode).
+    /// Locked only while holding `scope`.
+    scope_file: ForkLock<Option<PathBuf>>,
+    /// Version of the newest scope snapshot taken (assigned under `scope`).
+    scope_version: AtomicU64,
+    /// What the scope file holds, as far as this process knows; held across the
+    /// commit so snapshots reach the file in order.
+    scope_written: ForkLock<ScopeWritten>,
+    /// The newest scope can never be persisted (too large), so a missing file is
+    /// expected and must not be re-staged on every call. Cleared by the next
+    /// scope that stages.
+    scope_unpersistable: AtomicBool,
+    /// A transient write failure kept an older file that now lags the in-memory
+    /// scope: retry on the next scope call even if nothing changed.
+    scope_lagging: AtomicBool,
+    /// Earliest time (epoch ms) an unchanged scope is re-staged after a failed
+    /// write, so a bad disk costs one attempt per [`SCOPE_RETRY_MS`], not one per
+    /// call. A scope that changed is always written.
+    scope_retry_at: AtomicI64,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
@@ -339,12 +358,187 @@ struct LaunchPlan {
     heartbeat_of: Option<PathBuf>,
 }
 
+/// Minimum gap between retries of a failed scope write that nothing changed.
+const SCOPE_RETRY_MS: i64 = 1_000;
+
+/// Whether a retry gated by `retry_at` is due at `now` (both epoch ms). The wall
+/// clock is not monotonic: a retry time more than one back-off window ahead can
+/// only mean the clock stepped backwards after the failure, so it is due rather
+/// than suppressed for as long as the step.
+fn scope_retry_due(retry_at: i64, now: i64) -> bool {
+    now >= retry_at || retry_at - now > SCOPE_RETRY_MS
+}
+
+/// The scope file as this process last left it.
+#[derive(Default)]
+struct ScopeWritten {
+    /// Version of the newest snapshot committed (or attempted).
+    version: u64,
+    /// The file the identity below was written to.
+    path: Option<PathBuf>,
+    /// The scope on disk at `path` (empty when there is no file).
+    scope: Scope,
+    /// A temp file a failed rename left behind, with its version and scope: the
+    /// newest complete snapshot, which recovery prefers over `scope.json`.
+    kept_tmp: Option<(u64, Scope)>,
+}
+
+impl Shared {
+    /// Mutate the scope and persist it into the session directory, so a crash of
+    /// this session is recovered with the identity it had. Written on change (the
+    /// crash path never touches it); best-effort, since scope is enrichment.
+    ///
+    /// The file I/O runs after the scope lock is released: a snapshot and a
+    /// version are taken under it, and [`Shared::persist_scope`] keeps an older
+    /// snapshot from overwriting a newer one.
+    fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
+        let (result, job) = {
+            let mut guard = self.scope.lock();
+            let before = guard.clone();
+            let result = f(&mut guard);
+            // Only a real change is written (hosts may set the same value per
+            // request), or a missing file is restored (a failed write, or a data
+            // directory that vanished and was healed, must not outlast the next call).
+            let job = if *guard != before || self.scope_file_missing(&guard) {
+                self.scope_job(&guard)
+            } else {
+                None
+            };
+            (result, job)
+        };
+        if let Some(job) = job {
+            self.persist_scope(job);
+        }
+        result
+    }
+
+    /// The session file needs another attempt with nothing changed: it lags the
+    /// in-memory scope after a failed write (including a failed removal, which
+    /// matters for an empty scope: a logged-out identity must not linger), or a
+    /// non-empty scope's file is gone. Scope lock held.
+    fn scope_file_missing(&self, scope: &Scope) -> bool {
+        scope_retry_due(self.scope_retry_at.load(Ordering::Relaxed), epoch_ms())
+            && (self.scope_lagging.load(Ordering::Relaxed)
+                || (!self.scope_unpersistable.load(Ordering::Relaxed)
+                    && !scope.is_empty()
+                    && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())))
+    }
+
+    /// A versioned snapshot to persist, or `None` without a session file.
+    /// Call with the scope lock held (that is what orders the versions).
+    fn scope_job(&self, scope: &Scope) -> Option<(u64, PathBuf, Scope)> {
+        let path = self.scope_file.lock().clone()?;
+        let version = self.scope_version.fetch_add(1, Ordering::SeqCst) + 1;
+        Some((version, path, scope.clone()))
+    }
+
+    fn persist_scope(&self, (version, path, snapshot): (u64, PathBuf, Scope)) {
+        // Serialise and write the temp file with no lock held; only the rename
+        // (and the version check that keeps snapshots in order) is under one.
+        let staged = snapshot.stage(&path, version);
+        let mut written = self.scope_written.lock();
+        if version <= written.version {
+            staged.discard();
+            return;
+        }
+        written.version = version;
+        self.scope_unpersistable
+            .store(matches!(staged, Staged::TooLarge), Ordering::Relaxed);
+        // If this write fails, the old file is still right when the new scope
+        // only adds to it (anything stale is merely missing), so keep it;
+        // otherwise (an identity, label or attribute changed or went away) remove
+        // it, so a crash reports less rather than something wrong.
+        let same_file = written.path.as_ref() == Some(&path);
+        if !same_file {
+            written.kept_tmp = None;
+        }
+        let keep_stale = same_file && snapshot.extends(&written.scope);
+        let transient = !matches!(staged, Staged::TooLarge);
+        let was_ready = matches!(staged, Staged::Ready(_));
+        let was_remove = matches!(staged, Staged::Remove);
+        let result = staged.commit(&path, version, keep_stale);
+        // Temp files below this version can no longer win. A write that stages
+        // nothing (too large, or the disk refused) is no newer than a temp file a
+        // failed rename left earlier, so that one stays while the new scope only
+        // adds to it, and goes once the scope moves on (an identity change must
+        // not leave the previous one to be recovered).
+        let mut sweep_floor = version;
+        match result {
+            Ok(()) => {
+                written.kept_tmp = None;
+                self.scope_lagging.store(false, Ordering::Relaxed);
+                self.scope_retry_at.store(0, Ordering::Relaxed);
+                written.path = Some(path.clone());
+                written.scope = snapshot;
+            }
+            Err(_) => {
+                // After the attempt (which tried to unlink the old file unless
+                // keeping it), is the old file still there?
+                let dest_exists = path.exists();
+                if was_ready {
+                    written.kept_tmp = Some((version, snapshot.clone()));
+                } else if was_remove {
+                    written.kept_tmp = None;
+                } else if let Some((kept_version, kept)) = written.kept_tmp.take() {
+                    // Kept while the new scope only adds to it, or while the old
+                    // file still lingers (recovery prefers the temp over it).
+                    if snapshot.extends(&kept) || dest_exists {
+                        sweep_floor = kept_version;
+                        written.kept_tmp = Some((kept_version, kept));
+                    }
+                }
+                // Not keeping the old file means removing it; if that unlink
+                // failed too (read-only directory, a scanner holding it open) the
+                // old scope is still on disk, so remember it as such.
+                let survives = keep_stale || dest_exists;
+                if !survives {
+                    written.path = Some(path.clone());
+                    written.scope = Scope::default(); // the file is gone
+                }
+                // A surviving file is behind the in-memory scope: retry next
+                // call. A hopeless (too large) scope is retried only to get a
+                // surviving old identity removed, not to be written.
+                self.scope_lagging
+                    .store(survives && (transient || !keep_stale), Ordering::Relaxed);
+                self.scope_retry_at
+                    .store(epoch_ms() + SCOPE_RETRY_MS, Ordering::Relaxed);
+                self.degraded.store(true, Ordering::Relaxed);
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                crate::util::warn_once(
+                    &WARNED,
+                    "could not persist the session scope (identity, labels, attributes); a \
+                     crash before the next successful write is reported with the last \
+                     persisted scope, or none if something in it changed",
+                );
+            }
+        }
+        // The scan runs outside the ordering lock (it also takes fork prepare).
+        drop(written);
+        Scope::sweep_older(&path, sweep_floor);
+    }
+
+    /// Point scope persistence at `path` and write the current scope there (a
+    /// fork child's new session inherits the parent's scope in memory).
+    fn bind_scope_file(&self, path: Option<PathBuf>) {
+        let job = {
+            let guard = self.scope.lock();
+            *self.scope_file.lock() = path;
+            self.scope_job(&guard)
+        };
+        if let Some(job) = job {
+            self.persist_scope(job);
+        }
+    }
+}
+
 /// The recorder's own locks join the `fork()` lock protocol, so a forked child
 /// never inherits the scope or the cached access token locked by a thread (the
 /// capture worker merges the scope into every report) that did not survive.
 impl ForkLockable for Shared {
     fn fork_lock(&self) {
         self.scope.fork_lock();
+        self.scope_file.fork_lock();
+        self.scope_written.fork_lock();
         self.session.fork_lock();
         self.mem_queue.fork_lock();
         self.mem_blacklist.fork_lock();
@@ -363,6 +557,8 @@ impl ForkLockable for Shared {
         self.mem_blacklist.fork_unlock();
         self.mem_queue.fork_unlock();
         self.session.fork_unlock();
+        self.scope_written.fork_unlock();
+        self.scope_file.fork_unlock();
         self.scope.fork_unlock();
     }
 }
@@ -456,6 +652,12 @@ impl Recorder {
         }
         let shared = Arc::new(Shared {
             scope: ForkLock::new(Scope::default()),
+            scope_file: ForkLock::new(None),
+            scope_version: AtomicU64::new(0),
+            scope_written: ForkLock::new(ScopeWritten::default()),
+            scope_unpersistable: AtomicBool::new(false),
+            scope_lagging: AtomicBool::new(false),
+            scope_retry_at: AtomicI64::new(0),
             env,
             environment_json,
             app_token: config.app_token.clone(),
@@ -519,6 +721,11 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        shared.bind_scope_file(
+            session
+                .as_ref()
+                .map(|s| scope_file_path(&data_dir, s.generation())),
+        );
         // Only a session that can be recovered is registered eagerly: a memory-mode
         // run could never contribute its crash, so counting it would read healthy.
         shared
@@ -676,6 +883,9 @@ impl Recorder {
                 _ => None,
             };
         }
+        // Until the child's own session file is bound below, scope changes must
+        // not touch the parent's (a failed revive keeps running with this recorder).
+        self.shared.bind_scope_file(None);
         let pipeline = spawn_pipeline(
             &self.shared,
             store.is_some().then_some(self.data_dir.as_path()),
@@ -690,6 +900,11 @@ impl Recorder {
             Vec::new(),
         )?;
 
+        self.shared.bind_scope_file(
+            session
+                .as_ref()
+                .map(|s| scope_file_path(&self.data_dir, s.generation())),
+        );
         // The parent's session is still the parent's: leave its marker alone.
         std::mem::forget(std::mem::replace(&mut self.session, session));
         // The old channel senders must be LEAKED, never dropped. Dropping the last
@@ -758,8 +973,7 @@ impl Recorder {
 
     /// Mutate the ambient scope (email / labels / attributes).
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = self.shared.scope.lock();
-        f(&mut guard)
+        self.shared.with_scope(f)
     }
 
     /// Trigger a report with `meta`, snapshotting the window ending now.
@@ -1038,8 +1252,7 @@ impl RecorderHandle {
 
     /// Mutate the ambient scope.
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = self.shared.scope.lock();
-        f(&mut guard)
+        self.shared.with_scope(f)
     }
 
     /// Set the paused flag (gates telemetry sampling).
@@ -1485,6 +1698,13 @@ fn recover_one(
     let now = epoch_ms();
     let (start, end) = span.unwrap_or((now, now));
     let mut built = recovery::build_report(pending, end);
+    // A crash can land between the scope temp-file write and its rename; take the
+    // freshest complete scope (the parts directory is discarded once queued).
+    if let Some(scope) =
+        Scope::load_recovering(&pending.parts_dir.join(crate::model::scope::SCOPE_FILE))
+    {
+        apply_scope(&scope, &mut built.meta);
+    }
 
     // Apply before_send to recovered crashes too (host redaction/drop).
     let keep = match &shared.before_send {
@@ -1498,9 +1718,9 @@ fn recover_one(
         recovery::discard(data_dir, pending);
         return;
     }
-    // A recovered crash carries no scope (email/labels/attributes) from THIS
-    // process: they describe the new run, not the one that crashed, and the
-    // launch-path and worker passes must agree on it.
+    // A recovered crash carries the scope (email/labels/attributes) its OWN
+    // session persisted, never this process's ambient scope: that describes the
+    // new run. Both recovery passes go through here, so they agree.
     if launch_pass {
         match queue::admit_recovered(data_dir, &built.meta.signatures) {
             queue::Admission::Admit => {}
@@ -1567,9 +1787,20 @@ fn recover_one(
     }
 }
 
+/// The persisted-scope path for `generation`.
+fn scope_file_path(data_dir: &Path, generation: u64) -> PathBuf {
+    data_dir
+        .join("parts")
+        .join(generation.to_string())
+        .join(crate::model::scope::SCOPE_FILE)
+}
+
 /// Merge ambient scope (email / labels / attributes) into a report's metadata.
 fn merge_scope(shared: &Shared, meta: &mut ReportMeta) {
-    let scope = shared.scope.lock();
+    apply_scope(&shared.scope.lock(), meta);
+}
+
+fn apply_scope(scope: &Scope, meta: &mut ReportMeta) {
     if meta.email.is_none() {
         meta.email = scope.email.clone();
     }
@@ -2546,6 +2777,23 @@ fn drain_until_empty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scope_retry_backoff_survives_a_clock_stepping_backwards() {
+        let at = 1_000_000;
+        // Normal: not due inside the window, due once it has passed.
+        assert!(!scope_retry_due(at, at - 1));
+        assert!(scope_retry_due(at, at));
+        assert!(scope_retry_due(at, at + 5));
+        // The clock stepped back by minutes after the failure: `at` is now far
+        // beyond one back-off window, which can only mean a step, so retry.
+        assert!(scope_retry_due(at, at - SCOPE_RETRY_MS - 1));
+        assert!(scope_retry_due(at, at - 600_000));
+        // Right at the edge of a legitimate window it still waits.
+        assert!(!scope_retry_due(at, at - SCOPE_RETRY_MS));
+        // Never failed.
+        assert!(scope_retry_due(0, 12345));
+    }
     use crate::model::enums::BreadcrumbLevel;
     use crate::transport::MockTransport;
 
