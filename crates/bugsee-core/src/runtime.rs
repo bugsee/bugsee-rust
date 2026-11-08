@@ -267,6 +267,11 @@ struct Shared {
     /// Where the scope is persisted for this session (`None` in memory mode).
     /// Locked only while holding `scope`.
     scope_file: ForkLock<Option<PathBuf>>,
+    /// Version of the newest scope snapshot taken (assigned under `scope`).
+    scope_version: AtomicU64,
+    /// Version of the newest snapshot written; held across the write so
+    /// snapshots reach the file in order.
+    scope_written: ForkLock<u64>,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
@@ -346,27 +351,55 @@ impl Shared {
     /// Mutate the scope and persist it into the session directory, so a crash of
     /// this session is recovered with the identity it had. Written on change (the
     /// crash path never touches it); best-effort, since scope is enrichment.
+    ///
+    /// The file I/O runs after the scope lock is released: a snapshot and a
+    /// version are taken under it, and [`Shared::persist_scope`] keeps an older
+    /// snapshot from overwriting a newer one.
     fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = self.scope.lock();
-        let before = guard.clone();
-        let result = f(&mut guard);
-        // Only a real change is written (hosts may set the same value per request).
-        if *guard != before {
-            if let Some(path) = self.scope_file.lock().as_ref() {
-                let _ = guard.persist(path);
-            }
+        let (result, job) = {
+            let mut guard = self.scope.lock();
+            let before = guard.clone();
+            let result = f(&mut guard);
+            // Only a real change is written (hosts may set the same value per request).
+            let job = if *guard != before {
+                self.scope_job(&guard)
+            } else {
+                None
+            };
+            (result, job)
+        };
+        if let Some(job) = job {
+            self.persist_scope(job);
         }
         result
+    }
+
+    /// A versioned snapshot to persist, or `None` without a session file.
+    /// Call with the scope lock held (that is what orders the versions).
+    fn scope_job(&self, scope: &Scope) -> Option<(u64, PathBuf, Scope)> {
+        let path = self.scope_file.lock().clone()?;
+        let version = self.scope_version.fetch_add(1, Ordering::SeqCst) + 1;
+        Some((version, path, scope.clone()))
+    }
+
+    fn persist_scope(&self, (version, path, snapshot): (u64, PathBuf, Scope)) {
+        let mut written = self.scope_written.lock();
+        if version > *written {
+            *written = version;
+            let _ = snapshot.persist(&path);
+        }
     }
 
     /// Point scope persistence at `path` and write the current scope there (a
     /// fork child's new session inherits the parent's scope in memory).
     fn bind_scope_file(&self, path: Option<PathBuf>) {
-        let guard = self.scope.lock();
-        let mut file = self.scope_file.lock();
-        *file = path;
-        if let Some(path) = file.as_ref() {
-            let _ = guard.persist(path);
+        let job = {
+            let guard = self.scope.lock();
+            *self.scope_file.lock() = path;
+            self.scope_job(&guard)
+        };
+        if let Some(job) = job {
+            self.persist_scope(job);
         }
     }
 }
@@ -378,6 +411,7 @@ impl ForkLockable for Shared {
     fn fork_lock(&self) {
         self.scope.fork_lock();
         self.scope_file.fork_lock();
+        self.scope_written.fork_lock();
         self.session.fork_lock();
         self.mem_queue.fork_lock();
         self.mem_blacklist.fork_lock();
@@ -396,6 +430,7 @@ impl ForkLockable for Shared {
         self.mem_blacklist.fork_unlock();
         self.mem_queue.fork_unlock();
         self.session.fork_unlock();
+        self.scope_written.fork_unlock();
         self.scope_file.fork_unlock();
         self.scope.fork_unlock();
     }
@@ -491,6 +526,8 @@ impl Recorder {
         let shared = Arc::new(Shared {
             scope: ForkLock::new(Scope::default()),
             scope_file: ForkLock::new(None),
+            scope_version: AtomicU64::new(0),
+            scope_written: ForkLock::new(0),
             env,
             environment_json,
             app_token: config.app_token.clone(),
