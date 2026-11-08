@@ -505,6 +505,56 @@ fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     drop(recorder);
 }
 
+/// Launch over a crashed session whose `parts/1` holds `files`, and return the
+/// recovered report's request body.
+fn recover_with_scope_files(files: &[(&str, &[u8])]) -> Value {
+    let dir = TempDir::new();
+    seed_crashed_session(&dir.path, 1);
+    for (name, bytes) in files {
+        std::fs::write(dir.path.join("parts/1").join(name), bytes).unwrap();
+    }
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir.path, "TOKEN"), transport.clone()).unwrap();
+    assert!(recorder.flush(Duration::from_secs(5)));
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1);
+    let (req, _) = request_and_manifest(&bundles[0]);
+    drop(bundles);
+    assert!(
+        !dir.path.join("parts/1").exists(),
+        "evidence discarded once queued"
+    );
+    drop(recorder);
+    req
+}
+
+#[test]
+fn a_crash_mid_scope_write_recovers_the_newest_complete_scope() {
+    // Died after the temp file was written, before the rename: `scope.json` is
+    // one change behind and the temp file carries the identity the user had.
+    let old = br#"{"email":"old@example.com","labels":[],"attributes":{}}"#;
+    let new = br#"{"email":"new@example.com","labels":["beta"],"attributes":{}}"#;
+    let req = recover_with_scope_files(&[("scope.json", old), ("scope.json.5.tmp", new)]);
+    assert_eq!(req["email"], "new@example.com");
+    assert_eq!(req["labels"], serde_json::json!(["beta"]));
+}
+
+#[test]
+fn a_torn_scope_temp_file_falls_back_to_the_previous_scope() {
+    let old = br#"{"email":"old@example.com","labels":[],"attributes":{}}"#;
+    let torn = br#"{"email":"new@exam"#;
+    let req = recover_with_scope_files(&[("scope.json", old), ("scope.json.5.tmp", torn)]);
+    assert_eq!(req["email"], "old@example.com");
+}
+
+#[test]
+fn a_crash_before_the_first_scope_rename_still_recovers_it() {
+    let only = br#"{"email":"first@example.com","labels":[],"attributes":{}}"#;
+    let req = recover_with_scope_files(&[("scope.json.1.tmp", only)]);
+    assert_eq!(req["email"], "first@example.com");
+}
+
 #[test]
 fn a_corrupt_persisted_scope_does_not_stop_recovery() {
     let dir = TempDir::new();

@@ -115,6 +115,48 @@ impl Scope {
         }
     }
 
+    /// Read the freshest usable scope a crashed session left at `path`.
+    ///
+    /// A write is a temp file (`<name>.<version>.tmp`) renamed over `path`, so a
+    /// session that died between the two leaves the newest scope in the temp
+    /// file and one change older in `path`. Candidates are tried newest first
+    /// (highest version, then `path` itself); the first that parses within the
+    /// size cap wins. A temp file torn by a crash mid-write fails to parse and
+    /// the next older candidate is used. `None` when nothing is usable.
+    pub fn load_recovering(path: &Path) -> Option<Scope> {
+        let mut temps = Self::temp_files(path);
+        temps.sort_by_key(|t| std::cmp::Reverse(t.0));
+        temps
+            .into_iter()
+            .map(|(_, p)| p)
+            .chain(std::iter::once(path.to_path_buf()))
+            .find_map(|p| Self::load(&p))
+    }
+
+    /// Temp files `stage` may have left next to `path`, with their versions.
+    fn temp_files(path: &Path) -> Vec<(u64, std::path::PathBuf)> {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let file = e.file_name().into_string().ok()?;
+                let version = file
+                    .strip_prefix(name)?
+                    .strip_prefix('.')?
+                    .strip_suffix(".tmp")?
+                    .parse::<u64>()
+                    .ok()?;
+                Some((version, e.path()))
+            })
+            .collect()
+    }
+
     /// Read a scope written by [`Scope::persist`]. `None` when absent, oversized
     /// or unparseable (a torn or foreign file is ignored, never fatal).
     pub fn load(path: &Path) -> Option<Scope> {
@@ -203,6 +245,89 @@ mod tests {
         small.set_email(Some("a@b.c".into()));
         assert!(small.persist(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    fn scope_with_email(email: &str) -> Scope {
+        let mut s = Scope::default();
+        s.set_email(Some(email.into()));
+        s
+    }
+
+    /// The on-disk state of a process that died after `stage` wrote the temp
+    /// file and before `commit` renamed it: `Staged` has no `Drop`, so letting it
+    /// go leaves the temp file exactly as a crash would.
+    fn die_before_rename(scope: &Scope, path: &Path, tag: u64) -> std::path::PathBuf {
+        match scope.stage(path, tag) {
+            Staged::Ready(tmp) => tmp,
+            other => panic!("expected a staged temp file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_crash_between_write_and_rename_recovers_the_newer_scope() {
+        let path = tmp();
+        scope_with_email("old@b.c").persist(&path).unwrap();
+        let tmp_file = die_before_rename(&scope_with_email("new@b.c"), &path, 7);
+        assert!(tmp_file.exists());
+        // The renamed file is one change behind; the temp file holds the newest.
+        assert_eq!(
+            Scope::load(&path).unwrap().email.as_deref(),
+            Some("old@b.c")
+        );
+        let back = Scope::load_recovering(&path).unwrap();
+        assert_eq!(back.email.as_deref(), Some("new@b.c"));
+    }
+
+    #[test]
+    fn a_crash_between_write_and_rename_recovers_when_no_file_was_renamed_yet() {
+        // First ever scope change of the session: nothing to fall back to.
+        let path = tmp();
+        die_before_rename(&scope_with_email("first@b.c"), &path, 1);
+        assert!(!path.exists());
+        let back = Scope::load_recovering(&path).unwrap();
+        assert_eq!(back.email.as_deref(), Some("first@b.c"));
+    }
+
+    #[test]
+    fn a_crash_mid_write_falls_back_to_the_last_complete_scope() {
+        let path = tmp();
+        scope_with_email("old@b.c").persist(&path).unwrap();
+        // The process died while `write` was filling the temp file.
+        let tmp_file = die_before_rename(&scope_with_email("new@b.c"), &path, 7);
+        let full = std::fs::read(&tmp_file).unwrap();
+        std::fs::write(&tmp_file, &full[..full.len() / 2]).unwrap();
+        let back = Scope::load_recovering(&path).unwrap();
+        assert_eq!(back.email.as_deref(), Some("old@b.c"));
+        // Same when the temp file is empty (power loss after an unsynced write).
+        std::fs::write(&tmp_file, b"").unwrap();
+        assert_eq!(
+            Scope::load_recovering(&path).unwrap().email.as_deref(),
+            Some("old@b.c")
+        );
+    }
+
+    #[test]
+    fn a_torn_temp_file_with_nothing_to_fall_back_to_recovers_no_scope() {
+        let path = tmp();
+        let tmp_file = die_before_rename(&scope_with_email("new@b.c"), &path, 3);
+        let full = std::fs::read(&tmp_file).unwrap();
+        std::fs::write(&tmp_file, &full[..full.len() - 4]).unwrap();
+        assert!(Scope::load_recovering(&path).is_none());
+    }
+
+    #[test]
+    fn the_newest_valid_temp_file_wins_and_unrelated_files_are_ignored() {
+        let path = tmp();
+        scope_with_email("v0@b.c").persist(&path).unwrap();
+        die_before_rename(&scope_with_email("v2@b.c"), &path, 2);
+        die_before_rename(&scope_with_email("v10@b.c"), &path, 10); // 10 > 2 numerically
+        let torn = die_before_rename(&scope_with_email("v11@b.c"), &path, 11);
+        std::fs::write(&torn, b"{\"email\":\"v11").unwrap();
+        let dir = path.parent().unwrap();
+        std::fs::write(dir.join("scope.json.bak"), b"{\"email\":\"x@b.c\"}").unwrap();
+        std::fs::write(dir.join("other.json.99.tmp"), b"{\"email\":\"y@b.c\"}").unwrap();
+        let back = Scope::load_recovering(&path).unwrap();
+        assert_eq!(back.email.as_deref(), Some("v10@b.c"));
     }
 
     #[test]

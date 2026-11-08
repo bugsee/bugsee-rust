@@ -1580,7 +1580,11 @@ fn recover_one(
     let now = epoch_ms();
     let (start, end) = span.unwrap_or((now, now));
     let mut built = recovery::build_report(pending, end);
-    if let Some(scope) = Scope::load(&pending.parts_dir.join(crate::model::scope::SCOPE_FILE)) {
+    // A crash can land between the scope temp-file write and its rename; take the
+    // freshest complete scope (the parts directory is discarded once queued).
+    if let Some(scope) =
+        Scope::load_recovering(&pending.parts_dir.join(crate::model::scope::SCOPE_FILE))
+    {
         apply_scope(&scope, &mut built.meta);
     }
 
