@@ -569,3 +569,9 @@ Rust and are worth evaluating before building one.
 - CI: ~~cross-platform matrix~~ **done**; loom/miri/fuzz jobs still open — fuzzing is
   newly justified now that `pe_debug_id` parses headers of arbitrary third-party
   DLLs, and the marker/module-map readers parse files a crash can truncate mid-write.
+
+- Follow-ups from #27 (#48): macOS/iOS `platform.locale` now comes from
+  CoreFoundation's preferred language; `hardware.manufacturer` is reported
+  (Linux DMI `sys_vendor`, Windows `SystemManufacturer`, `Apple`, Android
+  `ro.product.manufacturer`); Android now reports `hardware.model` from
+  `ro.product.model`.

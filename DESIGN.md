@@ -160,7 +160,7 @@ struct Scope { email: Option<String>,        // → request.json.email
 Global base scope behind `RwLock`; `with_scope` pushes a thread-local overlay. **Breadcrumbs are a capture channel on the disk-backed ring** (not in-scope RAM) so they survive crashes.
 
 **Environment** (`request.json.environment`, Rust-adapted, built once, `x-client-type: rust`):
-`platform`{type:`linux`/`windows`/`macos`, os version, kernel, utc_offset, disk/mem totals+free, locale} · `app`{name, version, build, exe path} · `hardware`{cpu_count, arch, model?, boot_time, mem, **gpu**{vendor, renderer, api, driver_version, vram_mb} — best-effort, `gpu` feature default-off} · `sdk`{version, build, options, wrapper?}.
+`platform`{type:`linux`/`windows`/`macos`, os version, kernel, utc_offset, disk/mem totals+free, locale} · `app`{name, version, build, exe path} · `hardware`{cpu_count, arch, model?, manufacturer?, boot_time, mem, **gpu**{vendor, renderer, api, driver_version, vram_mb} — best-effort, `gpu` feature default-off} · `sdk`{version, build, options, wrapper?}.
 
 **Conventions:** timestamps = epoch ms (monotonic-guarded); custom-data flattened as top-level entry keys **except** breadcrumbs (nested under `data`); three `version` fields preserved (manifest=1, envelopes=2, video-aux N/A); `null` tolerated on read.
 

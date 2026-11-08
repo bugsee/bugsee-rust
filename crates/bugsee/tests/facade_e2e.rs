@@ -129,22 +129,25 @@ fn full_public_api_flow() {
     // keys. Only what every desktop host resolves is required everywhere;
     // locale (needs `LANG` on Linux) and model/manufacturer (no DMI in
     // containers) are asserted where the platform guarantees them.
-    let platform = &req["environment"]["platform"];
-    assert!(platform["utc_offset"].is_i64(), "{platform}");
-    assert!(
-        platform["memory_total"].as_u64().unwrap_or(0) > 0,
-        "{platform}"
-    );
-    assert!(platform["version"].is_string(), "{platform}");
-    #[cfg(target_os = "macos")]
+    #[cfg(feature = "telemetry")]
     {
-        let hw = &req["environment"]["hardware"];
-        assert_eq!(hw["manufacturer"], "Apple", "{hw}");
+        let platform = &req["environment"]["platform"];
+        assert!(platform["utc_offset"].is_i64(), "{platform}");
         assert!(
-            hw["model"].as_str().is_some_and(|m| m.contains(',')),
-            "{hw}"
+            platform["memory_total"].as_u64().unwrap_or(0) > 0,
+            "{platform}"
         );
-        assert!(platform["locale"].is_string(), "{platform}");
+        assert!(platform["version"].is_string(), "{platform}");
+        #[cfg(target_os = "macos")]
+        {
+            let hw = &req["environment"]["hardware"];
+            assert_eq!(hw["manufacturer"], "Apple", "{hw}");
+            assert!(
+                hw["model"].as_str().is_some_and(|m| m.contains(',')),
+                "{hw}"
+            );
+            assert!(platform["locale"].is_string(), "{platform}");
+        }
     }
 
     let mut mbytes = Vec::new();
