@@ -361,8 +361,8 @@ struct ScopeWritten {
     version: u64,
     /// The file the identity below was written to.
     path: Option<PathBuf>,
-    /// The identity (email) on disk at `path`; `None` when there is none.
-    email: Option<String>,
+    /// The scope on disk at `path` (empty when there is no file).
+    scope: Scope,
 }
 
 impl Shared {
@@ -422,23 +422,24 @@ impl Shared {
         written.version = version;
         self.scope_unpersistable
             .store(matches!(staged, Staged::TooLarge), Ordering::Relaxed);
-        // If this write fails, the old file is still right about who the user is
-        // when the identity did not change (only labels/attributes lag), so keep
-        // it; otherwise remove it, so a crash reports no identity rather than a
-        // stale one.
+        // If this write fails, the old file is still right when the new scope
+        // only adds to it (anything stale is merely missing), so keep it;
+        // otherwise (an identity, label or attribute changed or went away) remove
+        // it, so a crash reports less rather than something wrong.
         let same_file = written.path.as_ref() == Some(&path);
-        let keep_stale = same_file && written.email == snapshot.email;
+        let keep_stale = same_file && snapshot.extends(&written.scope);
         let transient = !matches!(staged, Staged::TooLarge);
-        match staged.commit(&path, version, keep_stale) {
+        let result = staged.commit(&path, version, keep_stale);
+        match result {
             Ok(()) => {
                 self.scope_lagging.store(false, Ordering::Relaxed);
-                written.path = Some(path);
-                written.email = snapshot.email;
+                written.path = Some(path.clone());
+                written.scope = snapshot;
             }
             Err(_) => {
                 if !keep_stale {
-                    written.path = Some(path);
-                    written.email = None; // the file is gone
+                    written.path = Some(path.clone());
+                    written.scope = Scope::default(); // the file is gone
                 }
                 // A kept file is behind the in-memory scope: retry next call.
                 self.scope_lagging
@@ -449,10 +450,14 @@ impl Shared {
                     &WARNED,
                     "could not persist the session scope (identity, labels, attributes); a \
                      crash before the next successful write is reported with the last \
-                     persisted identity, or none if it changed",
+                     persisted scope, or none if something in it changed",
                 );
             }
         }
+        // Temp files of older versions can no longer win; the scan runs outside
+        // the ordering lock (it also takes fork prepare).
+        drop(written);
+        Scope::sweep_older(&path, version);
     }
 
     /// Point scope persistence at `path` and write the current scope there (a

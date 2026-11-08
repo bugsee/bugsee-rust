@@ -41,20 +41,20 @@ pub enum Staged {
 }
 
 impl Staged {
-    /// Make the staged scope the persisted one; `version` is the version it was
-    /// staged under. Temp files of older versions are swept afterwards, so a
-    /// crash can never find one that a newer commit (or a removal) superseded.
+    /// Make the staged scope the persisted one. Cheap enough to run under an
+    /// ordering lock (a rename); follow it with [`Scope::sweep_older`] outside
+    /// the lock so a crash cannot find a temp file that this commit superseded.
     ///
     /// When the new scope cannot be persisted the previous file is removed, so a
     /// crash reports no identity rather than a stale one, unless `keep_stale`:
-    /// the caller knows the identity (email) is unchanged, so the old file is
-    /// still right about who the user is and only labels/attributes lag.
-    pub fn commit(self, path: &Path, version: u64, keep_stale: bool) -> std::io::Result<()> {
+    /// the caller knows the old file is merely missing things the new scope has
+    /// (see [`Scope::extends`]), so nothing in it is wrong.
+    pub fn commit(self, path: &Path, _version: u64, keep_stale: bool) -> std::io::Result<()> {
         let remove = || match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
-        let result = match self {
+        match self {
             Staged::Remove => remove(),
             Staged::Ready(tmp) => std::fs::rename(&tmp, path).inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
@@ -68,9 +68,7 @@ impl Staged {
                 }
                 Err(std::io::Error::other("scope could not be persisted"))
             }
-        };
-        Scope::sweep_temp_files(path, version);
-        result
+        }
     }
 
     /// Drop a staged scope that a newer one superseded.
@@ -87,6 +85,18 @@ pub const SCOPE_FILE: &str = "scope.json";
 const MAX_PERSISTED_BYTES: u64 = 1 << 20;
 
 impl Scope {
+    /// True when `self` only adds to `old`: same email (or `old` had none), and
+    /// every label and attribute of `old` is still there with the same value. An
+    /// older file of such a scope is merely missing things, never wrong.
+    pub fn extends(&self, old: &Scope) -> bool {
+        (old.email.is_none() || old.email == self.email)
+            && old.labels.iter().all(|l| self.labels.contains(l))
+            && old
+                .attributes
+                .iter()
+                .all(|(k, v)| self.attributes.get(k) == Some(v))
+    }
+
     /// True when nothing is set (email, labels, attributes).
     pub fn is_empty(&self) -> bool {
         self.email.is_none() && self.labels.is_empty() && self.attributes.is_empty()
@@ -151,10 +161,10 @@ impl Scope {
             .collect();
         let committed = Self::load(path).map(|s| (Self::stored_version(path), s));
         candidates.extend(committed);
-        // Highest version; on a tie the committed file (pushed last) wins.
+        // Highest version. `max_by_key` keeps the last of equal maxima, and the
+        // committed file is last, so it wins a tie.
         candidates
             .into_iter()
-            .rev()
             .max_by_key(|(v, _)| *v)
             .map(|(_, s)| s)
     }
@@ -168,8 +178,9 @@ impl Scope {
             .unwrap_or(0)
     }
 
-    /// Remove the temp files of versions older than `version`.
-    fn sweep_temp_files(path: &Path, version: u64) {
+    /// Remove the temp files of versions older than `version` (a directory scan:
+    /// call without holding an ordering lock).
+    pub fn sweep_older(path: &Path, version: u64) {
         for (v, p) in Self::temp_files(path) {
             if v < version {
                 let _ = std::fs::remove_file(p);
@@ -444,11 +455,12 @@ mod tests {
             .stage(&path, 2)
             .commit(&path, 2, false)
             .unwrap();
+        Scope::sweep_older(&path, 2);
         assert!(Scope::load_recovering(&path).is_none());
     }
 
     #[test]
-    fn a_commit_sweeps_the_temp_files_of_older_versions() {
+    fn a_sweep_removes_the_temp_files_of_older_versions() {
         let path = tmp();
         let older = die_before_rename(&scope_with_email("a@x"), &path, 1);
         let newer = die_before_rename(&scope_with_email("z@x"), &path, 9);
@@ -456,6 +468,8 @@ mod tests {
             .stage(&path, 5)
             .commit(&path, 5, false)
             .unwrap();
+        assert!(older.exists(), "commit itself does no directory scan");
+        Scope::sweep_older(&path, 5);
         assert!(!older.exists(), "an older version's temp file is swept");
         assert!(newer.exists(), "a newer in-flight temp file is left alone");
         assert_eq!(Scope::load(&path).unwrap().email.as_deref(), Some("b@x"));
@@ -473,6 +487,58 @@ mod tests {
         // Changed identity: never leave the previous one behind.
         assert!(big.stage(&path, 2).commit(&path, 2, false).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn on_equal_versions_the_committed_scope_wins() {
+        // No `"v"` (read as 0) next to a `.0.tmp`: a tie.
+        let path = tmp();
+        std::fs::write(&path.file, br#"{"email":"committed@x"}"#).unwrap();
+        std::fs::write(
+            path.with_file_name("scope.json.0.tmp"),
+            br#"{"email":"temp@x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Scope::load_recovering(&path).unwrap().email.as_deref(),
+            Some("committed@x")
+        );
+    }
+
+    #[test]
+    fn extends_is_true_only_when_the_old_scope_is_merely_missing_things() {
+        let mut old = Scope::default();
+        old.set_email(Some("a@x".into()));
+        old.labels.push("beta".into());
+        old.set_attribute("plan", Value::from("pro"));
+        let mut more = old.clone();
+        more.labels.push("new".into());
+        more.set_attribute("extra", Value::from(1));
+        assert!(more.extends(&old), "pure additions");
+        assert!(old.extends(&old), "unchanged");
+        assert!(old.extends(&Scope::default()), "anything extends nothing");
+
+        let mut changed_attr = old.clone();
+        changed_attr.set_attribute("plan", Value::from("free"));
+        assert!(
+            !changed_attr.extends(&old),
+            "a changed value is not an addition"
+        );
+        let mut removed_attr = old.clone();
+        removed_attr.clear_attribute("plan");
+        assert!(!removed_attr.extends(&old), "a removed attribute");
+        let mut removed_label = old.clone();
+        removed_label.labels.clear();
+        assert!(!removed_label.extends(&old), "a removed label");
+        let mut other_email = old.clone();
+        other_email.set_email(Some("b@x".into()));
+        assert!(!other_email.extends(&old), "a changed email");
+        let mut no_email = old.clone();
+        no_email.set_email(None);
+        assert!(!no_email.extends(&old), "a cleared email");
+        let mut gained_email = Scope::default();
+        gained_email.set_email(Some("a@x".into()));
+        assert!(gained_email.extends(&Scope::default()), "a gained email");
     }
 
     #[test]

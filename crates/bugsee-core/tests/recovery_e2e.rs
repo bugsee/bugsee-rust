@@ -537,6 +537,31 @@ fn a_transient_write_failure_that_kept_the_old_file_is_retried_on_the_next_call(
 }
 
 #[test]
+fn a_failed_write_that_changes_an_attribute_never_keeps_the_old_value() {
+    // Hosts that carry identity in an attribute (no email) must not be reported
+    // as the previous user when the write that changed it fails.
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_attribute("user_id", Value::from("A")));
+    assert!(scope_file.exists());
+    recorder.with_scope(|s| {
+        s.set_attribute("user_id", Value::from("B"));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    assert!(recorder.is_degraded());
+    assert!(
+        !scope_file.exists(),
+        "user A must not outlive the change to B"
+    );
+    drop(recorder);
+}
+
+#[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.
     let dir = TempDir::new();
