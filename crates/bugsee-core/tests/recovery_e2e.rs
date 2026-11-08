@@ -458,10 +458,10 @@ fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     });
     assert!(scope_file.exists(), "scope persisted on change");
     let scope_bytes = std::fs::read(&scope_file).unwrap();
-    // Setting what is already set is not a change: nothing is rewritten.
+    // A lost file is restored by the next call even if the value is unchanged.
     std::fs::remove_file(&scope_file).unwrap();
     first.with_scope(|s| s.set_email(Some("crashed@example.com".into())));
-    assert!(!scope_file.exists(), "an unchanged scope is not rewritten");
+    assert!(scope_file.exists(), "a missing scope file is restored");
     first.with_scope(|s| s.set_attribute("later", Value::from(1)));
     assert!(scope_file.exists());
     assert_ne!(

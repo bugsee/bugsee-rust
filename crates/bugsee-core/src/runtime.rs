@@ -360,8 +360,10 @@ impl Shared {
             let mut guard = self.scope.lock();
             let before = guard.clone();
             let result = f(&mut guard);
-            // Only a real change is written (hosts may set the same value per request).
-            let job = if *guard != before {
+            // Only a real change is written (hosts may set the same value per
+            // request), or a missing file is restored (a failed write, or a data
+            // directory that vanished and was healed, must not outlast the next call).
+            let job = if *guard != before || self.scope_file_missing(&guard) {
                 self.scope_job(&guard)
             } else {
                 None
@@ -372,6 +374,11 @@ impl Shared {
             self.persist_scope(job);
         }
         result
+    }
+
+    /// A non-empty scope whose session file is gone. Scope lock held.
+    fn scope_file_missing(&self, scope: &Scope) -> bool {
+        !scope.is_empty() && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())
     }
 
     /// A versioned snapshot to persist, or `None` without a session file.
