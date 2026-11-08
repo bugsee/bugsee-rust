@@ -474,6 +474,26 @@ fn a_scope_that_cannot_be_persisted_degrades_the_recorder_and_drops_the_stale_fi
 }
 
 #[test]
+fn a_failed_additive_scope_write_keeps_the_identity_on_disk() {
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_email(Some("user@example.com".into())));
+    // The next change (the email is untouched) cannot be persisted.
+    recorder.with_scope(|s| s.set_attribute("big", Value::from("x".repeat(2 << 20))));
+    assert!(recorder.is_degraded(), "the lost write is surfaced");
+    let kept = std::fs::read(&scope_file).expect("the identity written earlier survives");
+    let kept: Value = serde_json::from_slice(&kept).unwrap();
+    assert_eq!(kept["email"], "user@example.com");
+    assert!(kept["attributes"].get("big").is_none());
+    drop(recorder);
+}
+
+#[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.
     let dir = TempDir::new();

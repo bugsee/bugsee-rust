@@ -269,9 +269,9 @@ struct Shared {
     scope_file: ForkLock<Option<PathBuf>>,
     /// Version of the newest scope snapshot taken (assigned under `scope`).
     scope_version: AtomicU64,
-    /// Version of the newest snapshot written; held across the write so
-    /// snapshots reach the file in order.
-    scope_written: ForkLock<u64>,
+    /// What the scope file holds, as far as this process knows; held across the
+    /// commit so snapshots reach the file in order.
+    scope_written: ForkLock<ScopeWritten>,
     /// The newest scope can never be persisted (too large), so a missing file is
     /// expected and must not be re-staged on every call. Cleared by the next
     /// scope that stages.
@@ -351,6 +351,17 @@ struct LaunchPlan {
     heartbeat_of: Option<PathBuf>,
 }
 
+/// The scope file as this process last left it.
+#[derive(Default)]
+struct ScopeWritten {
+    /// Version of the newest snapshot committed (or attempted).
+    version: u64,
+    /// The file the identity below was written to.
+    path: Option<PathBuf>,
+    /// The identity (email) on disk at `path`; `None` when there is none.
+    email: Option<String>,
+}
+
 impl Shared {
     /// Mutate the scope and persist it into the session directory, so a crash of
     /// this session is recovered with the identity it had. Written on change (the
@@ -400,24 +411,38 @@ impl Shared {
         // (and the version check that keeps snapshots in order) is under one.
         let staged = snapshot.stage(&path, version);
         let mut written = self.scope_written.lock();
-        if version > *written {
-            *written = version;
-            self.scope_unpersistable
-                .store(matches!(staged, Staged::TooLarge), Ordering::Relaxed);
-            if staged.commit(&path).is_err() {
-                // The previous file is gone (a crash must not report the old
-                // identity), so a crash before the next successful write recovers
-                // no scope: surface that instead of failing silently.
+        if version <= written.version {
+            staged.discard();
+            return;
+        }
+        written.version = version;
+        self.scope_unpersistable
+            .store(matches!(staged, Staged::TooLarge), Ordering::Relaxed);
+        // If this write fails, the old file is still right about who the user is
+        // when the identity did not change (only labels/attributes lag), so keep
+        // it; otherwise remove it, so a crash reports no identity rather than a
+        // stale one.
+        let same_file = written.path.as_ref() == Some(&path);
+        let keep_stale = same_file && written.email == snapshot.email;
+        match staged.commit(&path, version, keep_stale) {
+            Ok(()) => {
+                written.path = Some(path);
+                written.email = snapshot.email;
+            }
+            Err(_) => {
+                if !keep_stale {
+                    written.path = Some(path);
+                    written.email = None; // the file is gone
+                }
                 self.degraded.store(true, Ordering::Relaxed);
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 crate::util::warn_once(
                     &WARNED,
                     "could not persist the session scope (identity, labels, attributes); a \
-                     crash before the next successful write is reported without them",
+                     crash before the next successful write is reported with the last \
+                     persisted identity, or none if it changed",
                 );
             }
-        } else {
-            staged.discard();
         }
     }
 
@@ -558,7 +583,7 @@ impl Recorder {
             scope: ForkLock::new(Scope::default()),
             scope_file: ForkLock::new(None),
             scope_version: AtomicU64::new(0),
-            scope_written: ForkLock::new(0),
+            scope_written: ForkLock::new(ScopeWritten::default()),
             scope_unpersistable: AtomicBool::new(false),
             env,
             environment_json,

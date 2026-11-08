@@ -33,32 +33,44 @@ pub enum Staged {
     /// The temp file holding the new scope.
     Ready(std::path::PathBuf),
     /// The new scope can never be persisted (it does not serialise or exceeds
-    /// [`MAX_PERSISTED_BYTES`]): committing removes the stale file, and retrying
-    /// the same scope is pointless.
+    /// [`MAX_PERSISTED_BYTES`]): retrying the same scope is pointless.
     TooLarge,
     /// The new scope could not be staged this time (e.g. disk full, directory
-    /// gone): committing removes the stale file, and a retry may succeed.
+    /// gone): a retry may succeed.
     Failed,
 }
 
 impl Staged {
-    /// Make the staged scope the persisted one.
-    pub fn commit(self, path: &Path) -> std::io::Result<()> {
+    /// Make the staged scope the persisted one; `version` is the version it was
+    /// staged under. Temp files of older versions are swept afterwards, so a
+    /// crash can never find one that a newer commit (or a removal) superseded.
+    ///
+    /// When the new scope cannot be persisted the previous file is removed, so a
+    /// crash reports no identity rather than a stale one, unless `keep_stale`:
+    /// the caller knows the identity (email) is unchanged, so the old file is
+    /// still right about who the user is and only labels/attributes lag.
+    pub fn commit(self, path: &Path, version: u64, keep_stale: bool) -> std::io::Result<()> {
         let remove = || match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
-        match self {
+        let result = match self {
             Staged::Remove => remove(),
             Staged::Ready(tmp) => std::fs::rename(&tmp, path).inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
-                let _ = remove();
+                if !keep_stale {
+                    let _ = remove();
+                }
             }),
             Staged::TooLarge | Staged::Failed => {
-                let _ = remove();
+                if !keep_stale {
+                    let _ = remove();
+                }
                 Err(std::io::Error::other("scope could not be persisted"))
             }
-        }
+        };
+        Scope::sweep_temp_files(path, version);
+        result
     }
 
     /// Drop a staged scope that a newer one superseded.
@@ -86,9 +98,10 @@ impl Scope {
     ///
     /// Best effort at not leaving a stale copy: when the new scope cannot be
     /// written (or is larger than recovery will read), the old file is removed, so
-    /// a crash reports no identity rather than a previous one.
+    /// a crash reports no identity rather than a previous one (see
+    /// [`Staged::commit`] for the one case where it is kept).
     pub fn persist(&self, path: &Path) -> std::io::Result<()> {
-        self.stage(path, 0).commit(path)
+        self.stage(path, 0).commit(path, 0, false)
     }
 
     /// First half of [`Scope::persist`]: do the slow part (serialise, write a
@@ -99,6 +112,7 @@ impl Scope {
             return Staged::Remove;
         }
         let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
+            "v": tag,
             "email": self.email,
             "labels": self.labels,
             "attributes": self.attributes,
@@ -124,18 +138,43 @@ impl Scope {
     ///
     /// A write is a temp file (`<name>.<version>.tmp`) renamed over `path`, so a
     /// session that died between the two leaves the newest scope in the temp
-    /// file and one change older in `path`. Candidates are tried newest first
-    /// (highest version, then `path` itself); the first that parses within the
-    /// size cap wins. A temp file torn by a crash mid-write fails to parse and
-    /// the next older candidate is used. `None` when nothing is usable.
+    /// file and one change older in `path`. Every candidate carries a version
+    /// (a temp file in its name, `path` in its `"v"` field; absent is 0) and the
+    /// highest version that parses within the size cap wins, so a temp file left
+    /// by a writer that lost the race never beats a newer committed scope. A temp
+    /// file torn by a crash mid-write fails to parse and the next candidate is
+    /// used. `None` when nothing is usable.
     pub fn load_recovering(path: &Path) -> Option<Scope> {
-        let mut temps = Self::temp_files(path);
-        temps.sort_by_key(|t| std::cmp::Reverse(t.0));
-        temps
+        let mut candidates: Vec<(u64, Scope)> = Self::temp_files(path)
             .into_iter()
-            .map(|(_, p)| p)
-            .chain(std::iter::once(path.to_path_buf()))
-            .find_map(|p| Self::load(&p))
+            .filter_map(|(v, p)| Self::load(&p).map(|s| (v, s)))
+            .collect();
+        let committed = Self::load(path).map(|s| (Self::stored_version(path), s));
+        candidates.extend(committed);
+        // Highest version; on a tie the committed file (pushed last) wins.
+        candidates
+            .into_iter()
+            .rev()
+            .max_by_key(|(v, _)| *v)
+            .map(|(_, s)| s)
+    }
+
+    /// The `"v"` a committed scope file was staged under (0 if absent).
+    fn stored_version(path: &Path) -> u64 {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v.get("v").and_then(Value::as_u64))
+            .unwrap_or(0)
+    }
+
+    /// Remove the temp files of versions older than `version`.
+    fn sweep_temp_files(path: &Path, version: u64) {
+        for (v, p) in Self::temp_files(path) {
+            if v < version {
+                let _ = std::fs::remove_file(p);
+            }
+        }
     }
 
     /// Temp files `stage` may have left next to `path`, with their versions.
@@ -348,6 +387,66 @@ mod tests {
         std::fs::write(dir.join("other.json.99.tmp"), b"{\"email\":\"y@b.c\"}").unwrap();
         let back = Scope::load_recovering(&path).unwrap();
         assert_eq!(back.email.as_deref(), Some("v10@b.c"));
+    }
+
+    #[test]
+    fn a_stale_lower_version_temp_file_never_beats_the_committed_scope() {
+        // Thread B committed version 2; thread A's older version 1 was still
+        // staged (it lost the version check) when the process died.
+        let path = tmp();
+        scope_with_email("b@x")
+            .stage(&path, 2)
+            .commit(&path, 2, false)
+            .unwrap();
+        die_before_rename(&scope_with_email("a@x"), &path, 1);
+        let back = Scope::load_recovering(&path).unwrap();
+        assert_eq!(back.email.as_deref(), Some("b@x"));
+        // A genuinely newer temp file still wins over the committed one.
+        die_before_rename(&scope_with_email("c@x"), &path, 3);
+        assert_eq!(
+            Scope::load_recovering(&path).unwrap().email.as_deref(),
+            Some("c@x")
+        );
+    }
+
+    #[test]
+    fn a_stale_temp_file_after_a_removal_recovers_no_scope() {
+        // Logout (version 2) removed scope.json; version 1's temp file survives.
+        let path = tmp();
+        die_before_rename(&scope_with_email("a@x"), &path, 1);
+        Scope::default()
+            .stage(&path, 2)
+            .commit(&path, 2, false)
+            .unwrap();
+        assert!(Scope::load_recovering(&path).is_none());
+    }
+
+    #[test]
+    fn a_commit_sweeps_the_temp_files_of_older_versions() {
+        let path = tmp();
+        let older = die_before_rename(&scope_with_email("a@x"), &path, 1);
+        let newer = die_before_rename(&scope_with_email("z@x"), &path, 9);
+        scope_with_email("b@x")
+            .stage(&path, 5)
+            .commit(&path, 5, false)
+            .unwrap();
+        assert!(!older.exists(), "an older version's temp file is swept");
+        assert!(newer.exists(), "a newer in-flight temp file is left alone");
+        assert_eq!(Scope::load(&path).unwrap().email.as_deref(), Some("b@x"));
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_old_file_only_when_asked_to() {
+        let path = tmp();
+        scope_with_email("a@x").persist(&path).unwrap();
+        let mut big = scope_with_email("a@x");
+        big.set_attribute("big", Value::from("x".repeat(MAX_PERSISTED_BYTES as usize)));
+        // Same identity: the old file is still right about who the user is.
+        assert!(big.stage(&path, 1).commit(&path, 1, true).is_err());
+        assert_eq!(Scope::load(&path).unwrap().email.as_deref(), Some("a@x"));
+        // Changed identity: never leave the previous one behind.
+        assert!(big.stage(&path, 2).commit(&path, 2, false).is_err());
+        assert!(!path.exists());
     }
 
     #[test]
