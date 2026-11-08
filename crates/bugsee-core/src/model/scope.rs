@@ -254,10 +254,36 @@ impl Scope {
 mod tests {
     use super::*;
 
-    fn tmp() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("bugsee-scope-{}", crate::util::random_hex(8)));
-        std::fs::create_dir_all(&p).unwrap();
-        p.join(SCOPE_FILE)
+    /// A scratch scope path whose directory is removed when dropped.
+    struct TmpScope {
+        dir: std::path::PathBuf,
+        file: std::path::PathBuf,
+    }
+
+    impl Drop for TmpScope {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl AsRef<Path> for TmpScope {
+        fn as_ref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    impl std::ops::Deref for TmpScope {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.file
+        }
+    }
+
+    fn tmp() -> TmpScope {
+        let dir = std::env::temp_dir().join(format!("bugsee-scope-{}", crate::util::random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(SCOPE_FILE);
+        TmpScope { dir, file }
     }
 
     #[test]

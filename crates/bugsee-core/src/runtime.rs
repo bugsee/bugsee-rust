@@ -276,6 +276,9 @@ struct Shared {
     /// expected and must not be re-staged on every call. Cleared by the next
     /// scope that stages.
     scope_unpersistable: AtomicBool,
+    /// A transient write failure kept an older file that now lags the in-memory
+    /// scope: retry on the next scope call even if nothing changed.
+    scope_lagging: AtomicBool,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
@@ -395,7 +398,8 @@ impl Shared {
     fn scope_file_missing(&self, scope: &Scope) -> bool {
         !scope.is_empty()
             && !self.scope_unpersistable.load(Ordering::Relaxed)
-            && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())
+            && (self.scope_lagging.load(Ordering::Relaxed)
+                || self.scope_file.lock().as_ref().is_some_and(|p| !p.exists()))
     }
 
     /// A versioned snapshot to persist, or `None` without a session file.
@@ -424,8 +428,10 @@ impl Shared {
         // stale one.
         let same_file = written.path.as_ref() == Some(&path);
         let keep_stale = same_file && written.email == snapshot.email;
+        let transient = !matches!(staged, Staged::TooLarge);
         match staged.commit(&path, version, keep_stale) {
             Ok(()) => {
+                self.scope_lagging.store(false, Ordering::Relaxed);
                 written.path = Some(path);
                 written.email = snapshot.email;
             }
@@ -434,6 +440,9 @@ impl Shared {
                     written.path = Some(path);
                     written.email = None; // the file is gone
                 }
+                // A kept file is behind the in-memory scope: retry next call.
+                self.scope_lagging
+                    .store(keep_stale && transient, Ordering::Relaxed);
                 self.degraded.store(true, Ordering::Relaxed);
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 crate::util::warn_once(
@@ -585,6 +594,7 @@ impl Recorder {
             scope_version: AtomicU64::new(0),
             scope_written: ForkLock::new(ScopeWritten::default()),
             scope_unpersistable: AtomicBool::new(false),
+            scope_lagging: AtomicBool::new(false),
             env,
             environment_json,
             app_token: config.app_token.clone(),

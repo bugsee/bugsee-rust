@@ -493,6 +493,49 @@ fn a_failed_additive_scope_write_keeps_the_identity_on_disk() {
     drop(recorder);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_transient_write_failure_that_kept_the_old_file_is_retried_on_the_next_call() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    let parts = scope_file.parent().unwrap().to_path_buf();
+    recorder.with_scope(|s| s.set_email(Some("user@example.com".into())));
+
+    // A read-only session directory: the temp file cannot be written, so the
+    // old file (same email) is kept while the in-memory scope moves on.
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o555)).unwrap();
+    recorder.with_scope(|s| s.labels.push("beta".into()));
+    let writable = std::fs::write(parts.join("probe"), b"").is_ok(); // running as root
+    std::fs::set_permissions(&parts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if writable {
+        return;
+    }
+    assert!(recorder.is_degraded());
+    let lagging: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(
+        lagging["labels"],
+        serde_json::json!([]),
+        "the kept file lags"
+    );
+
+    // The host sets the very same value again (no change): the lagging file is
+    // still brought up to date.
+    recorder.with_scope(|s| {
+        if !s.labels.contains(&"beta".to_string()) {
+            s.labels.push("beta".into());
+        }
+    });
+    let healed: Value = serde_json::from_slice(&std::fs::read(&scope_file).unwrap()).unwrap();
+    assert_eq!(healed["labels"], serde_json::json!(["beta"]));
+    drop(recorder);
+}
+
 #[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.
