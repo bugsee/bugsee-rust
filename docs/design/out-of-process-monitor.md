@@ -150,7 +150,7 @@ Process attributes: monitor is started with stdio closed/null, in its own proces
 | Unix path (verified) | Reaches | Monitor action |
 |---|---|---|
 | No host handler (`SIG_DFL`/ignored non-sent) or host declined after `call_host` | `finish_fatal` then `die_of` | confirm-fatal |
-| **Stack overflow on a small alt stack** (`looks_like_stack_overflow`: fault within 16 KiB below / 4 KiB above `sp`, handler with under 32 KiB of alt stack left) | `complete_report` **before** `call_host`; the host (Rust's own overflow handler) then prints and `abort()`s | **local save only** of the faulting registers before `call_host` (below); no monitor traffic yet |
+| **Any fault on a small alt stack** (`must_complete_before_host`: handler with under 32 KiB of alt stack left, e.g. a Rust-spawned thread; the stack-overflow case and a host that `abort()`s on a spawned thread both need it) | `complete_report` **before** `call_host`; the host (Rust's own overflow handler, or any host that `abort()`s) then runs and may `abort()` | **local save only** of the faulting registers before `call_host` (below); no monitor traffic yet |
 | **Nested `abort()` from inside the host handler** (`aborting_inside_host`: SIGABRT within 1 MiB below the chained frame) | `finish_original_report`, **never** `finish_fatal`; the original SIGSEGV `ucontext` is gone by now | confirm-fatal, sending the **locally saved** faulting registers from the chain slot |
 | Host recovered (`drop_marker`) | marker unlinked | **nothing**: the monitor was never told, so there is nothing to cancel |
 
