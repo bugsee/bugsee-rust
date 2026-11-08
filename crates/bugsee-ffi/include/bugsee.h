@@ -533,7 +533,8 @@ BugseeStatus bugsee_storage_status(uint32_t *out_flags);
 
  `name` defaults to "Exception", `reason` to "". `frames` run innermost call
  first (at most 512 are kept); `function` is required per frame, and a frame
- with `"in_app": false` is hidden from grouping. `causes` runs outermost first
+ with `"in_app": false` is hidden from grouping (an error with no in-app
+ frames groups by name and reason alone, so send them). `causes` runs outermost first
  (at most 32 are kept). Unknown fields are ignored. Does nothing (and returns
  `OK`) before launch, like the other capture calls.
 

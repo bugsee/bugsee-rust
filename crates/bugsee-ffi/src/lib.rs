@@ -1078,6 +1078,8 @@ fn parse_frame(value: &Value, index: usize) -> Result<Frame, String> {
             .as_i64()
             .ok_or_else(|| format!("frames[{index}]: `line` must be an integer"))?,
     };
+    // The model reserves -1 (unknown) and -2 (native); anything lower is unknown.
+    let line = if line < -2 { -1 } else { line };
     let in_app = match obj.get("in_app") {
         None | Some(Value::Null) => true,
         Some(Value::Bool(b)) => *b,
@@ -1178,7 +1180,8 @@ fn parse_host_error(json: &str) -> Result<HostError, String> {
 ///
 /// `name` defaults to "Exception", `reason` to "". `frames` run innermost call
 /// first (at most 512 are kept); `function` is required per frame, and a frame
-/// with `"in_app": false` is hidden from grouping. `causes` runs outermost first
+/// with `"in_app": false` is hidden from grouping (an error with no in-app
+/// frames groups by name and reason alone, so send them). `causes` runs outermost first
 /// (at most 32 are kept). Unknown fields are ignored. Does nothing (and returns
 /// `OK`) before launch, like the other capture calls.
 ///
@@ -1223,6 +1226,11 @@ mod tests {
     fn last_error() -> Option<String> {
         let p = bugsee_last_error();
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+
+    /// Borrow a handle the test knows is live (a null-checked `as_ref`).
+    fn opts<'a>(handle: *mut BugseeOptions) -> &'a BugseeOptions {
+        unsafe { handle.as_ref() }.expect("handle is non-null")
     }
 
     fn new_options(token: &CStr) -> *mut BugseeOptions {
@@ -1449,7 +1457,7 @@ mod tests {
                 bugsee_options_set_flush_at_exit_ms(handle, 2000),
                 BugseeStatus::Ok
             );
-            let o = &*handle;
+            let o = opts(handle);
             assert_eq!(o.data_dir.as_deref(), Some(std::path::Path::new("/data/x")));
             assert_eq!(o.endpoint.as_deref(), Some("http://e"));
             assert_eq!(o.scrubbing, Some(false));
@@ -1470,8 +1478,8 @@ mod tests {
                 bugsee_options_set_flush_at_exit_ms(handle, 0),
                 BugseeStatus::Ok
             );
-            assert!((*handle).data_dir.is_none());
-            assert!((*handle).flush_at_exit.is_none());
+            assert!(opts(handle).data_dir.is_none());
+            assert!(opts(handle).flush_at_exit.is_none());
 
             bugsee_options_free(handle);
             bugsee_options_free(std::ptr::null_mut());
@@ -1486,7 +1494,7 @@ mod tests {
                 bugsee_options_set_data_dir(handle, c"\xff".as_ptr()),
                 BugseeStatus::InvalidArgument
             );
-            assert!((*handle).data_dir.is_none());
+            assert!(opts(handle).data_dir.is_none());
             for rate in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
                 assert_eq!(
                     bugsee_options_set_sample_rate(handle, rate),
