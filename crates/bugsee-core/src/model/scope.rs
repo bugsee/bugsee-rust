@@ -25,6 +25,45 @@ pub struct Scope {
     pub contexts: Map<String, Value>,
 }
 
+/// A scope written to a temp file, awaiting its rename (see [`Scope::stage`]).
+#[derive(Debug)]
+pub enum Staged {
+    /// The scope is empty: committing removes the file.
+    Remove,
+    /// The temp file holding the new scope.
+    Ready(std::path::PathBuf),
+    /// The new scope could not be staged: committing removes the stale file.
+    Failed,
+}
+
+impl Staged {
+    /// Make the staged scope the persisted one.
+    pub fn commit(self, path: &Path) -> std::io::Result<()> {
+        let remove = || match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        match self {
+            Staged::Remove => remove(),
+            Staged::Ready(tmp) => std::fs::rename(&tmp, path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+                let _ = remove();
+            }),
+            Staged::Failed => {
+                let _ = remove();
+                Err(std::io::Error::other("scope could not be persisted"))
+            }
+        }
+    }
+
+    /// Drop a staged scope that a newer one superseded.
+    pub fn discard(self) {
+        if let Staged::Ready(tmp) = self {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
 /// File name of the persisted scope inside a session's parts directory.
 pub const SCOPE_FILE: &str = "scope.json";
 /// Largest persisted scope that recovery will read.
@@ -40,42 +79,40 @@ impl Scope {
     /// so a crash mid-write leaves the previous copy). An empty scope removes the
     /// file. Called on change, never on the crash path.
     ///
-    /// Never leaves a stale copy: when the new scope cannot be written (or is
-    /// larger than recovery will read), the old file is removed, so a crash
-    /// reports no identity rather than a previous one.
+    /// Best effort at not leaving a stale copy: when the new scope cannot be
+    /// written (or is larger than recovery will read), the old file is removed, so
+    /// a crash reports no identity rather than a previous one.
     pub fn persist(&self, path: &Path) -> std::io::Result<()> {
-        let remove = || match std::fs::remove_file(path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-        if self.is_empty() {
-            return remove();
-        }
-        let written = self.write_file(path);
-        if written.is_err() {
-            let _ = remove();
-        }
-        written
+        self.stage(path, 0).commit(path)
     }
 
-    fn write_file(&self, path: &Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec(&serde_json::json!({
+    /// First half of [`Scope::persist`]: do the slow part (serialise, write a
+    /// temp file named by `tag`) so a caller can take a lock for only the
+    /// [`Staged::commit`].
+    pub fn stage(&self, path: &Path, tag: u64) -> Staged {
+        if self.is_empty() {
+            return Staged::Remove;
+        }
+        let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
             "email": self.email,
             "labels": self.labels,
             "attributes": self.attributes,
-        }))
-        .map_err(std::io::Error::other)?;
+        })) else {
+            return Staged::Failed;
+        };
         if bytes.len() as u64 > MAX_PERSISTED_BYTES {
-            return Err(std::io::Error::other("scope too large to persist"));
+            return Staged::Failed;
         }
         let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
+        tmp.push(format!(".{tag}.tmp"));
         let tmp = std::path::PathBuf::from(tmp);
-        let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        match std::fs::write(&tmp, bytes) {
+            Ok(()) => Staged::Ready(tmp),
+            Err(_) => {
+                let _ = std::fs::remove_file(&tmp);
+                Staged::Failed
+            }
         }
-        result
     }
 
     /// Read a scope written by [`Scope::persist`]. `None` when absent, oversized

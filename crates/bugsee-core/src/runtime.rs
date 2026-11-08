@@ -383,10 +383,15 @@ impl Shared {
     }
 
     fn persist_scope(&self, (version, path, snapshot): (u64, PathBuf, Scope)) {
+        // Serialise and write the temp file with no lock held; only the rename
+        // (and the version check that keeps snapshots in order) is under one.
+        let staged = snapshot.stage(&path, version);
         let mut written = self.scope_written.lock();
         if version > *written {
             *written = version;
-            let _ = snapshot.persist(&path);
+            let _ = staged.commit(&path);
+        } else {
+            staged.discard();
         }
     }
 
