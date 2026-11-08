@@ -2173,10 +2173,15 @@ mod imp {
             unsafe {
                 let prev = (*PREVIOUS.0.get()).as_mut_ptr().cast::<libc::sigaction>();
                 let mut sa: libc::sigaction = core::mem::zeroed();
+                // Nothing is added to the mask: the kernel blocks the delivered
+                // signal itself, and that is all. Whatever else the thread had
+                // blocked stays blocked, and nothing more does. The host handler we
+                // chain to then runs under the mask it would have had if it had
+                // been called directly, so a host that `abort()`s from inside its
+                // handler delivers SIGABRT to us (glibc 2.41 no longer unblocks it
+                // for the caller). A fault while we write the marker is caught by
+                // the `WRITING` latch, not by the mask.
                 libc::sigemptyset(&mut sa.sa_mask);
-                for sig in SIGNALS {
-                    libc::sigaddset(&mut sa.sa_mask, sig);
-                }
                 sa.sa_sigaction = handler as *const () as usize;
                 sa.sa_flags = libc::SA_ONSTACK | libc::SA_SIGINFO;
                 ARMED.store(1, Ordering::Release);
@@ -2725,6 +2730,51 @@ mod imp {
             }
         }
 
+        /// Was this signal sent with `kill` (`SI_USER`)? Only Linux says so reliably:
+        /// `abort()` and `pthread_kill` raise at their own thread (`SI_TKILL`).
+        #[inline(never)]
+        unsafe fn sent_by_kill(info: *const libc::siginfo_t) -> bool {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                // SAFETY: kernel-provided siginfo of the signal being handled.
+                unsafe { (*info).si_code == libc::SI_USER }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                let _ = info;
+                false
+            }
+        }
+
+        /// A SIGABRT that was sent (not the host's `abort()`) is ending the process:
+        /// report it as itself. Header only — the unwind is not async-signal-safe
+        /// and this runs nested inside a host handler, possibly on a small alternate
+        /// stack, where a re-fault would end the process of SIGSEGV instead.
+        #[inline(never)]
+        unsafe fn report_sent_abort(
+            tid: i32,
+            path: *mut Vec<PathChar>,
+            sig: libc::c_int,
+            info: *const libc::siginfo_t,
+            pc: usize,
+        ) {
+            if path.is_null() {
+                return;
+            }
+            lock_writing(tid);
+            if !report_is_complete() {
+                let watchdog = Watchdog::arm();
+                // SAFETY: the path is a leaked box; `info` is the kernel's siginfo.
+                unsafe { write_header(&*path, sig, info, pc) };
+                let generation = GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                OWNER.store(generation, Ordering::Release);
+                FRAMED.store(generation, Ordering::Release);
+                watchdog.disarm();
+            }
+            WRITING.store(0, Ordering::Release);
+            flush_inflight_events();
+        }
+
         /// Is this `SIGABRT` raised from inside the host handler we called?
         #[inline(never)]
         fn aborting_inside_host(tid: i32, sig: libc::c_int) -> bool {
@@ -2809,7 +2859,24 @@ mod imp {
             }
             let path = MARKER_PATH.load(Ordering::Acquire);
             if aborting_inside_host(tid, sig) {
-                unsafe { finish_original_report(tid, path) };
+                // A SIGABRT inside the host handler we called is, nearly always,
+                // that host's own `abort()`: the process is dying of the fault it
+                // was recovering, whose report is still missing its frames.
+                //
+                // It can also be a SIGABRT merely SENT to this thread while it is in
+                // the host (`kill` by a supervisor or another thread, which only
+                // happens to land here; `pthread_kill`, which looks exactly like
+                // `abort()`'s own raise). Linux says when it was `kill`: that is a
+                // crash of its own, and the recovering fault's report must not
+                // stand in for it. Either way the process ends of SIGABRT right
+                // here, as `abort()` would a moment later, so nothing is swallowed.
+                if unsafe { sent_by_kill(info) } {
+                    let regs = unsafe { regs_of(uc) };
+                    unsafe { report_sent_abort(tid, path, sig, info, regs.pc) };
+                } else {
+                    unsafe { finish_original_report(tid, path) };
+                }
+                unsafe { die_of(sig, info) };
                 return;
             }
 
