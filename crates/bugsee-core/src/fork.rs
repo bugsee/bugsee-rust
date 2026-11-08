@@ -29,16 +29,29 @@
 //! guarded are a few instructions long (enqueue, clone a handle), which is the
 //! regime where a spin-then-yield lock is the right tool.
 //!
-//! Lock-order rule: SDK code must never hold two registered locks at once except
-//! in the registration order (statics first, then per-recorder locks), or the
-//! prepare step could deadlock against it.
+//! Lock-order rule: every registered lock has a **rank** and `prepare` takes the
+//! locks in ascending rank, regardless of when each one registered (statics
+//! register lazily on first use, so registration order says nothing about
+//! nesting). SDK code that holds two registered locks at once must take them in
+//! ascending rank too, or `prepare` could deadlock against it. The ranks in use:
+//! [`ForkMutex::ranked`] globals that nest (the facade's recorder lock and the
+//! locks taken under it), then [`RANK_INSTANCE`] for per-recorder locks (which
+//! may be taken under the facade lock), then [`RANK_LEAF`] for everything else.
+//! A leaf lock may be taken while a lower-ranked one is held, but no other
+//! registered lock may be taken while a leaf is held.
+//!
+//! Registration itself takes the registry lock, which `prepare` holds while it
+//! waits for every registered lock. So a lock must never be *registered for the
+//! first time* while another registered lock is held: call
+//! [`ForkMutex::ensure_registered`] on such a lock up front (the facade does, at
+//! launch).
 //!
 //! Windows has no `fork`, so there the protocol is inert (the locks still work).
 
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Once, Weak};
+use std::sync::{Arc, Weak};
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -88,6 +101,16 @@ impl RawLock {
         self.0.store(false, Ordering::Release);
     }
 }
+
+/// Rank of per-instance locks registered through [`register_weak`]: taken after
+/// every explicitly ranked global (the facade may lock its recorder, then the
+/// recorder locks its own state) and before the leaf locks.
+pub const RANK_INSTANCE: u16 = 1000;
+
+/// Default rank of a [`ForkMutex`]: a leaf lock. It may be taken under a
+/// lower-ranked lock, but no other registered lock is ever taken while it is
+/// held, so it can go last.
+pub const RANK_LEAF: u16 = 2000;
 
 /// Something with locks that must be quiesced across a `fork()`.
 pub trait ForkLockable: Send + Sync {
@@ -182,27 +205,51 @@ impl<T: Send> ForkLockable for ForkLock<T> {
 pub struct ForkMutex<T: 'static> {
     inner: ForkLock<Option<T>>,
     init: fn() -> T,
-    registered: Once,
+    rank: u16,
+    /// Set under the registry lock together with the registration itself, so a
+    /// fork can never see a half-done registration (a `Once` mid-flight would
+    /// leave the child waiting on a thread that no longer exists).
+    registered: AtomicBool,
 }
 
 impl<T: Send + 'static> ForkMutex<T> {
     /// A mutex whose initial value is `init()`, computed on first lock.
     pub const fn new(init: fn() -> T) -> Self {
+        Self::ranked(init, RANK_LEAF)
+    }
+
+    /// Like [`new`](Self::new), with an explicit position in the fork lock
+    /// order: lower ranks are taken first. Give one to any lock that is held
+    /// while another registered lock is taken (the outer lock gets the lower
+    /// rank); use a rank below [`RANK_INSTANCE`] for a lock held while a
+    /// recorder's own locks are taken.
+    pub const fn ranked(init: fn() -> T, rank: u16) -> Self {
         ForkMutex {
             inner: ForkLock::new(None),
             init,
-            registered: Once::new(),
+            rank,
+            registered: AtomicBool::new(false),
+        }
+    }
+
+    fn register_once(&'static self) {
+        if !self.registered.load(Ordering::Acquire) {
+            register(
+                Entry::Static(&self.inner),
+                self.rank,
+                Some(&self.registered),
+            );
         }
     }
 
     /// Register with the fork protocol without locking.
     pub fn ensure_registered(&'static self) {
-        self.registered.call_once(|| register_static(&self.inner));
+        self.register_once();
     }
 
     /// Lock, registering with the fork protocol and initialising on first use.
     pub fn lock(&'static self) -> ForkMutexGuard<T> {
-        self.registered.call_once(|| register_static(&self.inner));
+        self.register_once();
         let mut guard = self.inner.lock();
         if guard.is_none() {
             *guard = Some((self.init)());
@@ -212,7 +259,7 @@ impl<T: Send + 'static> ForkMutex<T> {
 
     /// Lock without blocking; `None` if it is held.
     pub fn try_lock(&'static self) -> Option<ForkMutexGuard<T>> {
-        self.registered.call_once(|| register_static(&self.inner));
+        self.register_once();
         let mut guard = self.inner.try_lock()?;
         if guard.is_none() {
             *guard = Some((self.init)());
@@ -260,7 +307,7 @@ enum Held {
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Registry {
     lock: RawLock,
-    entries: UnsafeCell<Vec<Entry>>,
+    entries: UnsafeCell<Vec<(u16, Entry)>>,
     /// What `prepare` locked, so `parent`/`child` unlock exactly that set.
     held: UnsafeCell<Vec<Held>>,
 }
@@ -275,29 +322,37 @@ static REGISTRY: Registry = Registry {
     held: UnsafeCell::new(Vec::new()),
 };
 
-fn register(entry: Entry) {
+/// Add `entry`; with `flag`, only if it is not yet set, setting it before the
+/// registry lock is released.
+fn register(entry: Entry, rank: u16, flag: Option<&AtomicBool>) {
     REGISTRY.lock.lock();
+    if let Some(flag) = flag {
+        if flag.load(Ordering::Relaxed) {
+            REGISTRY.lock.unlock();
+            return;
+        }
+        flag.store(true, Ordering::Release);
+    }
     // SAFETY: registry lock held.
     let entries = unsafe { &mut *REGISTRY.entries.get() };
     // Drop registrations whose owner is gone, so a long-lived process that
     // relaunches repeatedly does not grow the list without bound.
-    entries.retain(|e| match e {
+    entries.retain(|(_, e)| match e {
         Entry::Static(_) => true,
         Entry::Weak(w) => w.strong_count() > 0,
     });
-    entries.push(entry);
+    // Keep the list sorted by rank (stable among equals), so `prepare` can just
+    // walk it: this is where the fixed lock order is enforced.
+    let at = entries.partition_point(|(r, _)| *r <= rank);
+    entries.insert(at, (rank, entry));
     REGISTRY.lock.unlock();
-}
-
-fn register_static<T: Send + 'static>(lock: &'static ForkLock<T>) {
-    register(Entry::Static(lock));
 }
 
 /// Register a per-instance lock holder (held weakly: when it is dropped the
 /// registration lapses on its own). Call once per instance.
 pub fn register_weak(target: &Arc<impl ForkLockable + 'static>) {
     let arc: Arc<dyn ForkLockable> = target.clone();
-    register(Entry::Weak(Arc::downgrade(&arc)));
+    register(Entry::Weak(Arc::downgrade(&arc)), RANK_INSTANCE, None);
 }
 
 /// Serialises the SDK's own stack walks. The `backtrace` crate guards symbol
@@ -323,6 +378,7 @@ pub fn lock_backtrace() -> BacktraceGuard {
 pub fn install_fork_hook() {
     #[cfg(unix)]
     {
+        use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             // Register the backtrace lock now, not lazily on its first use: a
@@ -335,7 +391,7 @@ pub fn install_fork_hook() {
                 let (entries, held) =
                     unsafe { (&mut *REGISTRY.entries.get(), &mut *REGISTRY.held.get()) };
                 held.clear();
-                for entry in entries.iter() {
+                for (_, entry) in entries.iter() {
                     match entry {
                         Entry::Static(s) => {
                             s.fork_lock();
@@ -428,6 +484,73 @@ mod tests {
         install_fork_hook(); // idempotent
         let before = fork_epoch();
         assert_eq!(fork_epoch(), before);
+    }
+
+    /// Regression test for a lock-order inversion: `prepare` used to take locks in
+    /// registration order, so an inner lock that registered before its outer lock
+    /// deadlocked a fork against a thread nesting them outer -> inner.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_takes_nested_locks_in_rank_order_not_registration_order() {
+        static OUTER: ForkMutex<u64> = ForkMutex::ranked(|| 0, 10);
+        static INNER: ForkMutex<u64> = ForkMutex::ranked(|| 0, 20);
+        install_fork_hook();
+        // Register the inner lock FIRST, the outer one second.
+        drop(INNER.lock());
+        drop(OUTER.lock());
+
+        // A hang here would hold the whole test run, so bound it: the parent is
+        // the thread stuck in `fork`, which no per-child deadline can catch.
+        let done = Arc::new(AtomicBool::new(false));
+        // Disarms the watchdog on every exit path, a failed assertion included.
+        struct Disarm(Arc<AtomicBool>);
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _disarm = Disarm(Arc::clone(&done));
+        let watchdog = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                while !done.load(Ordering::Relaxed) {
+                    if start.elapsed() > std::time::Duration::from_secs(60) {
+                        eprintln!("fork() deadlocked against nested locks");
+                        std::process::abort();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut outer = OUTER.lock();
+                    let mut inner = INNER.lock();
+                    *outer += 1;
+                    *inner += 1;
+                }
+            })
+        };
+        for _ in 0..100 {
+            // SAFETY: the child only locks, then `_exit`s.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let ok = OUTER.try_lock().is_some() && INNER.try_lock().is_some();
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().unwrap();
+        drop(_disarm);
+        watchdog.join().unwrap();
     }
 
     /// The point of the protocol: fork while another thread holds the lock and

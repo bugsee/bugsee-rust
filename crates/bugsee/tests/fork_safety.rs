@@ -390,6 +390,35 @@ fn forking_while_another_thread_is_capturing_never_deadlocks_the_child() {
     )
     .expect("launch");
 
+    // The deadlock this guards against sits in the PARENT, inside `fork()` itself,
+    // where the per-child deadline below never runs. A watchdog turns a
+    // regression into a failure instead of a hung test process. (The original
+    // inversion needs this to be the process's first launch; the targeted
+    // reproduction is `fork::tests::prepare_takes_nested_locks_in_rank_order_...`
+    // in bugsee-core.)
+    let finished = Arc::new(AtomicBool::new(false));
+    // Disarms the watchdog on every exit path, a failed assertion included.
+    struct Disarm(Arc<AtomicBool>);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _disarm = Disarm(Arc::clone(&finished));
+    let watchdog = {
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !finished.load(Ordering::Relaxed) {
+                if start.elapsed() > Duration::from_secs(300) {
+                    eprintln!("fork() deadlocked while another thread was capturing");
+                    std::process::abort();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+
     // A thread hammering the SDK's global lock, so some forks land while it is held.
     let stop = Arc::new(AtomicBool::new(false));
     let hammer = {
@@ -419,6 +448,8 @@ fn forking_while_another_thread_is_capturing_never_deadlocks_the_child() {
 
     stop.store(true, Ordering::Relaxed);
     hammer.join().unwrap();
+    drop(_disarm);
+    watchdog.join().unwrap();
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&out);
 }

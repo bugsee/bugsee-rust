@@ -34,7 +34,15 @@ use bugsee_core::runtime::StorageMode;
 //
 // `ForkMutex` rather than `Mutex` so a `fork()` child can abandon a lock a
 // vanished thread held (see `bugsee_core::fork`).
-static RECORDER: ForkMutex<Option<Recorder>> = ForkMutex::new(|| None);
+// Fork lock order of the facade's nested globals: `REVIVING` is held across
+// `RECORDER`, which is held across `RESOLUTION` and every call into the
+// recorder (whose own locks rank after all of these). The fork `prepare` step
+// takes locks in this order, so it can never invert a caller.
+const RANK_REVIVING: u16 = 10;
+const RANK_RECORDER: u16 = 20;
+const RANK_RESOLUTION: u16 = 30;
+
+static RECORDER: ForkMutex<Option<Recorder>> = ForkMutex::ranked(|| None, RANK_RECORDER);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "native")]
 static NATIVE: ForkMutex<Option<bugsee_native::NativeHandler>> = ForkMutex::new(|| None);
@@ -54,7 +62,7 @@ struct Resolved {
     skipped: Vec<String>,
     explicit_rejected: Option<String>,
 }
-static RESOLUTION: ForkMutex<Option<Resolved>> = ForkMutex::new(|| None);
+static RESOLUTION: ForkMutex<Option<Resolved>> = ForkMutex::ranked(|| None, RANK_RESOLUTION);
 
 /// The fork epoch this process last reconciled with.
 static SEEN_FORK_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -82,6 +90,15 @@ impl Bugsee {
     /// Launch with explicit [`LaunchOptions`].
     pub fn launch_with(options: LaunchOptions) -> io::Result<LaunchGuard> {
         bugsee_core::fork::install_fork_hook();
+        // Nested globals register now, not on first use under another lock: a
+        // registration waits on the registry lock a forking thread holds while it
+        // waits for the very lock we would be holding.
+        RECORDER.ensure_registered();
+        RESOLUTION.ensure_registered();
+        // `revive_after_fork` locks NATIVE under REVIVING; register it here so
+        // that lock is never first-registered while another is held.
+        #[cfg(feature = "native")]
+        NATIVE.ensure_registered();
         check_fork();
         // No writable directory is not an error: the recorder runs in memory so
         // handled errors still go out (see `DataDirSource`).
@@ -704,7 +721,7 @@ const MAX_REVIVE_ATTEMPTS: u32 = 3;
 fn revive_after_fork(epoch: u64) {
     // Serialise revival: a second thread calling in meanwhile waits for it rather
     // than carrying on against a half-built SDK. The value counts failed attempts.
-    static REVIVING: ForkMutex<u32> = ForkMutex::new(|| 0);
+    static REVIVING: ForkMutex<u32> = ForkMutex::ranked(|| 0, RANK_REVIVING);
     let mut failures = REVIVING.lock();
     if SEEN_FORK_EPOCH.load(Ordering::SeqCst) == epoch {
         return; // another thread finished it while we waited
