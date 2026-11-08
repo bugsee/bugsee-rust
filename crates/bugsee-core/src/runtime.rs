@@ -42,7 +42,7 @@ use crate::model::entry::{Breadcrumb, CaptureEntry, TraceEntry};
 use crate::model::enums::IssueType;
 use crate::model::environment::Environment;
 use crate::model::report::TimeWindow;
-use crate::model::scope::Scope;
+use crate::model::scope::{Scope, Staged};
 use crate::reporting::{self, AssembledReport, ReportMeta};
 use crate::session::Session;
 use crate::transport::{self, Transport, TransportError};
@@ -272,6 +272,10 @@ struct Shared {
     /// Version of the newest snapshot written; held across the write so
     /// snapshots reach the file in order.
     scope_written: ForkLock<u64>,
+    /// The newest scope can never be persisted (too large), so a missing file is
+    /// expected and must not be re-staged on every call. Cleared by the next
+    /// scope that stages.
+    scope_unpersistable: AtomicBool,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
@@ -378,7 +382,9 @@ impl Shared {
 
     /// A non-empty scope whose session file is gone. Scope lock held.
     fn scope_file_missing(&self, scope: &Scope) -> bool {
-        !scope.is_empty() && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())
+        !scope.is_empty()
+            && !self.scope_unpersistable.load(Ordering::Relaxed)
+            && self.scope_file.lock().as_ref().is_some_and(|p| !p.exists())
     }
 
     /// A versioned snapshot to persist, or `None` without a session file.
@@ -396,7 +402,20 @@ impl Shared {
         let mut written = self.scope_written.lock();
         if version > *written {
             *written = version;
-            let _ = staged.commit(&path);
+            self.scope_unpersistable
+                .store(matches!(staged, Staged::TooLarge), Ordering::Relaxed);
+            if staged.commit(&path).is_err() {
+                // The previous file is gone (a crash must not report the old
+                // identity), so a crash before the next successful write recovers
+                // no scope: surface that instead of failing silently.
+                self.degraded.store(true, Ordering::Relaxed);
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                crate::util::warn_once(
+                    &WARNED,
+                    "could not persist the session scope (identity, labels, attributes); a \
+                     crash before the next successful write is reported without them",
+                );
+            }
         } else {
             staged.discard();
         }
@@ -540,6 +559,7 @@ impl Recorder {
             scope_file: ForkLock::new(None),
             scope_version: AtomicU64::new(0),
             scope_written: ForkLock::new(0),
+            scope_unpersistable: AtomicBool::new(false),
             env,
             environment_json,
             app_token: config.app_token.clone(),

@@ -441,6 +441,39 @@ fn request_and_manifest(bundle: &[u8]) -> (Value, Value) {
 }
 
 #[test]
+fn a_scope_that_cannot_be_persisted_degrades_the_recorder_and_drops_the_stale_file() {
+    let dir = TempDir::new();
+    let recorder = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = recorder.crash_info_path().with_file_name("scope.json");
+    recorder.with_scope(|s| s.set_email(Some("a@example.com".into())));
+    assert!(scope_file.exists());
+    assert!(!recorder.is_degraded(), "a healthy write is not degraded");
+
+    // Over the persistable cap: the old identity must not outlive the change
+    // (a crash would report the wrong user), and the loss is surfaced.
+    recorder.with_scope(|s| {
+        s.set_email(Some("b@example.com".into()));
+        s.set_attribute("big", Value::from("x".repeat(2 << 20)));
+    });
+    assert!(!scope_file.exists(), "the stale identity is not kept");
+    assert!(recorder.is_degraded(), "the lost scope is surfaced");
+
+    // It is not re-staged on every call while it stays hopeless.
+    recorder.with_scope(|s| s.labels.push("l".into()));
+    assert!(!scope_file.exists());
+    // Once it fits again, persistence resumes.
+    recorder.with_scope(|s| {
+        s.attributes.remove("big");
+    });
+    assert!(scope_file.exists());
+    drop(recorder);
+}
+
+#[test]
 fn a_session_persists_its_scope_and_a_crash_recovers_it() {
     // Run 1: scope lands in the session directory as it changes.
     let dir = TempDir::new();

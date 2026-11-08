@@ -32,7 +32,12 @@ pub enum Staged {
     Remove,
     /// The temp file holding the new scope.
     Ready(std::path::PathBuf),
-    /// The new scope could not be staged: committing removes the stale file.
+    /// The new scope can never be persisted (it does not serialise or exceeds
+    /// [`MAX_PERSISTED_BYTES`]): committing removes the stale file, and retrying
+    /// the same scope is pointless.
+    TooLarge,
+    /// The new scope could not be staged this time (e.g. disk full, directory
+    /// gone): committing removes the stale file, and a retry may succeed.
     Failed,
 }
 
@@ -49,7 +54,7 @@ impl Staged {
                 let _ = std::fs::remove_file(&tmp);
                 let _ = remove();
             }),
-            Staged::Failed => {
+            Staged::TooLarge | Staged::Failed => {
                 let _ = remove();
                 Err(std::io::Error::other("scope could not be persisted"))
             }
@@ -98,10 +103,10 @@ impl Scope {
             "labels": self.labels,
             "attributes": self.attributes,
         })) else {
-            return Staged::Failed;
+            return Staged::TooLarge;
         };
         if bytes.len() as u64 > MAX_PERSISTED_BYTES {
-            return Staged::Failed;
+            return Staged::TooLarge;
         }
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(format!(".{tag}.tmp"));
@@ -261,6 +266,21 @@ mod tests {
             Staged::Ready(tmp) => tmp,
             other => panic!("expected a staged temp file, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn staging_tells_a_hopeless_scope_from_a_transient_failure() {
+        let path = tmp();
+        let mut big = scope_with_email("a@b.c");
+        big.set_attribute("big", Value::from("x".repeat(MAX_PERSISTED_BYTES as usize)));
+        assert!(matches!(big.stage(&path, 1), Staged::TooLarge));
+        // A directory that is gone is worth retrying.
+        let missing = path.with_file_name("nope").join(SCOPE_FILE);
+        assert!(matches!(
+            scope_with_email("a@b.c").stage(&missing, 1),
+            Staged::Failed
+        ));
+        assert!(matches!(Scope::default().stage(&path, 1), Staged::Remove));
     }
 
     #[test]
