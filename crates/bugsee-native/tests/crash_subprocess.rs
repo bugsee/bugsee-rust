@@ -30,7 +30,7 @@ fn run_as_child_if_requested() {
     let _handler = bugsee_native::install(PathBuf::from(marker)).expect("install handler");
 
     // Deliberate null dereference → SIGSEGV / EXC_BAD_ACCESS.
-    let p = std::ptr::null_mut::<u8>();
+    let p = std::hint::black_box(std::ptr::null_mut::<u8>());
     unsafe {
         std::ptr::write_volatile(p, 1);
     }

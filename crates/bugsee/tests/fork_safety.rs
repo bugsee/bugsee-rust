@@ -293,7 +293,7 @@ fn a_crash_in_the_child_is_recovered_as_the_childs_not_the_parents() {
         // Touch the SDK first so the child rebinds to its own session…
         Bugsee::capture_message(LogLevel::Warning, "child-starting");
         // …then die for real.
-        unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+        unsafe { std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1) };
         0
     });
     let status = wait_with_deadline(child, Duration::from_secs(30));
@@ -345,7 +345,7 @@ fn a_child_that_crashes_before_touching_the_sdk_does_not_blame_its_parent() {
     // pointed at the parent's marker. It must record nothing rather than write a
     // crash into a session that did not crash.
     let child = fork_child(|| {
-        unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+        unsafe { std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1) };
         0
     });
     let status = wait_with_deadline(child, Duration::from_secs(30));
@@ -445,7 +445,7 @@ fn a_worker_that_crashed_is_recovered_by_the_next_worker_while_the_master_lives(
     // Worker A uses the SDK, then dies for real.
     let a = fork_child(|| {
         Bugsee::capture_message(LogLevel::Warning, "worker-a-alive");
-        unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+        unsafe { std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1) };
         0
     });
     assert!(libc::WIFSIGNALED(wait_with_deadline(
