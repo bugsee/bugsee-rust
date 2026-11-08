@@ -175,7 +175,7 @@ fn child_entry() {
         "sigterm_host_handler" => {
             set_action(libc::SIGTERM, host_handler as *const () as usize, 0);
         }
-        "sigterm_oneshot_handler" => {
+        "sigterm_oneshot_handler" | "sigterm_oneshot_twice" => {
             // A host's one-shot handler: it must run for THIS signal and not be
             // turned into a kill by the SDK's own default-disposition logic.
             set_action(
@@ -254,6 +254,18 @@ fn child_entry() {
         | "sigterm_late_handler" => {
             ready();
             exit_via_host(guard)
+        }
+        // A one-shot host handler has now fired: the kernel would have reset
+        // the disposition to the default, so the NEXT signal must end the
+        // process (after the flush), as it would have without the SDK.
+        "sigterm_oneshot_twice" => {
+            ready();
+            while !HOST_HANDLER_RAN.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(dir.join("host-handler-ran"), b"1").unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+            std::process::exit(3); // the second signal should have ended us
         }
         // Ignored at install: the SDK must leave it ignored.
         "sigterm_ignored" => {
@@ -559,6 +571,40 @@ fn a_hosts_own_handler_still_runs_and_decides() {
         assert_eq!(pending, 1, "[{kind}]");
         assert_eq!(abnormal, 0, "[{kind}]");
     }
+}
+
+// Apple's `sigaction` query does not report `SA_RESETHAND`, so the SDK cannot
+// recognise a one-shot host there (the same limit `bugsee-native` documents);
+// this is the case that only a Linux run can prove.
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn a_one_shot_hosts_second_signal_terminates_like_the_default() {
+    // `SA_RESETHAND` is emulated in the SDK's chain: after the host's one-shot
+    // handler has run, the previous disposition is the default again. The first
+    // signal is the host's (flush only, no kill); the second must end the
+    // process of the signal instead of calling the spent handler again.
+    let (out, pending, abnormal) = run_case(
+        "sigterm_oneshot_twice",
+        FAIL,
+        &[libc::SIGTERM, libc::SIGTERM],
+    );
+    assert!(
+        out.dir.join("host-handler-ran").exists(),
+        "the one-shot handler never ran: {}",
+        out.stderr
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGTERM),
+        "the second signal must terminate: {:?} {}",
+        out.status,
+        out.stderr
+    );
+    assert_eq!(pending, 1);
+    assert_eq!(
+        abnormal, 0,
+        "a signalled stop after the flush is deliberate"
+    );
 }
 
 #[test]

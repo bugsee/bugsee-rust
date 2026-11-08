@@ -381,6 +381,32 @@ mod imp {
         }
         true
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::make_pipe;
+
+        /// Both ends are closed across `exec` and the write end never blocks the
+        /// crash handler. On Linux and Android this is the `pipe2(O_CLOEXEC)`
+        /// path; elsewhere the `pipe` + `fcntl` fallback.
+        #[test]
+        fn the_wake_pipe_is_cloexec_and_its_write_end_nonblocking() {
+            let (r, w) = make_pipe().expect("pipe");
+            // SAFETY: fcntl queries on, then closing, descriptors made above.
+            unsafe {
+                for fd in [r, w] {
+                    let f = libc::fcntl(fd, libc::F_GETFD);
+                    assert!(f >= 0 && f & libc::FD_CLOEXEC != 0, "fd {fd}: {f}");
+                }
+                let wl = libc::fcntl(w, libc::F_GETFL);
+                assert!(wl >= 0 && wl & libc::O_NONBLOCK != 0, "{wl}");
+                let rl = libc::fcntl(r, libc::F_GETFL);
+                assert!(rl >= 0 && rl & libc::O_NONBLOCK == 0, "read end: {rl}");
+                libc::close(r);
+                libc::close(w);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
