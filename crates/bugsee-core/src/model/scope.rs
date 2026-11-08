@@ -56,8 +56,10 @@ impl Staged {
         };
         match self {
             Staged::Remove => remove(),
+            // A failed rename keeps the temp file: it is a complete snapshot of the
+            // newest scope, which `load_recovering` prefers over a stale
+            // `scope.json`. A later commit's `sweep_older` removes it.
             Staged::Ready(tmp) => std::fs::rename(&tmp, path).inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
                 if !keep_stale {
                     let _ = remove();
                 }
@@ -539,6 +541,32 @@ mod tests {
         let mut gained_email = Scope::default();
         gained_email.set_email(Some("a@x".into()));
         assert!(gained_email.extends(&Scope::default()), "a gained email");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rename_leaves_the_complete_temp_file_for_recovery() {
+        // A directory where `scope.json` should go makes the rename fail (and the
+        // old file impossible to remove), standing in for a dest held open.
+        let path = tmp();
+        std::fs::create_dir(&path.file).unwrap();
+        let staged = scope_with_email("new@x").stage(&path, 5);
+        let Staged::Ready(tmp_file) = &staged else {
+            panic!("expected a staged temp file")
+        };
+        let tmp_file = tmp_file.clone();
+        assert!(staged.commit(&path, 5, false).is_err());
+        assert!(
+            tmp_file.exists(),
+            "the fully written scope is not thrown away"
+        );
+        assert_eq!(
+            Scope::load_recovering(&path).unwrap().email.as_deref(),
+            Some("new@x")
+        );
+        // A later, higher version sweeps it.
+        Scope::sweep_older(&path, 6);
+        assert!(!tmp_file.exists());
     }
 
     #[test]
