@@ -89,7 +89,7 @@ fn abnormal_prior_session_is_recovered_on_next_launch() {
 
     // The pre-crash log window rode along.
     let log_name = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .find(|n| n.ends_with(".log.json"))
         .expect("log capture file present");
     let mut lbytes = Vec::new();
@@ -409,7 +409,7 @@ fn a_torn_or_garbage_part_tail_is_ignored_on_recovery() {
         assert_eq!(bundles.len(), 1, "{what}: the session was still delivered");
         let mut zip = ZipArchive::new(Cursor::new(bundles[0].clone())).unwrap();
         let log_name = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
             .find(|n| n.ends_with(".log.json"))
             .unwrap_or_else(|| panic!("{what}: no log file"));
         let mut raw = Vec::new();
