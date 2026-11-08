@@ -363,6 +363,33 @@ mod imp {
         *installed = true;
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The self-pipe's write end is closed across `exec` (a spawned program
+        /// must not inherit it) and never blocks the signal handler. On Linux and
+        /// Android this is the `pipe2(O_CLOEXEC)` path; elsewhere the
+        /// `pipe` + `fcntl` fallback. Both must end up the same.
+        #[test]
+        fn the_wake_pipe_is_cloexec_and_its_write_end_nonblocking() {
+            install(Duration::from_secs(1)).expect("install");
+            let w = PIPE_W.load(Ordering::SeqCst);
+            assert!(w >= 0, "installing creates the pipe");
+            // SAFETY: fcntl queries on a descriptor that is never closed.
+            let (fd_flags, fl_flags) =
+                unsafe { (libc::fcntl(w, libc::F_GETFD), libc::fcntl(w, libc::F_GETFL)) };
+            assert!(
+                fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0,
+                "{fd_flags}"
+            );
+            assert!(
+                fl_flags >= 0 && fl_flags & libc::O_NONBLOCK != 0,
+                "{fl_flags}"
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -414,6 +441,68 @@ mod imp {
         }
         ARMED.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use bugsee_core::MockTransport;
+        use std::sync::Arc;
+
+        // The console events Windows can deliver to a handler routine.
+        const CTRL_C_EVENT: u32 = 0;
+        const CTRL_BREAK_EVENT: u32 = 1;
+        const CTRL_CLOSE_EVENT: u32 = 2;
+        const CTRL_LOGOFF_EVENT: u32 = 5;
+        const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+        /// The routine is registered with the console, and for every event kind
+        /// it flushes and stops the SDK, then answers FALSE so the next handler
+        /// (the host's, or the default one that ends the process) still runs.
+        #[test]
+        fn every_console_event_flushes_then_passes_the_event_on() {
+            install(Duration::from_secs(5)).expect("install");
+            install(Duration::from_secs(5)).expect("install twice (idempotent)");
+
+            for kind in [
+                CTRL_C_EVENT,
+                CTRL_BREAK_EVENT,
+                CTRL_CLOSE_EVENT,
+                CTRL_LOGOFF_EVENT,
+                CTRL_SHUTDOWN_EVENT,
+            ] {
+                let dir = std::env::temp_dir().join(format!(
+                    "bugsee-ctrl-{kind}-{}",
+                    bugsee_core::util::random_hex(6)
+                ));
+                let mock = Arc::new(MockTransport::default());
+                let guard = Bugsee::launch_with(
+                    crate::LaunchOptions::new("APP_TOKEN")
+                        .data_dir(&dir)
+                        .native_crash_capture(false)
+                        .with_transport(mock.clone()),
+                )
+                .expect("launch");
+                Bugsee::capture_message(crate::LogLevel::Error, "ctrl-event-marker");
+
+                // SAFETY: calling the routine as Windows would, on this thread.
+                let answer = unsafe { on_event(kind) };
+                assert_eq!(answer, 0, "event {kind} must be passed on, not swallowed");
+                assert!(!Bugsee::is_launched(), "event {kind} stops the SDK");
+                assert_eq!(
+                    mock.uploaded_bundles.lock().unwrap().len(),
+                    1,
+                    "event {kind} flushes the queued report"
+                );
+                drop(guard); // already stopped: a no-op
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            // Proof the routine really is registered with the console: removing
+            // it succeeds only if `install` added it.
+            // SAFETY: unregistering the routine registered above.
+            assert_ne!(unsafe { SetConsoleCtrlHandler(Some(on_event), 0) }, 0);
+        }
     }
 }
 
