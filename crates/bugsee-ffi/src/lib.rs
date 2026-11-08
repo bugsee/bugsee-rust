@@ -37,7 +37,8 @@ pub enum BugseeStatus {
     /// A Rust panic was contained at the boundary.
     Panic = 3,
     NotLaunched = 4,
-    /// The SDK is launched but a `flush` did not drain before its timeout.
+    /// A `flush` or `shutdown` did not drain before its timeout (after a
+    /// `shutdown` the SDK is stopped regardless).
     Timeout = 5,
     /// The ABI version the caller was built against is not the one this
     /// library implements.
@@ -61,7 +62,7 @@ pub const BUGSEE_LEVEL_DEBUG: i32 = 4;
 /// Log level for [`bugsee_log`]: verbose output.
 pub const BUGSEE_LEVEL_VERBOSE: i32 = 5;
 
-/// Storage flag for [`bugsee_storage_status`]: state is kept on disk (clear:
+/// Storage flag for `bugsee_storage_status`: state is kept on disk (clear:
 /// the SDK runs from memory and nothing survives the process).
 pub const BUGSEE_STORAGE_DISK: u32 = 1 << 0;
 /// Storage flag: a disk write has failed since launch; crash recovery can no
@@ -153,13 +154,15 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 fn guarded(f: impl FnOnce() -> BugseeStatus) -> BugseeStatus {
     match bugsee::guard(f) {
         Ok(status) => status,
-        Err(payload) => fail(
-            BugseeStatus::Panic,
-            format!(
-                "panic contained at the FFI boundary: {}",
-                panic_message(&*payload)
-            ),
-        ),
+        Err(payload) => {
+            let message = panic_message(&*payload);
+            // A payload whose destructor panics must not unwind out of `extern "C"`.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+            fail(
+                BugseeStatus::Panic,
+                format!("panic contained at the FFI boundary: {message}"),
+            )
+        }
     }
 }
 
@@ -603,7 +606,8 @@ pub unsafe extern "C" fn bugsee_options_set_sample_rate(
 }
 
 /// Longest time `launch` may spend recovering a previous crash, in
-/// milliseconds. Default: the SDK's built-in budget (a few seconds).
+/// milliseconds. Default: the SDK's built-in budget (a few seconds). 0 skips
+/// the launch pass entirely: crashes are recovered in the background instead.
 ///
 /// # Safety
 /// `options` must be a live handle from `bugsee_options_new` that no other
@@ -831,14 +835,13 @@ pub unsafe extern "C" fn bugsee_trace(
     value_json: *const c_char,
 ) -> BugseeStatus {
     guarded(|| {
-        let (name, json) = match unsafe {
-            (
-                cstr_required(name, "name"),
-                cstr_required(value_json, "value_json"),
-            )
-        } {
-            (Ok(n), Ok(j)) => (n, j),
-            (Err(status), _) | (_, Err(status)) => return status,
+        let name = match unsafe { cstr_required(name, "name") } {
+            Ok(n) => n,
+            Err(status) => return status,
+        };
+        let json = match unsafe { cstr_required(value_json, "value_json") } {
+            Ok(j) => j,
+            Err(status) => return status,
         };
         match serde_json::from_str::<Value>(&json) {
             Ok(value) => {
@@ -878,14 +881,13 @@ pub unsafe extern "C" fn bugsee_set_attribute(
     value_json: *const c_char,
 ) -> BugseeStatus {
     guarded(|| {
-        let (key, json) = match unsafe {
-            (
-                cstr_required(key, "key"),
-                cstr_required(value_json, "value_json"),
-            )
-        } {
-            (Ok(k), Ok(j)) => (k, j),
-            (Err(status), _) | (_, Err(status)) => return status,
+        let key = match unsafe { cstr_required(key, "key") } {
+            Ok(k) => k,
+            Err(status) => return status,
+        };
+        let json = match unsafe { cstr_required(value_json, "value_json") } {
+            Ok(j) => j,
+            Err(status) => return status,
         };
         match serde_json::from_str::<Value>(&json) {
             Ok(value) => {
@@ -911,11 +913,14 @@ pub unsafe extern "C" fn bugsee_capture_exception(
     reason: *const c_char,
 ) -> BugseeStatus {
     guarded(|| {
-        let (name, reason) =
-            match unsafe { (cstr_optional(name, "name"), cstr_optional(reason, "reason")) } {
-                (Ok(n), Ok(r)) => (n, r),
-                (Err(status), _) | (_, Err(status)) => return status,
-            };
+        let name = match unsafe { cstr_optional(name, "name") } {
+            Ok(n) => n,
+            Err(status) => return status,
+        };
+        let reason = match unsafe { cstr_optional(reason, "reason") } {
+            Ok(r) => r,
+            Err(status) => return status,
+        };
         let name = name.unwrap_or_else(|| "Exception".to_string());
         let reason = reason.unwrap_or_default();
         Bugsee::capture_message(LogLevel::Error, format!("{name}: {reason}"));
@@ -1109,17 +1114,18 @@ fn parse_host_error(json: &str) -> Result<HostError, String> {
     match obj.get("causes") {
         None | Some(Value::Null) => {}
         Some(Value::Array(items)) => {
-            for (i, item) in items.iter().take(MAX_HOST_CAUSES).enumerate() {
+            for (i, item) in items.iter().enumerate() {
                 let c = item
                     .as_object()
                     .ok_or_else(|| format!("causes[{i}] must be an object"))?;
                 let ctx = |e: String| format!("causes[{i}]: {e}");
-                causes.push(Cause {
-                    name: str_field(c, "name")
-                        .map_err(ctx)?
-                        .unwrap_or_else(|| "Error".to_string()),
-                    reason: str_field(c, "reason").map_err(ctx)?.unwrap_or_default(),
-                });
+                let name = str_field(c, "name")
+                    .map_err(ctx)?
+                    .unwrap_or_else(|| "Error".to_string());
+                let reason = str_field(c, "reason").map_err(ctx)?.unwrap_or_default();
+                if causes.len() < MAX_HOST_CAUSES {
+                    causes.push(Cause { name, reason });
+                }
             }
         }
         Some(_) => return Err("`causes` must be an array".to_string()),
@@ -1129,8 +1135,11 @@ fn parse_host_error(json: &str) -> Result<HostError, String> {
     match obj.get("frames") {
         None | Some(Value::Null) => {}
         Some(Value::Array(items)) => {
-            for (i, item) in items.iter().take(MAX_HOST_FRAMES).enumerate() {
-                frames.push(parse_frame(item, i)?);
+            for (i, item) in items.iter().enumerate() {
+                let frame = parse_frame(item, i)?;
+                if frames.len() < MAX_HOST_FRAMES {
+                    frames.push(frame);
+                }
             }
         }
         Some(_) => return Err("`frames` must be an array".to_string()),
@@ -1291,6 +1300,63 @@ mod tests {
     }
 
     #[test]
+    fn last_error_is_per_thread_and_sticky() {
+        // A fresh thread has no error.
+        std::thread::spawn(|| assert!(bugsee_last_error().is_null()))
+            .join()
+            .unwrap();
+        assert_eq!(
+            unsafe { bugsee_event(std::ptr::null()) },
+            BugseeStatus::InvalidArgument
+        );
+        let msg = last_error().unwrap();
+        // A success does not clear it.
+        assert_eq!(unsafe { bugsee_event(c"ok".as_ptr()) }, BugseeStatus::Ok);
+        assert_eq!(last_error().as_deref(), Some(msg.as_str()));
+        // Another thread's failure is not visible here.
+        std::thread::spawn(|| {
+            let _ = unsafe { bugsee_log(99, c"x".as_ptr()) };
+            assert!(last_error().unwrap().contains("log level"));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(last_error().as_deref(), Some(msg.as_str()));
+    }
+
+    #[test]
+    fn last_error_describes_the_first_bad_argument() {
+        assert_eq!(
+            unsafe { bugsee_trace(std::ptr::null(), std::ptr::null()) },
+            BugseeStatus::InvalidArgument
+        );
+        assert!(last_error().unwrap().contains("name must not be NULL"));
+        assert_eq!(
+            unsafe { bugsee_set_attribute(std::ptr::null(), std::ptr::null()) },
+            BugseeStatus::InvalidArgument
+        );
+        assert!(last_error().unwrap().contains("key must not be NULL"));
+        assert_eq!(
+            unsafe { bugsee_capture_exception(c"\xff".as_ptr(), c"\xfe".as_ptr()) },
+            BugseeStatus::InvalidArgument
+        );
+        assert!(last_error().unwrap().contains("name is not valid UTF-8"));
+    }
+
+    #[test]
+    fn panicking_payload_destructor_is_contained() {
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    panic!("drop bomb");
+                }
+            }
+        }
+        let status = guarded(|| std::panic::panic_any(Bomb));
+        assert_eq!(status, BugseeStatus::Panic);
+    }
+
+    #[test]
     fn abi_and_version_queries() {
         assert_eq!(bugsee_abi_version(), BUGSEE_ABI_VERSION);
         let v = unsafe { CStr::from_ptr(bugsee_version()) }
@@ -1300,6 +1366,10 @@ mod tests {
         for (code, text) in [
             (0, "ok"),
             (1, "invalid argument"),
+            (2, "internal error"),
+            (3, "panic contained at the FFI boundary"),
+            (4, "SDK not launched"),
+            (5, "timed out"),
             (6, "ABI version mismatch"),
         ] {
             let s = unsafe { CStr::from_ptr(bugsee_status_string(code)) };
@@ -1446,6 +1516,13 @@ mod tests {
         );
         assert!(last_error().unwrap().contains("frames[0]"));
         assert_eq!(send(br#"{"causes": {}}"#), BugseeStatus::InvalidArgument);
+        // Entries past the caps are still validated.
+        let mut late_bad = String::from(r#"{"frames":["#);
+        for _ in 0..MAX_HOST_FRAMES {
+            late_bad.push_str(r#"{"function":"f"},"#);
+        }
+        late_bad.push_str(r#"{"line":1}]}"#);
+        assert_eq!(send(late_bad.as_bytes()), BugseeStatus::InvalidArgument);
         // Length is honoured: a NUL-free slice shorter than the buffer is fine.
         assert_eq!(
             send(br#"{"name":"E"} trailing"#),

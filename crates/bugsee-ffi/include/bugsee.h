@@ -26,7 +26,7 @@
  *   - Every function may be called from any thread. Blocking calls (flush,
  *     shutdown, stop) do not hold the SDK's global lock while they wait.
  *   - Capture calls made before launch or after stop do nothing and return OK;
- *     flush and shutdown return NOT_LAUNCHED.
+ *     flush, shutdown and storage_status return NOT_LAUNCHED.
  *   - Treat any BugseeStatus value you do not recognise as an error.
  *   - Check bugsee_abi_version() against BUGSEE_ABI_VERSION at load time. The
  *     ABI is NOT frozen yet: any release may bump it.
@@ -73,7 +73,7 @@
 #define BUGSEE_LEVEL_VERBOSE 5
 
 /*
- Storage flag for [`bugsee_storage_status`]: state is kept on disk (clear:
+ Storage flag for `bugsee_storage_status`: state is kept on disk (clear:
  the SDK runs from memory and nothing survives the process).
  */
 #define BUGSEE_STORAGE_DISK (1 << 0)
@@ -113,7 +113,8 @@ enum BugseeStatus
   BUGSEE_STATUS_PANIC = 3,
   BUGSEE_STATUS_NOT_LAUNCHED = 4,
   /*
-   The SDK is launched but a `flush` did not drain before its timeout.
+   A `flush` or `shutdown` did not drain before its timeout (after a
+   `shutdown` the SDK is stopped regardless).
    */
   BUGSEE_STATUS_TIMEOUT = 5,
   /*
@@ -331,7 +332,8 @@ BugseeStatus bugsee_options_set_sample_rate(BugseeOptions *options, double rate)
 
 /*
  Longest time `launch` may spend recovering a previous crash, in
- milliseconds. Default: the SDK's built-in budget (a few seconds).
+ milliseconds. Default: the SDK's built-in budget (a few seconds). 0 skips
+ the launch pass entirely: crashes are recovered in the background instead.
 
  # Safety
  `options` must be a live handle from `bugsee_options_new` that no other

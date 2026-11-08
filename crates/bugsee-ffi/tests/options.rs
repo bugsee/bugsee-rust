@@ -69,7 +69,9 @@ fn launch_with_options_then_shutdown() {
             BugseeStatus::Ok
         );
         assert_eq!(bugsee_launch_with_options(options), BugseeStatus::Ok);
-        // The handle is not consumed: it can be reused, then freed.
+        // The handle is not consumed: launching again from it works (replacing
+        // the running SDK), and it is freed afterwards.
+        assert_eq!(bugsee_launch_with_options(options), BugseeStatus::Ok);
         bugsee_options_free(options);
     }
     assert_eq!(bugsee_is_active(), 1);

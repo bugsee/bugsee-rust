@@ -27,7 +27,7 @@ header = """/*
  *   - Every function may be called from any thread. Blocking calls (flush,
  *     shutdown, stop) do not hold the SDK's global lock while they wait.
  *   - Capture calls made before launch or after stop do nothing and return OK;
- *     flush and shutdown return NOT_LAUNCHED.
+ *     flush, shutdown and storage_status return NOT_LAUNCHED.
  *   - Treat any BugseeStatus value you do not recognise as an error.
  *   - Check bugsee_abi_version() against BUGSEE_ABI_VERSION at load time. The
  *     ABI is NOT frozen yet: any release may bump it.
