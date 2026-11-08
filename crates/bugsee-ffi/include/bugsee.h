@@ -12,12 +12,40 @@
  *  Every function is panic-safe: a Rust panic never crosses this boundary — it
  *  is contained and reported as BUGSEE_STATUS_PANIC (bugsee_is_active has no
  *  status to carry it and returns 0 instead).
+ *
+ *  Conventions (the per-function "# Safety" notes below are the C contract for
+ *  that function, not Rust's unsafety rules):
+ *   - Strings are UTF-8, NUL-terminated and BORROWED for the call only: the SDK
+ *     copies what it keeps and never returns a pointer into caller memory.
+ *     Windows hosts holding UTF-16 must convert first.
+ *   - NULL is BUGSEE_STATUS_INVALID_ARGUMENT unless the parameter is documented
+ *     as optional (then NULL means "default"). Invalid UTF-8 is always
+ *     INVALID_ARGUMENT, required or optional.
+ *   - Strings the SDK returns (bugsee_version, bugsee_status_string,
+ *     bugsee_last_error) are owned by the SDK and must never be freed.
+ *   - Every function may be called from any thread. Blocking calls (flush,
+ *     shutdown, stop) do not hold the SDK's global lock while they wait.
+ *   - Capture calls made before launch or after stop do nothing and return OK;
+ *     flush, shutdown and storage_status return NOT_LAUNCHED.
+ *   - Treat any BugseeStatus value you do not recognise as an error.
+ *   - Check bugsee_abi_version() against BUGSEE_ABI_VERSION at load time. The
+ *     ABI is NOT frozen yet: any release may bump it.
+ *   - Do not call back into the SDK from a signal handler.
  */
 
 #ifndef BUGSEE_H
 #define BUGSEE_H
 
 #include <stdint.h>
+#include <stddef.h>
+
+/*
+ The ABI version this library implements: a monotonic integer bumped on any
+ incompatible change to the C surface, independent of the crate version.
+ Until the surface is frozen, any release may bump it. Compare it with
+ `bugsee_abi_version()` at load time.
+ */
+#define BUGSEE_ABI_VERSION 1
 
 /*
  Log level for [`bugsee_log`]: errors.
@@ -45,7 +73,31 @@
 #define BUGSEE_LEVEL_VERBOSE 5
 
 /*
- Result of an FFI call.
+ Storage flag for `bugsee_storage_status`: state is kept on disk (clear:
+ the SDK runs from memory and nothing survives the process).
+ */
+#define BUGSEE_STORAGE_DISK (1 << 0)
+
+/*
+ Storage flag: a disk write has failed since launch; crash recovery can no
+ longer be relied on.
+ */
+#define BUGSEE_STORAGE_DEGRADED (1 << 1)
+
+/*
+ Storage flag: a fatal crash can be recovered on the next launch.
+ */
+#define BUGSEE_STORAGE_CRASH_RECOVERY (1 << 2)
+
+/*
+ Storage flag: the data directory is the temp-dir fallback and may be wiped
+ on restart.
+ */
+#define BUGSEE_STORAGE_MAY_BE_EPHEMERAL (1 << 3)
+
+/*
+ Result of an FFI call. Callers must treat any value they do not know as an
+ error: new codes may be added without an ABI version bump.
  */
 enum BugseeStatus
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -61,9 +113,15 @@ enum BugseeStatus
   BUGSEE_STATUS_PANIC = 3,
   BUGSEE_STATUS_NOT_LAUNCHED = 4,
   /*
-   The SDK is launched but a `flush` did not drain before its timeout.
+   A `flush` or `shutdown` did not drain before its timeout (after a
+   `shutdown` the SDK is stopped regardless).
    */
   BUGSEE_STATUS_TIMEOUT = 5,
+  /*
+   The ABI version the caller was built against is not the one this
+   library implements.
+   */
+  BUGSEE_STATUS_ABI_MISMATCH = 6,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -73,15 +131,248 @@ typedef int32_t BugseeStatus;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
+/*
+ Launch options under construction: a plain bag of values the host fills with
+ the `bugsee_options_set_*` setters, then hands to
+ `bugsee_launch_with_options`. Opaque to C; created by `bugsee_options_new`,
+ released by `bugsee_options_free`.
+ */
+typedef struct BugseeOptions BugseeOptions;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
 /*
+ The ABI version this library implements (`BUGSEE_ABI_VERSION`). Compare it
+ with the value from the header you built against before calling anything
+ else. It changes only on an incompatible change to the C surface and is
+ independent of the crate version.
+ */
+uint32_t bugsee_abi_version(void);
+
+/*
+ The crate version as a static NUL-terminated string (for diagnostics, not
+ compatibility checks: use `bugsee_abi_version` for that). The pointer is
+ valid for the life of the process and must not be freed.
+ */
+const char *bugsee_version(void);
+
+/*
+ A static, human-readable name for a status code, as a NUL-terminated string
+ (never NULL; unknown values give "unknown status"). Takes an integer, not
+ the enum, so a value from a newer library is safe to pass. The pointer is
+ valid for the life of the process and must not be freed.
+ */
+const char *bugsee_status_string(int32_t status);
+
+/*
+ The message for the most recent non-OK status returned to the **calling
+ thread** by any SDK function, or NULL if none has occurred on this thread.
+
+ A successful call does not clear it, so read it right after the failing
+ call. The pointer is owned by the SDK, must not be freed, and stays valid
+ only until the next SDK call on the same thread that fails (copy it if you
+ need it longer). The text is for humans, not for parsing.
+ */
+const char *bugsee_last_error(void);
+
+/*
+ Create an options handle for `app_token`, written to `*out`.
+
+ `abi_version` must be the `BUGSEE_ABI_VERSION` the caller was built against;
+ a different value fails with `BUGSEE_STATUS_ABI_MISMATCH`. `*out` is set to
+ NULL on every failure. Every other option starts at its documented default.
+
+ # Safety
+ `app_token` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`); it is copied, so it need only live for the call. `out`
+ must be a valid pointer to a writable `BugseeOptions *` (NULL is
+ `INVALID_ARGUMENT`). On success the caller owns `*out` and must release it
+ with `bugsee_options_free`.
+ */
+BugseeStatus bugsee_options_new(uint32_t abi_version, const char *app_token, BugseeOptions **out);
+
+/*
+ Release an options handle. NULL is a no-op. Launching does not consume the
+ handle, so free it once you are done with it, whether or not the launch
+ succeeded.
+
+ # Safety
+ `options` must be NULL or a pointer returned by `bugsee_options_new` that
+ has not been freed already, and no other thread may be using it.
+ */
+void bugsee_options_free(BugseeOptions *options);
+
+/*
+ Override the API endpoint (testing / self-hosting). NULL = production.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). `value` must be NULL (reset to
+ the default) or a valid NUL-terminated UTF-8 string, which is copied;
+ invalid UTF-8 is `INVALID_ARGUMENT`.
+ */
+BugseeStatus bugsee_options_set_endpoint(BugseeOptions *options, const char *value);
+
+/*
+ Set the on-disk data directory. It must outlive the process for crash
+ recovery to work, and is the setting a mobile host cannot do without
+ (point it at the app's private files directory). NULL = the SDK's default
+ resolution (the `BUGSEE_DATA_DIR` environment variable, then fallbacks).
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). `value` must be NULL (reset to
+ the default) or a valid NUL-terminated UTF-8 string, which is copied;
+ invalid UTF-8 is `INVALID_ARGUMENT`.
+ */
+BugseeStatus bugsee_options_set_data_dir(BugseeOptions *options, const char *value);
+
+/*
+ Set the application version reported with every issue. NULL = unset: the
+ SDK cannot infer it, so without it issues carry no version.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). `value` must be NULL (reset to
+ the default) or a valid NUL-terminated UTF-8 string, which is copied;
+ invalid UTF-8 is `INVALID_ARGUMENT`.
+ */
+BugseeStatus bugsee_options_set_app_version(BugseeOptions *options, const char *value);
+
+/*
+ Set the application build reported with every issue. NULL = unset: the
+ SDK cannot infer it, so without it issues carry no build.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). `value` must be NULL (reset to
+ the default) or a valid NUL-terminated UTF-8 string, which is copied;
+ invalid UTF-8 is `INVALID_ARGUMENT`.
+ */
+BugseeStatus bugsee_options_set_app_build(BugseeOptions *options, const char *value);
+
+/*
+ Set the application package / bundle id reported with every issue.
+ NULL = the host process's executable name, which in a managed host
+ (PHP, Python, Node, ...) is the interpreter, so pass the real app id.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). `value` must be NULL (reset to
+ the default) or a valid NUL-terminated UTF-8 string, which is copied;
+ invalid UTF-8 is `INVALID_ARGUMENT`.
+ */
+BugseeStatus bugsee_options_set_app_package_id(BugseeOptions *options, const char *value);
+
+/*
+ Native crash capture (signal / exception handlers). Default on. A managed
+ host (JVM, V8, CLR, PHP) that owns native crash handling should turn it off.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). Any non-zero `enabled` is true.
+ */
+BugseeStatus bugsee_options_set_native_crash_capture(BugseeOptions *options, int32_t enabled);
+
+/*
+ System telemetry sampling (battery, memory, network, ...). Default on.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). Any non-zero `enabled` is true.
+ */
+BugseeStatus bugsee_options_set_system_telemetry(BugseeOptions *options, int32_t enabled);
+
+/*
+ Report Rust panics from the panic hook, outside any guarded call.
+ Default off.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). Any non-zero `enabled` is true.
+ */
+BugseeStatus bugsee_options_set_report_panics_from_hook(BugseeOptions *options, int32_t enabled);
+
+/*
+ PII / secret scrubbing of every report. Default on; turning it off sends
+ reports exactly as captured.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). Any non-zero `enabled` is true.
+ */
+BugseeStatus bugsee_options_set_scrubbing(BugseeOptions *options, int32_t enabled);
+
+/*
+ Report rate limiting. Default on.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). Any non-zero `enabled` is true.
+ */
+BugseeStatus bugsee_options_set_rate_limiting(BugseeOptions *options, int32_t enabled);
+
+/*
+ Release-health session tracking. Default off.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`). Any non-zero `enabled` is true.
+ */
+BugseeStatus bugsee_options_set_release_health(BugseeOptions *options, int32_t enabled);
+
+/*
+ Fraction of non-fatal reports to keep, in `[0.0, 1.0]` (default 1.0; crashes
+ are never sampled out). NaN or an out-of-range value is `INVALID_ARGUMENT`.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`).
+ */
+BugseeStatus bugsee_options_set_sample_rate(BugseeOptions *options, double rate);
+
+/*
+ Longest time `launch` may spend recovering a previous crash, in
+ milliseconds. Default 500 ms. 0 skips
+ the launch pass entirely: crashes are recovered in the background instead.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`).
+ */
+BugseeStatus bugsee_options_set_launch_recovery_budget_ms(BugseeOptions *options,
+                                                          uint32_t budget_ms);
+
+/*
+ Flush pending reports for up to `timeout_ms` when the process exits through
+ the normal runtime exit path (unix only; on Windows call `bugsee_shutdown`
+ yourself). 0 = off, which is the default.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is using (NULL is `INVALID_ARGUMENT`).
+ */
+BugseeStatus bugsee_options_set_flush_at_exit_ms(BugseeOptions *options, uint32_t timeout_ms);
+
+/*
+ Launch the SDK with the settings in `options`. The handle is only read, not
+ consumed: free it with `bugsee_options_free` afterwards. Launching while
+ already launched replaces the running SDK.
+
+ # Safety
+ `options` must be a live handle from `bugsee_options_new` that no other
+ thread is modifying during the call (NULL is `INVALID_ARGUMENT`).
+ */
+BugseeStatus bugsee_launch_with_options(const BugseeOptions *options);
+
+/*
  Launch the SDK with default options for `app_token`.
 
  # Safety
- `app_token` must be a valid NUL-terminated C string or null.
+ `app_token` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`); it is copied, so it need only live for the call.
  */
 BugseeStatus bugsee_launch(const char *app_token);
 
@@ -89,7 +380,10 @@ BugseeStatus bugsee_launch(const char *app_token);
  Launch with an explicit API endpoint override (for testing / self-hosting).
 
  # Safety
- Both pointers must be valid NUL-terminated C strings or null.
+ `app_token` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`). `endpoint` may be NULL (the default endpoint) or a valid
+ NUL-terminated UTF-8 string; invalid UTF-8 is `INVALID_ARGUMENT`. Both are
+ copied, so they need only live for the call.
  */
 BugseeStatus bugsee_launch_with_endpoint(const char *app_token, const char *endpoint);
 
@@ -114,10 +408,12 @@ BugseeStatus bugsee_pause(void);
 BugseeStatus bugsee_resume(void);
 
 /*
- Log a message at `level` (1=Error … 5=Verbose).
+ Log a message at `level` (1=Error … 5=Verbose; anything else is
+ `INVALID_ARGUMENT`).
 
  # Safety
- `message` must be a valid NUL-terminated C string or null.
+ `message` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`); it is copied.
  */
 BugseeStatus bugsee_log(int32_t level, const char *message);
 
@@ -125,7 +421,8 @@ BugseeStatus bugsee_log(int32_t level, const char *message);
  Record a developer event.
 
  # Safety
- `name` must be a valid NUL-terminated C string or null.
+ `name` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`); it is copied.
  */
 BugseeStatus bugsee_event(const char *name);
 
@@ -133,7 +430,10 @@ BugseeStatus bugsee_event(const char *name);
  Record a developer event with a JSON object of parameters.
 
  # Safety
- Both pointers must be valid NUL-terminated C strings or null.
+ `name` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`). `params_json` may be NULL (no parameters) or a valid
+ NUL-terminated UTF-8 JSON object; anything else is `INVALID_ARGUMENT`. Both are
+ copied.
  */
 BugseeStatus bugsee_event_with_params(const char *name, const char *params_json);
 
@@ -141,7 +441,8 @@ BugseeStatus bugsee_event_with_params(const char *name, const char *params_json)
  Record a named value trace (value is a JSON scalar/array/object).
 
  # Safety
- Both pointers must be valid NUL-terminated C strings or null.
+ Both pointers must be valid NUL-terminated UTF-8 strings (NULL is
+ `INVALID_ARGUMENT`); they are copied. `value_json` must be valid JSON.
  */
 BugseeStatus bugsee_trace(const char *name, const char *value_json);
 
@@ -149,7 +450,8 @@ BugseeStatus bugsee_trace(const char *name, const char *value_json);
  Set the user identifier.
 
  # Safety
- `email` must be a valid NUL-terminated C string or null.
+ `email` must be a valid NUL-terminated UTF-8 string (NULL is
+ `INVALID_ARGUMENT`); it is copied.
  */
 BugseeStatus bugsee_set_email(const char *email);
 
@@ -157,15 +459,20 @@ BugseeStatus bugsee_set_email(const char *email);
  Set a report-level attribute (value is a JSON value).
 
  # Safety
- Both pointers must be valid NUL-terminated C strings or null.
+ Both pointers must be valid NUL-terminated UTF-8 strings (NULL is
+ `INVALID_ARGUMENT`); they are copied. `value_json` must be valid JSON.
  */
 BugseeStatus bugsee_set_attribute(const char *key, const char *value_json);
 
 /*
- Report a handled exception (name + reason) from the host language.
+ Report a handled exception (name + reason) from the host language. This is
+ lossy: it records a message issue with the Rust backtrace of the call site,
+ not the host's stack. Prefer `bugsee_report_error`.
 
  # Safety
- Both pointers must be valid NUL-terminated C strings or null.
+ Both pointers may be NULL (`name` defaults to "Exception", `reason` to "") or
+ valid NUL-terminated UTF-8 strings; invalid UTF-8 is `INVALID_ARGUMENT`. Both
+ are copied.
  */
 BugseeStatus bugsee_capture_exception(const char *name, const char *reason);
 
@@ -177,9 +484,73 @@ BugseeStatus bugsee_upload(void);
 /*
  Block until pending work drains, or `timeout_ms` elapses. Returns `Ok` on a
  full drain, `Timeout` if the SDK is launched but the queue did not drain in
- time, or `NotLaunched` if the SDK was never launched (F1).
+ time, or `NotLaunched` if the SDK is not launched (never launched, or
+ stopped).
  */
 BugseeStatus bugsee_flush(uint32_t timeout_ms);
+
+/*
+ Flush, then stop: the call to make before a deliberate exit. Waits up to
+ `timeout_ms` for captured work to be persisted and the queue to drain, then
+ stops the SDK whatever the outcome. Returns `OK` if everything was delivered,
+ `TIMEOUT` if not (undelivered reports stay in the durable queue for the next
+ launch in disk mode; the SDK is stopped either way), or `NOT_LAUNCHED`.
+ Worst-case blocking time is `timeout_ms` plus about 4 seconds.
+ */
+BugseeStatus bugsee_shutdown(uint32_t timeout_ms);
+
+/*
+ Opt in to a flush on `SIGTERM` / `SIGINT` (unix) or console control events
+ (Windows), waiting up to `timeout_ms`. Never on by default and it never
+ takes the signal from the host: the previous handler still runs. Idempotent
+ (a second call only updates the timeout) and valid before launch. Choose a
+ timeout below the orchestrator's grace period by at least 4 seconds.
+ */
+BugseeStatus bugsee_install_termination_flush(uint32_t timeout_ms);
+
+/*
+ Where the SDK keeps its state, as a bit set of `BUGSEE_STORAGE_*` flags
+ written to `*out_flags`; `NOT_LAUNCHED` (and `*out_flags` = 0) before launch.
+ Use it to confirm a deployment can recover from a crash: it needs
+ `BUGSEE_STORAGE_CRASH_RECOVERY`, and on a container
+ `BUGSEE_STORAGE_MAY_BE_EPHEMERAL` clear. Unknown bits must be ignored.
+
+ # Safety
+ `out_flags` must be a valid pointer to a writable `uint32_t` (NULL is
+ `INVALID_ARGUMENT`).
+ */
+BugseeStatus bugsee_storage_status(uint32_t *out_flags);
+
+/*
+ Report a **handled** error caught by the host language, with the host's own
+ stack, as a non-fatal `error` issue. Unlike `bugsee_capture_exception`, no
+ Rust backtrace of the binding's glue is attached.
+
+ `json` points at `len` bytes of a UTF-8 JSON object (no NUL terminator is
+ needed; up to 1 MiB):
+
+ `{"name": "RuntimeError", "reason": "boom",
+   "causes": [{"name": "IOError", "reason": "disk full"}],
+   "frames": [{"function": "run", "module": "App.Job", "file": "job.php",
+               "line": 42, "in_app": true}]}`
+
+ `name` defaults to "Exception", `reason` to "". `frames` run innermost call
+ first (at most 512 are kept); `function` is required per frame, and a frame
+ with `"in_app": false` is hidden from grouping (an error with no in-app
+ frames groups by name and reason alone, so send them). `causes` runs outermost first
+ (at most 32 are kept). `handled` may be omitted or `true`; `false` (an
+ uncaught exception needing a synchronous, durable path) is rejected as
+ `INVALID_ARGUMENT` because that path is not implemented. Other unknown
+ fields are ignored. Does nothing (and returns
+ `OK`) before launch, like the other capture calls.
+
+ # Safety
+ `json` must point at `len` readable bytes that stay valid for the call (NULL
+ or a `len` of 0 is `INVALID_ARGUMENT`). Invalid UTF-8, malformed JSON, a
+ wrongly typed field or more than 1 MiB is `INVALID_ARGUMENT`; see
+ `bugsee_last_error`.
+ */
+BugseeStatus bugsee_report_error(const char *json, size_t len);
 
 #ifdef __cplusplus
 }  // extern "C"

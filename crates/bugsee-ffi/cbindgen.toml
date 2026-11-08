@@ -13,6 +13,25 @@ header = """/*
  *  Every function is panic-safe: a Rust panic never crosses this boundary — it
  *  is contained and reported as BUGSEE_STATUS_PANIC (bugsee_is_active has no
  *  status to carry it and returns 0 instead).
+ *
+ *  Conventions (the per-function "# Safety" notes below are the C contract for
+ *  that function, not Rust's unsafety rules):
+ *   - Strings are UTF-8, NUL-terminated and BORROWED for the call only: the SDK
+ *     copies what it keeps and never returns a pointer into caller memory.
+ *     Windows hosts holding UTF-16 must convert first.
+ *   - NULL is BUGSEE_STATUS_INVALID_ARGUMENT unless the parameter is documented
+ *     as optional (then NULL means "default"). Invalid UTF-8 is always
+ *     INVALID_ARGUMENT, required or optional.
+ *   - Strings the SDK returns (bugsee_version, bugsee_status_string,
+ *     bugsee_last_error) are owned by the SDK and must never be freed.
+ *   - Every function may be called from any thread. Blocking calls (flush,
+ *     shutdown, stop) do not hold the SDK's global lock while they wait.
+ *   - Capture calls made before launch or after stop do nothing and return OK;
+ *     flush, shutdown and storage_status return NOT_LAUNCHED.
+ *   - Treat any BugseeStatus value you do not recognise as an error.
+ *   - Check bugsee_abi_version() against BUGSEE_ABI_VERSION at load time. The
+ *     ABI is NOT frozen yet: any release may bump it.
+ *   - Do not call back into the SDK from a signal handler.
  */"""
 include_guard = "BUGSEE_H"
 cpp_compat = true
@@ -21,7 +40,7 @@ style = "type"
 no_includes = true
 documentation = true
 documentation_style = "c"
-sys_includes = ["stdint.h"]
+sys_includes = ["stdint.h", "stddef.h"]
 
 [enum]
 rename_variants = "QualifiedScreamingSnakeCase"

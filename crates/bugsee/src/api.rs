@@ -588,6 +588,23 @@ impl Bugsee {
         Self::with_recorder(|r| r.report(built.meta, Some(built.crash_json)));
     }
 
+    /// Report a handled error captured by a host language (a binding), with the
+    /// **host's** frames instead of a Rust backtrace.
+    ///
+    /// `frames` are outermost-last as the host reported them (innermost call
+    /// first); `causes` is the cause chain, outermost-first. The report goes
+    /// through the same bundle writer, signature and dedupe as
+    /// [`Bugsee::capture_error`]. A no-op before `launch`.
+    pub fn capture_host_error(
+        name: &str,
+        reason: &str,
+        causes: &[Cause],
+        frames: Vec<bugsee_core::model::crash::Frame>,
+    ) {
+        let built = errors::build_handled_error(name, reason, causes, frames, epoch_ms());
+        Self::with_recorder(|r| r.report(built.meta, Some(built.crash_json)));
+    }
+
     /// Report a message as a non-fatal `error` issue with a backtrace.
     pub fn capture_message(level: LogLevel, message: impl Into<String>) {
         let frames = crate::frames::capture();
