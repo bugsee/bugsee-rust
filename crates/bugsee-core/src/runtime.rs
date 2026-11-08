@@ -264,6 +264,9 @@ impl Drop for SnapshotHandle {
 /// State shared between the facade, the capture worker, and the uploader.
 struct Shared {
     scope: ForkLock<Scope>,
+    /// Where the scope is persisted for this session (`None` in memory mode).
+    /// Locked only while holding `scope`.
+    scope_file: ForkLock<Option<PathBuf>>,
     env: Environment,
     environment_json: Vec<u8>,
     app_token: String,
@@ -339,12 +342,38 @@ struct LaunchPlan {
     heartbeat_of: Option<PathBuf>,
 }
 
+impl Shared {
+    /// Mutate the scope and persist it into the session directory, so a crash of
+    /// this session is recovered with the identity it had. Written on change (the
+    /// crash path never touches it); best-effort, since scope is enrichment.
+    fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
+        let mut guard = self.scope.lock();
+        let result = f(&mut guard);
+        if let Some(path) = self.scope_file.lock().as_ref() {
+            let _ = guard.persist(path);
+        }
+        result
+    }
+
+    /// Point scope persistence at `path` and write the current scope there (a
+    /// fork child's new session inherits the parent's scope in memory).
+    fn bind_scope_file(&self, path: Option<PathBuf>) {
+        let guard = self.scope.lock();
+        let mut file = self.scope_file.lock();
+        *file = path;
+        if let Some(path) = file.as_ref() {
+            let _ = guard.persist(path);
+        }
+    }
+}
+
 /// The recorder's own locks join the `fork()` lock protocol, so a forked child
 /// never inherits the scope or the cached access token locked by a thread (the
 /// capture worker merges the scope into every report) that did not survive.
 impl ForkLockable for Shared {
     fn fork_lock(&self) {
         self.scope.fork_lock();
+        self.scope_file.fork_lock();
         self.session.fork_lock();
         self.mem_queue.fork_lock();
         self.mem_blacklist.fork_lock();
@@ -363,6 +392,7 @@ impl ForkLockable for Shared {
         self.mem_blacklist.fork_unlock();
         self.mem_queue.fork_unlock();
         self.session.fork_unlock();
+        self.scope_file.fork_unlock();
         self.scope.fork_unlock();
     }
 }
@@ -456,6 +486,7 @@ impl Recorder {
         }
         let shared = Arc::new(Shared {
             scope: ForkLock::new(Scope::default()),
+            scope_file: ForkLock::new(None),
             env,
             environment_json,
             app_token: config.app_token.clone(),
@@ -519,6 +550,11 @@ impl Recorder {
             Some((session, store)) => (Some(session), Some(store)),
             None => (None, None),
         };
+        shared.bind_scope_file(
+            session
+                .as_ref()
+                .map(|s| scope_file_path(&data_dir, s.generation())),
+        );
         // Only a session that can be recovered is registered eagerly: a memory-mode
         // run could never contribute its crash, so counting it would read healthy.
         shared
@@ -690,6 +726,11 @@ impl Recorder {
             Vec::new(),
         )?;
 
+        self.shared.bind_scope_file(
+            session
+                .as_ref()
+                .map(|s| scope_file_path(&self.data_dir, s.generation())),
+        );
         // The parent's session is still the parent's: leave its marker alone.
         std::mem::forget(std::mem::replace(&mut self.session, session));
         // The old channel senders must be LEAKED, never dropped. Dropping the last
@@ -758,8 +799,7 @@ impl Recorder {
 
     /// Mutate the ambient scope (email / labels / attributes).
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = self.shared.scope.lock();
-        f(&mut guard)
+        self.shared.with_scope(f)
     }
 
     /// Trigger a report with `meta`, snapshotting the window ending now.
@@ -1038,8 +1078,7 @@ impl RecorderHandle {
 
     /// Mutate the ambient scope.
     pub fn with_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
-        let mut guard = self.shared.scope.lock();
-        f(&mut guard)
+        self.shared.with_scope(f)
     }
 
     /// Set the paused flag (gates telemetry sampling).
@@ -1485,6 +1524,9 @@ fn recover_one(
     let now = epoch_ms();
     let (start, end) = span.unwrap_or((now, now));
     let mut built = recovery::build_report(pending, end);
+    if let Some(scope) = Scope::load(&pending.parts_dir.join(crate::model::scope::SCOPE_FILE)) {
+        apply_scope(&scope, &mut built.meta);
+    }
 
     // Apply before_send to recovered crashes too (host redaction/drop).
     let keep = match &shared.before_send {
@@ -1498,9 +1540,9 @@ fn recover_one(
         recovery::discard(data_dir, pending);
         return;
     }
-    // A recovered crash carries no scope (email/labels/attributes) from THIS
-    // process: they describe the new run, not the one that crashed, and the
-    // launch-path and worker passes must agree on it.
+    // A recovered crash carries the scope (email/labels/attributes) its OWN
+    // session persisted, never this process's ambient scope: that describes the
+    // new run. Both recovery passes go through here, so they agree.
     if launch_pass {
         match queue::admit_recovered(data_dir, &built.meta.signatures) {
             queue::Admission::Admit => {}
@@ -1567,9 +1609,20 @@ fn recover_one(
     }
 }
 
+/// The persisted-scope path for `generation`.
+fn scope_file_path(data_dir: &Path, generation: u64) -> PathBuf {
+    data_dir
+        .join("parts")
+        .join(generation.to_string())
+        .join(crate::model::scope::SCOPE_FILE)
+}
+
 /// Merge ambient scope (email / labels / attributes) into a report's metadata.
 fn merge_scope(shared: &Shared, meta: &mut ReportMeta) {
-    let scope = shared.scope.lock();
+    apply_scope(&shared.scope.lock(), meta);
+}
+
+fn apply_scope(scope: &Scope, meta: &mut ReportMeta) {
     if meta.email.is_none() {
         meta.email = scope.email.clone();
     }

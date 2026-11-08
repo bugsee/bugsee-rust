@@ -429,3 +429,85 @@ fn a_torn_or_garbage_part_tail_is_ignored_on_recovery() {
         drop(recorder);
     }
 }
+
+fn request_and_manifest(bundle: &[u8]) -> (Value, Value) {
+    let mut zip = ZipArchive::new(Cursor::new(bundle.to_vec())).unwrap();
+    let mut read = |name: &str| {
+        let mut b = Vec::new();
+        zip.by_name(name).unwrap().read_to_end(&mut b).unwrap();
+        serde_json::from_slice::<Value>(&b).unwrap()
+    };
+    (read("request.json"), read("manifest.json"))
+}
+
+#[test]
+fn a_session_persists_its_scope_and_a_crash_recovers_it() {
+    // Run 1: scope lands in the session directory as it changes.
+    let dir = TempDir::new();
+    let first = Recorder::launch(
+        RecorderConfig::new(&dir.path, "TOKEN"),
+        Arc::new(MockTransport::default()),
+    )
+    .unwrap();
+    let scope_file = first.crash_info_path().with_file_name("scope.json");
+    assert!(!scope_file.exists(), "nothing to persist yet");
+    first.with_scope(|s| {
+        s.set_email(Some("crashed@example.com".into()));
+        s.labels.push("beta".into());
+        s.set_attribute("plan", Value::from("pro"));
+    });
+    assert!(scope_file.exists(), "scope persisted on change");
+    let scope_bytes = std::fs::read(&scope_file).unwrap();
+    first.with_scope(|s| s.set_attribute("later", Value::from(1)));
+    assert_ne!(
+        std::fs::read(&scope_file).unwrap(),
+        scope_bytes,
+        "rewritten on change"
+    );
+    first.with_scope(|s| {
+        s.set_email(None);
+        s.labels.clear();
+        s.clear_all_attributes();
+    });
+    assert!(!scope_file.exists(), "an empty scope leaves no file");
+    drop(first);
+
+    // The crashed session, as a later launch finds it.
+    let dir2 = TempDir::new();
+    seed_crashed_session(&dir2.path, 1);
+    std::fs::write(dir2.path.join("parts/1/scope.json"), scope_bytes).unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir2.path, "TOKEN"), transport.clone()).unwrap();
+    // This run's own scope must not leak into the recovered crash.
+    recorder.with_scope(|s| s.set_email(Some("new-run@example.com".into())));
+    assert!(recorder.flush(Duration::from_secs(5)));
+
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1);
+    let (req, manifest) = request_and_manifest(&bundles[0]);
+    assert_eq!(req["email"], "crashed@example.com");
+    assert_eq!(req["labels"], serde_json::json!(["beta"]));
+    assert_eq!(manifest["attrs"]["plan"], "pro");
+    drop(bundles);
+    assert!(!dir2.path.join("parts/1").exists());
+    drop(recorder);
+}
+
+#[test]
+fn a_corrupt_persisted_scope_does_not_stop_recovery() {
+    let dir = TempDir::new();
+    seed_crashed_session(&dir.path, 1);
+    std::fs::write(dir.path.join("parts/1/scope.json"), b"{torn").unwrap();
+    let transport = Arc::new(MockTransport::default());
+    let recorder =
+        Recorder::launch(RecorderConfig::new(&dir.path, "TOKEN"), transport.clone()).unwrap();
+    assert!(recorder.flush(Duration::from_secs(5)));
+    let bundles = transport.uploaded_bundles.lock().unwrap();
+    assert_eq!(bundles.len(), 1);
+    let (req, _) = request_and_manifest(&bundles[0]);
+    assert!(req["email"].is_null());
+    drop(bundles);
+    drop(recorder);
+}
