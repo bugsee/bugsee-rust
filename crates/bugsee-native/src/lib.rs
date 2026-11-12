@@ -491,7 +491,6 @@ mod imp {
     struct Regs {
         pc: usize,
         fp: usize,
-        sp: usize,
     }
 
     #[cfg(unix)]
@@ -500,18 +499,17 @@ mod imp {
         {
             // SAFETY: `uc` is the kernel-provided `ucontext_t` of the fault.
             let ucp = uc as *const libc::ucontext_t;
-            let (pc, sp) = unsafe { (context_pc(ucp), context_sp(ucp)) };
+            let pc = unsafe { context_pc(ucp) };
             Regs {
                 pc: pc.unwrap_or(0),
                 fp: 0,
-                sp,
             }
         }
         #[cfg(target_vendor = "apple")]
         {
             // SAFETY: as above.
-            let (pc, fp, sp) = unsafe { context_regs(uc as *const DarwinUcontext) };
-            Regs { pc, fp, sp }
+            let (pc, fp, _sp) = unsafe { context_regs(uc as *const DarwinUcontext) };
+            Regs { pc, fp }
         }
     }
 
@@ -1858,32 +1856,6 @@ mod imp {
         (pc != 0).then_some(pc)
     }
 
-    /// The interrupted stack pointer from the signal's saved register state.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe fn context_sp(uc: *const libc::ucontext_t) -> usize {
-        // SAFETY: `uc` is the kernel-provided `ucontext_t` of the fault.
-        let mc = unsafe { &(*uc).uc_mcontext };
-        #[cfg(target_arch = "x86_64")]
-        let sp = mc.gregs[15] as usize; // REG_RSP
-        #[cfg(target_arch = "x86")]
-        let sp = mc.gregs[7] as usize; // REG_ESP
-        #[cfg(target_arch = "aarch64")]
-        let sp = mc.sp as usize;
-        #[cfg(target_arch = "arm")]
-        let sp = mc.arm_sp as usize;
-        #[cfg(not(any(
-            target_arch = "x86_64",
-            target_arch = "x86",
-            target_arch = "aarch64",
-            target_arch = "arm"
-        )))]
-        let sp = {
-            let _ = mc;
-            0usize
-        };
-        sp
-    }
-
     #[cfg(unix)]
     /// The Unix signal path (Linux, Android, macOS).
     ///
@@ -2013,9 +1985,14 @@ mod imp {
             CHAIN.iter().find(|s| s.tid.load(Ordering::Acquire) == tid)
         }
         /// The marker generation whose frames are already on disk, so completing a
-        /// report twice (eagerly for a stack overflow, then again from the
+        /// report twice (eagerly on a small alternate stack, then again from the
         /// `abort()` that follows it) appends them once.
         static FRAMED: AtomicU64 = AtomicU64::new(0);
+        /// The marker generation completed BEFORE its host handler ran, on a small
+        /// alternate stack. Until the host declines, that fault is only possibly
+        /// fatal, so a report of a fault that surely is (a nested `abort()`) may
+        /// replace it. Cleared once the process is known to die of it.
+        static EARLY: AtomicU64 = AtomicU64::new(0);
         /// Per thread: the PC of the last fault a host returned from without doing
         /// anything, and how many times in a row that has happened. One such return
         /// is normal (a swallowed `raise`, which macOS delivers looking exactly like
@@ -2400,7 +2377,9 @@ mod imp {
         /// may replace it: the process is dying of that one.
         fn report_is_complete() -> bool {
             let owner = OWNER.load(Ordering::Acquire);
-            owner != 0 && FRAMED.load(Ordering::Acquire) == owner
+            owner != 0
+                && FRAMED.load(Ordering::Acquire) == owner
+                && EARLY.load(Ordering::Acquire) != owner
         }
 
         /// A fault that did not write its header up front and has turned out fatal:
@@ -2446,6 +2425,8 @@ mod imp {
             // SAFETY: the path is a leaked box.
             unsafe {
                 if generation != 0 {
+                    let _ =
+                        EARLY.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                     complete_report(tid, &*path, regs, generation);
                 } else {
                     report_unrecorded(tid, &*path, sig, info, regs);
@@ -2697,12 +2678,14 @@ mod imp {
             let regs = Regs {
                 pc: slot.pc.load(Ordering::Acquire),
                 fp: slot.fp.load(Ordering::Acquire),
-                sp: 0,
             };
             let generation = slot.generation.load(Ordering::Acquire);
             // SAFETY: the path is a leaked box.
             unsafe {
                 if generation != 0 {
+                    // The process is dying of this very fault now.
+                    let _ =
+                        EARLY.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                     complete_report(tid, &*path, regs, generation);
                     flush_inflight_events();
                     return;
@@ -2810,30 +2793,34 @@ mod imp {
             }
         }
 
-        /// A memory fault at (or just under) the stack pointer is a stack overflow.
-        /// Rust's own handler for one prints and then `abort()`s, which needs a
-        /// whole second signal frame on a possibly tiny alternate stack — so for
-        /// this one case the report is completed BEFORE the host handler runs.
+        /// Must the report be completed BEFORE the host handler runs?
+        ///
+        /// A host that ends the process with `abort()` from inside its handler (Rust's
+        /// own stack-overflow handler, or any host that aborts on a fault it does not
+        /// recover) raises a second signal on the alternate stack the handler is
+        /// already running on. On a SMALL alternate stack (the one Rust gives a
+        /// spawned thread; the SDK only replaces the installing thread's) the unwind
+        /// that the nested handler would then run for the report does not fit, and the
+        /// process dies of `SIGSEGV` with the report missing its frames. So there the
+        /// report is completed first, for a real fault (not a signal merely sent, and
+        /// not a breakpoint, which a host resumes from).
+        ///
+        /// The cost: a fault the host would have recovered also pays an unwind and a
+        /// marker append on such a thread (it is deleted again afterwards). On a big
+        /// alternate stack, or the thread's own stack, it pays nothing extra.
+        ///
+        /// Known limits: if the unwind itself does not fit a very small alternate
+        /// stack, a fault the host would have recovered ends the process (as a
+        /// stack overflow already could). And only the first fault in flight is
+        /// completed early; a nested abort of a later one still unwinds inside the
+        /// nested handler.
         #[inline(never)]
-        unsafe fn looks_like_stack_overflow(
-            sig: libc::c_int,
-            info: *const libc::siginfo_t,
-            regs: Regs,
-        ) -> bool {
-            if !matches!(sig, libc::SIGSEGV | libc::SIGBUS) || regs.sp == 0 {
+        fn must_complete_before_host(sig: libc::c_int, info: *const libc::siginfo_t) -> bool {
+            // SAFETY: kernel-provided siginfo.
+            if sig == libc::SIGTRAP || is_sent(unsafe { (*info).si_code }) {
                 return false;
             }
-            // Only matters where the nested `abort()` could not get a second signal
-            // frame: a handler running on a SMALL alternate stack. On a big one (or
-            // on the thread's own stack) the abort path completes the report, and a
-            // recovered guard-page fault (a JVM yellow page, Go stack growth) pays
-            // nothing extra.
-            if !on_small_alt_stack() {
-                return false;
-            }
-            // SAFETY: kernel-provided siginfo of a fault signal.
-            let addr = unsafe { fault_address(info, sig) };
-            addr >= regs.sp.saturating_sub(16 * 1024) && addr <= regs.sp.saturating_add(4096)
+            on_small_alt_stack()
         }
 
         unsafe extern "C" fn handler(
@@ -2882,7 +2869,8 @@ mod imp {
 
             let regs = unsafe { regs_of(uc) };
             let (_first, generation) = unsafe { record_header(tid, path, sig, info, regs.pc) };
-            if generation != 0 && unsafe { looks_like_stack_overflow(sig, info, regs) } {
+            if generation != 0 && must_complete_before_host(sig, info) {
+                EARLY.store(generation, Ordering::Release);
                 unsafe { complete_report(tid, &*path, regs, generation) };
             }
 

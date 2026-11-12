@@ -430,6 +430,22 @@ fn child() {
             };
             let _ = recovered.join();
         }
+        // The host aborts from inside its handler on a SPAWNED thread, which keeps the
+        // small alternate stack Rust gave it: the nested SIGABRT frame must still fit.
+        "spawned_thread_abort" => {
+            install_host_with(aborting_host, 0);
+            let _h = bugsee_native::install(marker.clone()).unwrap();
+            // Sets the page the host recovers; the null write is not it, so it aborts.
+            guarded_page();
+            std::thread::spawn(|| {
+                // SAFETY: deliberate null write; the host aborts on it.
+                unsafe {
+                    std::ptr::write_volatile(std::hint::black_box(std::ptr::null_mut::<u8>()), 1)
+                };
+            })
+            .join()
+            .unwrap();
+        }
         // A SIGABRT with `si_code == SI_USER` (what `kill` delivers) reaching a thread
         // that is inside a host handler is a crash of its own, not that host's abort.
         // The host forges it at its own thread, so delivery is deterministic: no other
@@ -777,6 +793,23 @@ fn a_first_in_flight_write_barrier_is_not_reported_as_the_crash() {
         "the fatal fault's report must be the one left: {marker:?}"
     );
     assert!(marker.contains("frame=0x"), "{marker:?}");
+}
+
+#[test]
+fn a_host_aborting_inside_its_handler_on_a_spawned_thread_keeps_the_report() {
+    child();
+    let (out, marker) = run(
+        "spawned_thread_abort",
+        "a_host_aborting_inside_its_handler_on_a_spawned_thread_keeps_the_report",
+    );
+    assert!(marker.contains("address=0x0\n"), "{marker:?}");
+    assert!(marker.contains("frame=0x"), "{marker:?} {:?}", out.status);
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGABRT),
+        "{marker:?} {:?}",
+        out.status
+    );
 }
 
 #[test]
