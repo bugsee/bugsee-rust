@@ -118,13 +118,13 @@ jobs:
           fi
 
   msrv:
-    name: build (MSRV 1.88)
+    name: build (MSRV 1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - name: Install pinned MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2

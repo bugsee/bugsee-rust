@@ -14,8 +14,8 @@ bugsee-panic = { workspace = true, optional = true }
 bugsee-native = { workspace = true, optional = true }
 serde_json = { workspace = true }
 backtrace = "0.3"
-ureq = { version = "2", optional = true, features = ["json"] }
-sysinfo = { version = "0.33", optional = true, default-features = false, features = ["system", "disk"] }
+ureq = { version = "3", optional = true, features = ["json"] }
+sysinfo = { version = "0.38", optional = true, default-features = false, features = ["system", "disk"] }
 
 # Unconditional on unix: the data-directory ownership checks (`options.rs`) call
 # `geteuid`, and the `telemetry` feature's local-UTC-offset / hardware-model probes
@@ -26,7 +26,7 @@ sysinfo = { version = "0.33", optional = true, default-features = false, feature
 libc = "0.2"
 
 [dev-dependencies]
-zip = { version = "9.3.0", default-features = false, features = ["zstd"] }
+zip = { version = "9.8", default-features = false, features = ["zstd"] }
 
 [features]
 default = ["net", "panic", "native", "telemetry"]

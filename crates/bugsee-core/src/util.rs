@@ -38,7 +38,7 @@ pub fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     // getrandom only fails on platforms without an entropy source; fall back to
     // a time-seeded value so id generation never panics.
-    if getrandom::getrandom(&mut buf).is_err() {
+    if getrandom::fill(&mut buf).is_err() {
         let seed = epoch_ms() as u64;
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (seed.rotate_left(i as u32 * 8) & 0xff) as u8;
@@ -56,7 +56,7 @@ pub fn random_hex(n_bytes: usize) -> String {
 /// unavailable, so sampling never accidentally drops a report on error.
 pub fn random_unit_f64() -> f64 {
     let mut buf = [0u8; 8];
-    if getrandom::getrandom(&mut buf).is_err() {
+    if getrandom::fill(&mut buf).is_err() {
         return 1.0;
     }
     let v = u64::from_le_bytes(buf);

@@ -61,7 +61,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-MSRV is 1.88 and `Cargo.lock` is committed (CI builds with `--locked`).
+MSRV is 1.89 and `Cargo.lock` is committed (CI builds with `--locked`).
 
 ## License
 

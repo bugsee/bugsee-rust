@@ -41,11 +41,16 @@ impl HttpTransport {
     /// TLS records with its parent on one connection. Reports are rare, so the
     /// price of a new connection each time is far smaller than that hazard.
     fn agent(&self) -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(30))
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(30)))
+            .timeout_recv_body(Some(Duration::from_secs(30)))
+            .timeout_send_request(Some(Duration::from_secs(30)))
+            .timeout_send_body(Some(Duration::from_secs(30)))
+            // Status codes are mapped by `map_response`, not turned into errors.
+            .http_status_as_error(false)
             .build()
+            .into()
     }
 }
 
@@ -67,8 +72,8 @@ fn app_error_parts(v: &Value) -> (Option<i64>, Option<String>) {
 /// Map an `ok:false` envelope onto a [`TransportError`].
 ///
 /// The API signals APPLICATION errors with an `ok:false` body and — this is the
-/// part that matters — an HTTP **200**. `ureq` only yields `Error::Status` for
-/// 4xx/5xx, so an envelope consulted solely from [`map_ureq_error`] is invisible
+/// part that matters — an HTTP **200**. `ureq` only yields an error status for
+/// 4xx/5xx, so an envelope consulted solely from [`map_response`] is invisible
 /// on the status the server actually uses for them. Both paths funnel here.
 ///
 /// The message is carried into the error rather than dropped: a rejected report
@@ -96,26 +101,35 @@ fn check_envelope(v: &Value) -> Result<(), TransportError> {
     Ok(())
 }
 
-fn map_ureq_error(err: ureq::Error) -> TransportError {
-    match err {
-        ureq::Error::Status(code, resp) => {
-            // Inspect the response envelope for Bugsee app error codes.
-            let body: Option<Value> = resp.into_json().ok();
-            let (app_code, message) = body.as_ref().map(app_error_parts).unwrap_or((None, None));
-            match (code, app_code) {
-                (401, _) => TransportError::SessionExpired,
-                (_, Some(12003)) => TransportError::DuplicateDropped,
-                (_, Some(12004)) => TransportError::TooManySimilar { signatures: vec![] },
-                (429, _) | (500..=599, _) => TransportError::Transient(format!("http {code}")),
-                _ => TransportError::Permanent(match message {
-                    Some(m) => format!("http {code}: {m}"),
-                    None => format!("http {code}"),
-                }),
-            }
-        }
-        // Transport/IO errors are retryable.
-        other => TransportError::Transient(other.to_string()),
+/// Turn a received response into `Ok` for 2xx/3xx or the matching
+/// [`TransportError`] for 4xx/5xx. The agent is built with
+/// `http_status_as_error(false)` so the body of an error response stays
+/// readable here (ureq 3 would otherwise discard it).
+fn map_response(
+    mut resp: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, TransportError> {
+    let code = resp.status().as_u16();
+    if code < 400 {
+        return Ok(resp);
     }
+    // Inspect the response envelope for Bugsee app error codes.
+    let body: Option<Value> = resp.body_mut().read_json().ok();
+    let (app_code, message) = body.as_ref().map(app_error_parts).unwrap_or((None, None));
+    Err(match (code, app_code) {
+        (401, _) => TransportError::SessionExpired,
+        (_, Some(12003)) => TransportError::DuplicateDropped,
+        (_, Some(12004)) => TransportError::TooManySimilar { signatures: vec![] },
+        (429, _) | (500..=599, _) => TransportError::Transient(format!("http {code}")),
+        _ => TransportError::Permanent(match message {
+            Some(m) => format!("http {code}: {m}"),
+            None => format!("http {code}"),
+        }),
+    })
+}
+
+/// Transport/IO failures are retryable.
+fn map_ureq_error(err: ureq::Error) -> TransportError {
+    TransportError::Transient(err.to_string())
 }
 
 impl Transport for HttpTransport {
@@ -126,15 +140,17 @@ impl Transport for HttpTransport {
     ) -> Result<String, TransportError> {
         let env: Value = serde_json::from_slice(environment_json).unwrap_or(Value::Null);
         let body = serde_json::json!({ "app_token": app_token, "environment": env });
-        let resp = self
+        let mut resp = self
             .agent()
             .post(&format!("{}/sessions", self.base_url))
-            .set("Content-Type", "application/json")
-            .set("x-client-type", "rust")
+            .header("Content-Type", "application/json")
+            .header("x-client-type", "rust")
             .send_json(body)
-            .map_err(map_ureq_error)?;
+            .map_err(map_ureq_error)
+            .and_then(map_response)?;
         let v: Value = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| TransportError::Transient(e.to_string()))?;
         // An application error arrives as HTTP 200 + `ok:false`; without this
         // the miss falls through to the opaque "no access_token" below.
@@ -160,15 +176,17 @@ impl Transport for HttpTransport {
             body.insert("access_token".into(), Value::from(t));
         }
         let url = format!("{}/issues?app_token={}", self.base_url, app_token);
-        let resp = self
+        let mut resp = self
             .agent()
             .post(&url)
-            .set("Content-Type", "application/json")
-            .set("x-client-type", "rust")
+            .header("Content-Type", "application/json")
+            .header("x-client-type", "rust")
             .send_json(Value::Object(body))
-            .map_err(map_ureq_error)?;
+            .map_err(map_ureq_error)
+            .and_then(map_response)?;
         let v: Value = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| TransportError::Transient(e.to_string()))?;
         // The load-bearing one. A rejected issue (e.g. a validation failure on
         // some environment field) comes back 200 + `ok:false`, and without this
@@ -185,9 +203,10 @@ impl Transport for HttpTransport {
     fn upload_bundle(&self, endpoint: &str, zip: &[u8]) -> Result<(), TransportError> {
         self.agent()
             .put(endpoint)
-            .set("Content-Length", &zip.len().to_string())
-            .send_bytes(zip)
-            .map_err(map_ureq_error)?;
+            .header("Content-Length", zip.len().to_string())
+            .send(zip)
+            .map_err(map_ureq_error)
+            .and_then(map_response)?;
         Ok(())
     }
 }

@@ -12,9 +12,9 @@ description = "Core capture, persistence, and export engine for the Bugsee Rust 
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_repr = { workspace = true }
-zip = { version = "9.3.0", default-features = false, features = ["zstd"] }
-getrandom = "0.2"
-sha1 = "0.10.7"
+zip = { version = "9.8", default-features = false, features = ["zstd"] }
+getrandom = "0.4"
+sha1 = "0.11"
 backtrace = "0.3"
 
 # Unix only: a single contained `kill(pid, 0)` liveness probe used by recovery to
