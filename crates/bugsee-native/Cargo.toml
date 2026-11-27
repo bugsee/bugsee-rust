@@ -23,7 +23,7 @@ libc = "0.2"
 
 # Apple: fault-safe reads of the crashed thread's stack.
 [target.'cfg(target_vendor = "apple")'.dependencies]
-mach2 = "0.4"
+mach2 = "0.7"
 
 # Linux/Android: the handler runs on the crashing thread, so a signal-safe
 # unwinder captures its own stack (handles both x86_64 and aarch64).
